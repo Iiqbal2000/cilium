@@ -35,7 +35,7 @@ var log = logging.DefaultLogger.WithField(logfields.LogSubsys, "cilium-health-la
 
 const (
 	serverProbeInterval  = 60 * time.Second
-	serverProbeDeadline  = 1 * time.Second
+	serverProbeDeadline  = 10 * time.Second
 	connectRetryInterval = 1 * time.Second
 	statusProbeInterval  = 5 * time.Second
 )
@@ -48,8 +48,10 @@ func Launch(spec *healthApi.Spec, initialized <-chan struct{}) (*CiliumHealth, e
 	)
 
 	config := server.Config{
+		CiliumURI:     ciliumPkg.DefaultSockPath(),
 		Debug:         option.Config.Opts.IsEnabled(option.Debug),
 		ProbeInterval: serverProbeInterval,
+		ICMPReqsCount: option.Config.HealthCheckICMPFailureThreshold,
 		ProbeDeadline: serverProbeDeadline,
 		HTTPPathPort:  option.Config.ClusterHealthPort,
 		HealthAPISpec: spec,
@@ -57,12 +59,12 @@ func Launch(spec *healthApi.Spec, initialized <-chan struct{}) (*CiliumHealth, e
 
 	ch.server, err = server.NewServer(config)
 	if err != nil {
-		return nil, fmt.Errorf("failed to instantiate cilium-health server: %s", err)
+		return nil, fmt.Errorf("failed to instantiate cilium-health server: %w", err)
 	}
 
 	ch.client, err = client.NewDefaultClient()
 	if err != nil {
-		return nil, fmt.Errorf("failed to instantiate cilium-health client: %s", err)
+		return nil, fmt.Errorf("failed to instantiate cilium-health client: %w", err)
 	}
 
 	go ch.runServer(initialized)

@@ -4,13 +4,18 @@
 package proxy
 
 import (
+	"github.com/cilium/hive/cell"
+	"github.com/spf13/pflag"
+
+	"github.com/cilium/cilium/pkg/controller"
 	datapath "github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/envoy"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	monitoragent "github.com/cilium/cilium/pkg/monitor/agent"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/proxy/logger"
 	"github.com/cilium/cilium/pkg/proxy/logger/endpoint"
+	"github.com/cilium/cilium/pkg/time"
+	"github.com/cilium/cilium/pkg/trigger"
 )
 
 // Cell provides the L7 Proxy which provides support for L7 network policies.
@@ -20,39 +25,38 @@ var Cell = cell.Module(
 	"l7-proxy",
 	"L7 Proxy provides support for L7 network policies",
 
-	cell.Provide(func() ProxyConfig { return DefaultProxyConfig }),
-
 	cell.Provide(newProxy),
 	cell.Provide(newEnvoyProxyIntegration),
 	cell.Provide(newDNSProxyIntegration),
 	cell.ProvidePrivate(endpoint.NewEndpointInfoRegistry),
+	cell.Config(ProxyConfig{}),
 )
 
 type ProxyConfig struct {
-	minPort, maxPort uint16
-	dnsProxyPort     uint16
+	ProxyPortrangeMin          uint16
+	ProxyPortrangeMax          uint16
+	RestoredProxyPortsAgeLimit uint
 }
 
-var DefaultProxyConfig = ProxyConfig{
-	minPort: 10000,
-	maxPort: 20000,
-	// The default value for the DNS proxy port is set to 0 to allocate a random
-	// port.
-	dnsProxyPort: 0,
+func (r ProxyConfig) Flags(flags *pflag.FlagSet) {
+	flags.Uint16("proxy-portrange-min", 10000, "Start of port range that is used to allocate ports for L7 proxies.")
+	flags.Uint16("proxy-portrange-max", 20000, "End of port range that is used to allocate ports for L7 proxies.")
+	flags.Uint("restored-proxy-ports-age-limit", 15, "Time after which a restored proxy ports file is considered stale (in minutes)")
 }
 
 type proxyParams struct {
 	cell.In
 
-	Datapath              datapath.Datapath
+	Lifecycle             cell.Lifecycle
+	Config                ProxyConfig
+	IPTablesManager       datapath.IptablesManager
 	EndpointInfoRegistry  logger.EndpointInfoRegistry
 	MonitorAgent          monitoragent.Agent
 	EnvoyProxyIntegration *envoyProxyIntegration
 	DNSProxyIntegration   *dnsProxyIntegration
-	XdsServer             envoy.XDSServer
 }
 
-func newProxy(params proxyParams, cfg ProxyConfig) *Proxy {
+func newProxy(params proxyParams) *Proxy {
 	if !option.Config.EnableL7Proxy {
 		log.Info("L7 proxies are disabled")
 		if option.Config.EnableEnvoyConfig {
@@ -63,15 +67,52 @@ func newProxy(params proxyParams, cfg ProxyConfig) *Proxy {
 
 	configureProxyLogger(params.EndpointInfoRegistry, params.MonitorAgent, option.Config.AgentLabels)
 
-	return createProxy(cfg.minPort, cfg.maxPort, cfg.dnsProxyPort, params.Datapath, params.EnvoyProxyIntegration, params.DNSProxyIntegration, params.XdsServer)
+	p := createProxy(params.Config.ProxyPortrangeMin, params.Config.ProxyPortrangeMax, params.IPTablesManager, params.EnvoyProxyIntegration, params.DNSProxyIntegration)
+
+	triggerDone := make(chan struct{})
+
+	controllerManager := controller.NewManager()
+	controllerGroup := controller.NewGroup("proxy-ports-allocator")
+	controllerName := "proxy-ports-checkpoint"
+
+	params.Lifecycle.Append(cell.Hook{
+		OnStart: func(cell.HookContext) (err error) {
+			// Restore all proxy ports before we create the trigger to overwrite the
+			// file below
+			p.proxyPorts.RestoreProxyPorts(params.Config.RestoredProxyPortsAgeLimit)
+
+			p.proxyPorts.Trigger, err = trigger.NewTrigger(trigger.Parameters{
+				MinInterval: 10 * time.Second,
+				TriggerFunc: func(reasons []string) {
+					controllerManager.UpdateController(controllerName, controller.ControllerParams{
+						Group:    controllerGroup,
+						DoFunc:   p.proxyPorts.StoreProxyPorts,
+						StopFunc: p.proxyPorts.StoreProxyPorts, // perform one last checkpoint when the controller is removed
+					})
+				},
+				ShutdownFunc: func() {
+					controllerManager.RemoveControllerAndWait(controllerName) // waits for StopFunc
+					close(triggerDone)
+				},
+			})
+			return err
+		},
+		OnStop: func(cell.HookContext) error {
+			p.proxyPorts.Trigger.Shutdown()
+			<-triggerDone
+			return nil
+		},
+	})
+
+	return p
 }
 
 type envoyProxyIntegrationParams struct {
 	cell.In
 
-	Datapath    datapath.Datapath
-	XdsServer   envoy.XDSServer
-	AdminClient *envoy.EnvoyAdminClient
+	IptablesManager datapath.IptablesManager
+	XdsServer       envoy.XDSServer
+	AdminClient     *envoy.EnvoyAdminClient
 }
 
 func newEnvoyProxyIntegration(params envoyProxyIntegrationParams) *envoyProxyIntegration {
@@ -80,9 +121,9 @@ func newEnvoyProxyIntegration(params envoyProxyIntegrationParams) *envoyProxyInt
 	}
 
 	return &envoyProxyIntegration{
-		xdsServer:   params.XdsServer,
-		datapath:    params.Datapath,
-		adminClient: params.AdminClient,
+		xdsServer:       params.XdsServer,
+		iptablesManager: params.IptablesManager,
+		adminClient:     params.AdminClient,
 	}
 }
 

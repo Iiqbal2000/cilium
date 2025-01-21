@@ -17,7 +17,6 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 
-	"github.com/cilium/cilium/pkg/k8s"
 	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	v2alpha1 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	"github.com/cilium/cilium/pkg/k8s/client"
@@ -38,11 +37,8 @@ func CRDResourceName(crd string) string {
 
 func agentCRDResourceNames() []string {
 	result := []string{
-		CRDResourceName(v2.CNPName),
-		CRDResourceName(v2.CCNPName),
 		CRDResourceName(v2.CNName),
 		CRDResourceName(v2.CIDName),
-		CRDResourceName(v2alpha1.CCGName),
 		CRDResourceName(v2alpha1.CPIPName),
 	}
 
@@ -51,6 +47,18 @@ func agentCRDResourceNames() []string {
 		if option.Config.EnableCiliumEndpointSlice {
 			result = append(result, CRDResourceName(v2alpha1.CESName))
 		}
+	}
+
+	if option.Config.EnableCiliumNetworkPolicy {
+		result = append(result, CRDResourceName(v2.CNPName))
+	}
+
+	if option.Config.EnableCiliumClusterwideNetworkPolicy {
+		result = append(result, CRDResourceName(v2.CCNPName))
+	}
+
+	if option.Config.EnableCiliumNetworkPolicy || option.Config.EnableCiliumClusterwideNetworkPolicy {
+		result = append(result, CRDResourceName(v2alpha1.CCGName))
 	}
 
 	if option.Config.EnableIPv4EgressGateway {
@@ -65,6 +73,12 @@ func agentCRDResourceNames() []string {
 	}
 	if option.Config.EnableBGPControlPlane {
 		result = append(result, CRDResourceName(v2alpha1.BGPPName))
+		// BGPv2 CRDs
+		result = append(result, CRDResourceName(v2alpha1.BGPCCName))
+		result = append(result, CRDResourceName(v2alpha1.BGPAName))
+		result = append(result, CRDResourceName(v2alpha1.BGPPCName))
+		result = append(result, CRDResourceName(v2alpha1.BGPNCName))
+		result = append(result, CRDResourceName(v2alpha1.BGPNCOName))
 	}
 
 	result = append(result,
@@ -99,7 +113,8 @@ func AllCiliumCRDResourceNames() []string {
 	return append(
 		AgentCRDResourceNames(),
 		CRDResourceName(v2.CEWName),
-		CRDResourceName(v2alpha1.CNCName),
+		CRDResourceName(v2.CNCName),
+		CRDResourceName(v2alpha1.CNCName), // TODO depreciate CNC on v2alpha1 https://github.com/cilium/cilium/issues/31982
 	)
 }
 
@@ -173,6 +188,7 @@ func SyncCRDs(ctx context.Context, clientset client.Clientset, crdNames []string
 	log.Info("Waiting until all Cilium CRDs are available")
 
 	ticker := time.NewTicker(50 * time.Millisecond)
+	count := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -194,12 +210,17 @@ func SyncCRDs(ctx context.Context, clientset client.Clientset, crdNames []string
 				log.Info("All Cilium CRDs have been found and are available")
 				return nil
 			}
+			count++
+			if count == 20 {
+				count = 0
+				log.Infof("Still waiting for Cilium Operator to register the following CRDs: %v", crds.unSynced())
+			}
 		}
 	}
 }
 
 func (s *crdState) add(obj interface{}) {
-	if pom := k8s.CastInformerEvent[slim_metav1.PartialObjectMetadata](obj); pom != nil {
+	if pom := informer.CastInformerEvent[slim_metav1.PartialObjectMetadata](obj); pom != nil {
 		s.Lock()
 		s.m[CRDResourceName(pom.GetName())] = true
 		s.Unlock()
@@ -207,7 +228,7 @@ func (s *crdState) add(obj interface{}) {
 }
 
 func (s *crdState) remove(obj interface{}) {
-	if pom := k8s.CastInformerEvent[slim_metav1.PartialObjectMetadata](obj); pom != nil {
+	if pom := informer.CastInformerEvent[slim_metav1.PartialObjectMetadata](obj); pom != nil {
 		s.Lock()
 		s.m[CRDResourceName(pom.GetName())] = false
 		s.Unlock()

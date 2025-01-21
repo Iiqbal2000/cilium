@@ -23,6 +23,14 @@ plugin. Due to scalability concerns in particular for multi-queue network
 interfaces, it is not recommended to use the bandwidth CNI plugin which is
 based on TBF (Token Bucket Filter) instead of EDT.
 
+.. note::
+
+   It is strongly recommended to use Bandwidth Manager in combination with
+   :ref:`BPF Host Routing<eBPF_Host_Routing>` as otherwise legacy routing
+   through the upper stack could potentially result in undesired high latency
+   (see `this comparison <https://github.com/cilium/cilium/issues/29083#issuecomment-1831867718>`_
+   for more details).
+
 Cilium's bandwidth manager supports the ``kubernetes.io/egress-bandwidth`` Pod
 annotation which is enforced on egress at the native host networking devices.
 The bandwidth enforcement is supported for direct routing as well as tunneling
@@ -38,10 +46,6 @@ traffic can go up the stack. At this point traffic has already occupied the
 bandwidth usage on the wire, and the node has already spent resources on
 processing the packet. ``kubernetes.io/ingress-bandwidth`` annotation is ignored
 by Cilium's bandwidth manager.
-
-.. note::
-
-   Bandwidth Manager requires a v5.1.x or more recent Linux kernel.
 
 .. include:: ../../installation/k8s-install-download-release.rst
 
@@ -252,4 +256,4 @@ Limitations
 .. admonition:: Video
   :class: attention
 
-  For more insights on Cilium's bandwidth manager, check out this `KubeCon talk on Better Bandwidth Management with eBPF <https://www.youtube.com/watch?v=QTSS6ktK8hY>`__.
+  For more insights on Cilium's bandwidth manager, check out this `KubeCon talk on Better Bandwidth Management with eBPF <https://www.youtube.com/watch?v=QTSS6ktK8hY>`__ and `eCHO episode 98: Exploring the bandwidth manager with Cilium <https://www.youtube.com/watch?v=-JnXe8vAUKQ>`__.

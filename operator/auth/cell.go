@@ -4,10 +4,10 @@
 package auth
 
 import (
+	"github.com/cilium/hive/cell"
 	"github.com/spf13/pflag"
 
 	"github.com/cilium/cilium/operator/auth/spire"
-	"github.com/cilium/cilium/pkg/hive/cell"
 )
 
 const (
@@ -18,7 +18,7 @@ var Cell = cell.Module(
 	"auth-identity",
 	"Cilium Mutual Authentication Identity management",
 	spire.Cell,
-	cell.Config(Config{}),
+	cell.Config(defaultConfig),
 	cell.Invoke(registerIdentityWatcher),
 )
 
@@ -30,4 +30,8 @@ type Config struct {
 // Flags implements cell.Flagger interface.
 func (cfg Config) Flags(flags *pflag.FlagSet) {
 	flags.Bool(mutualAuthEnabled, cfg.Enabled, "Enable mutual authentication in Cilium")
+}
+
+var defaultConfig = Config{
+	Enabled: false,
 }

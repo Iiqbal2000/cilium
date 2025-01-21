@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"sort"
+	"slices"
 	"sync"
 
 	envoyAPI "github.com/cilium/proxy/go/cilium/api"
@@ -75,24 +75,20 @@ func newNPHDSCache(ipcache IPCacheEventSource) NPHDSCache {
 	return NPHDSCache{Cache: xds.NewCache(), ipcache: ipcache}
 }
 
-var (
-	observerOnce = sync.Once{}
-)
+var observerOnce = sync.Once{}
+
+func (cache *NPHDSCache) MarkRestorePending()   {}
+func (cache *NPHDSCache) MarkRestoreCompleted() {}
 
 // HandleResourceVersionAck is required to implement ResourceVersionAckObserver.
 // We use this to start the IP Cache listener on the first ACK so that we only
-// start the IP Cache listener if there is an Envoy node that uses NPHDS (e.g.,
-// Istio node, or host proxy running on kernel w/o LPM bpf map support).
+// start the IP Cache listener if there is an Envoy node that uses NPHDS
+// (e.g. Cilium host proxy running on kernel w/o LPM bpf map support).
 func (cache *NPHDSCache) HandleResourceVersionAck(ackVersion uint64, nackVersion uint64, nodeIP string, resourceNames []string, typeURL string, detail string) {
 	// Start caching for IP/ID mappings on the first indication someone wants them
 	observerOnce.Do(func() {
 		cache.ipcache.AddListener(cache)
 	})
-}
-
-// OnIPIdentityCacheGC is required to implement IPIdentityMappingListener.
-func (cache *NPHDSCache) OnIPIdentityCacheGC() {
-	// We don't have anything to synchronize in this case.
 }
 
 // OnIPIdentityCacheChange pushes modifications to the IP<->Identity mapping
@@ -103,7 +99,8 @@ func (cache *NPHDSCache) OnIPIdentityCacheGC() {
 // IP/ID mappings.
 func (cache *NPHDSCache) OnIPIdentityCacheChange(modType ipcache.CacheModification, cidrCluster cmtypes.PrefixCluster,
 	oldHostIP, newHostIP net.IP, oldID *ipcache.Identity, newID ipcache.Identity,
-	encryptKey uint8, k8sMeta *ipcache.K8sMetadata) {
+	encryptKey uint8, k8sMeta *ipcache.K8sMetadata,
+) {
 	cidr := cidrCluster.AsIPNet()
 
 	cidrStr := cidr.String()
@@ -165,7 +162,7 @@ func (cache *NPHDSCache) handleIPUpsert(npHost *envoyAPI.NetworkPolicyHosts, ide
 		hostAddresses = make([]string, 0, len(npHost.HostAddresses)+1)
 		hostAddresses = append(hostAddresses, npHost.HostAddresses...)
 		hostAddresses = append(hostAddresses, cidrStr)
-		sort.Strings(hostAddresses)
+		slices.Sort(hostAddresses)
 	}
 
 	newNpHost := envoyAPI.NetworkPolicyHosts{

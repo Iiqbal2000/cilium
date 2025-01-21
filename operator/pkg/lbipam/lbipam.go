@@ -8,33 +8,32 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"net/netip"
-	"runtime/pprof"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/sirupsen/logrus"
-	meta "k8s.io/apimachinery/pkg/api/meta"
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/job"
+	"go4.org/netipx"
+	"k8s.io/apimachinery/pkg/api/meta"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/workqueue"
 
-	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
-	"github.com/cilium/cilium/pkg/hive/job"
+	"github.com/cilium/cilium/pkg/annotation"
 	"github.com/cilium/cilium/pkg/ipalloc"
 	"github.com/cilium/cilium/pkg/k8s"
 	cilium_api_v2alpha1 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
-	cilium_client_v2alpha1 "github.com/cilium/cilium/pkg/k8s/client/clientset/versioned/typed/cilium.io/v2alpha1"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	slim_core_v1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
 	slim_meta "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/api/meta"
 	slim_meta_v1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
 	client_typed_v1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/client/clientset/versioned/typed/core/v1"
-	"github.com/cilium/cilium/pkg/option"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 )
 
 const (
@@ -46,9 +45,7 @@ const (
 	ciliumPoolIPsUsedCondition      = "cilium.io/IPsUsed"
 	ciliumPoolConflict              = "cilium.io/PoolConflict"
 
-	// The annotation LB IPAM will look for when searching for requested IPs
-	ciliumSvcLBIPSAnnotation = "io.cilium/lb-ipam-ips"
-	ciliumSvcLBISKAnnotation = "io.cilium/lb-ipam-sharing-key"
+	ciliumSvcLBISKCNWildward = "*"
 
 	// The string used in the FieldManager field on update options
 	ciliumFieldManager = "cilium-operator-lb-ipam"
@@ -66,82 +63,50 @@ var (
 	)
 )
 
-func newLBIPAM(params LBIPAMParams) *LBIPAM {
-	if !params.Clientset.IsEnabled() {
-		return nil
-	}
+type poolClient interface {
+	Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts meta_v1.PatchOptions, subresources ...string) (result *cilium_api_v2alpha1.CiliumLoadBalancerIPPool, err error)
+}
 
-	var lbClasses []string
-	if params.DaemonConfig.EnableBGPControlPlane {
-		lbClasses = append(lbClasses, cilium_api_v2alpha1.BGPLoadBalancerClass)
-	}
+type lbIPAMParams struct {
+	logger *slog.Logger
 
-	if params.DaemonConfig.EnableL2Announcements {
-		lbClasses = append(lbClasses, cilium_api_v2alpha1.L2AnnounceLoadBalancerClass)
-	}
+	lbClasses   []string
+	ipv4Enabled bool
+	ipv6Enabled bool
+	lbProtoDiff bool
 
-	jobGroup := params.JobRegistry.NewGroup(
-		params.Scope,
-		job.WithLogger(params.Logger),
-		job.WithPprofLabels(pprof.Labels("cell", "lbipam")),
-	)
+	poolClient poolClient
+	svcClient  client_typed_v1.ServicesGetter
 
+	poolResource resource.Resource[*cilium_api_v2alpha1.CiliumLoadBalancerIPPool]
+	svcResource  resource.Resource[*slim_core_v1.Service]
+
+	jobGroup job.Group
+
+	metrics *ipamMetrics
+
+	config      lbipamConfig
+	defaultIPAM bool
+}
+
+func newLBIPAM(params lbIPAMParams) *LBIPAM {
 	lbIPAM := &LBIPAM{
-		logger:       params.Logger,
-		poolResource: params.PoolResource,
-		svcResource:  params.SvcResource,
-		poolClient:   params.Clientset.CiliumV2alpha1().CiliumLoadBalancerIPPools(),
-		svcClient:    params.Clientset.Slim().CoreV1(),
-		shutdowner:   params.Shutdowner,
+		lbIPAMParams: params,
 		pools:        make(map[string]*cilium_api_v2alpha1.CiliumLoadBalancerIPPool),
 		rangesStore:  newRangesStore(),
 		serviceStore: NewServiceStore(),
-		lbClasses:    lbClasses,
-		ipv4Enabled:  option.Config.IPv4Enabled(),
-		ipv6Enabled:  option.Config.IPv6Enabled(),
-		jobGroup:     jobGroup,
-		metrics:      params.Metrics,
 	}
-
-	jobGroup.Add(
-		job.OneShot("lbipam main", func(ctx context.Context, health cell.HealthReporter) error {
-			lbIPAM.Run(ctx, health)
-			return nil
-		}),
-	)
-
-	params.LC.Append(jobGroup)
-
 	return lbIPAM
 }
 
 // LBIPAM is the loadbalancer IP address manager, controller which allocates and assigns IP addresses
 // to LoadBalancer services from the configured set of LoadBalancerIPPools in the cluster.
 type LBIPAM struct {
-	logger logrus.FieldLogger
-
-	lbClasses   []string
-	ipv4Enabled bool
-	ipv6Enabled bool
-
-	poolClient cilium_client_v2alpha1.CiliumLoadBalancerIPPoolInterface
-	svcClient  client_typed_v1.ServicesGetter
-
-	poolResource resource.Resource[*cilium_api_v2alpha1.CiliumLoadBalancerIPPool]
-	svcResource  resource.Resource[*slim_core_v1.Service]
-
-	shutdowner hive.Shutdowner
+	lbIPAMParams
 
 	pools        map[string]*cilium_api_v2alpha1.CiliumLoadBalancerIPPool
 	rangesStore  rangesStore
 	serviceStore serviceStore
-
-	jobGroup job.Group
-
-	metrics *ipamMetrics
-
-	// Only used during testing.
-	initDoneCallbacks []func()
 }
 
 func (ipam *LBIPAM) restart() {
@@ -154,77 +119,22 @@ func (ipam *LBIPAM) restart() {
 
 	// Re-start the main goroutine
 	ipam.jobGroup.Add(
-		job.OneShot("lbipam main", func(ctx context.Context, health cell.HealthReporter) error {
+		job.OneShot("lbipam-main", func(ctx context.Context, health cell.Health) error {
 			ipam.Run(ctx, health)
 			return nil
 		}),
 	)
 }
 
-func (ipam *LBIPAM) Run(ctx context.Context, health cell.HealthReporter) {
+func (ipam *LBIPAM) Run(ctx context.Context, health cell.Health) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	poolChan := ipam.poolResource.Events(ctx, eventsOpts)
 
 	ipam.logger.Info("LB-IPAM initializing")
-
-	// Synchronize pools first as we need them before we can satisfy
-	// the services. This will also wait for the first pool to appear
-	// before we start processing the services, which will save us from
-	// unnecessary work when LB-IPAM is not used.
-	poolsSynced := false
-	for event := range poolChan {
-		if event.Kind == resource.Sync {
-			err := ipam.settleConflicts(ctx)
-			if err != nil {
-				ipam.logger.WithError(err).Error("Error while settling pool conflicts")
-				// Keep retrying the handling of the sync event until we succeed.
-				// During this time we may receive further updates and deletes.
-				event.Done(err)
-				continue
-			}
-			poolsSynced = true
-			event.Done(nil)
-		} else {
-			ipam.handlePoolEvent(ctx, event)
-		}
-
-		// Pools have been synchronized and we've got more than
-		// one pool, continue initialization.
-		if poolsSynced && len(ipam.pools) > 0 {
-			break
-		}
-	}
-
-	svcChan := ipam.svcResource.Events(ctx, eventsOpts)
-
-	for event := range svcChan {
-		if event.Kind == resource.Sync {
-			if err := ipam.satisfyServices(ctx); err != nil {
-				ipam.logger.WithError(err).Error("Error while satisfying services")
-				// Keep retrying the handling of the sync event until we succeed.
-				event.Done(err)
-				continue
-			}
-			if err := ipam.updateAllPoolCounts(ctx); err != nil {
-				ipam.logger.WithError(err).Error("Error while updating pool counts")
-				event.Done(err)
-				continue
-			}
-			event.Done(nil)
-			break
-		} else {
-			ipam.handleServiceEvent(ctx, event)
-		}
-	}
-
+	svcChan := ipam.initialize(ctx, poolChan)
 	ipam.logger.Info("LB-IPAM done initializing")
-	for _, cb := range ipam.initDoneCallbacks {
-		if cb != nil {
-			cb()
-		}
-	}
 
 	for {
 		select {
@@ -255,19 +165,75 @@ func (ipam *LBIPAM) Run(ctx context.Context, health cell.HealthReporter) {
 	}
 }
 
+func (ipam *LBIPAM) initialize(
+	ctx context.Context,
+	poolChan <-chan resource.Event[*cilium_api_v2alpha1.CiliumLoadBalancerIPPool],
+) <-chan resource.Event[*slim_core_v1.Service] {
+	// Synchronize pools first as we need them before we can satisfy
+	// the services. This will also wait for the first pool to appear
+	// before we start processing the services, which will save us from
+	// unnecessary work when LB-IPAM is not used.
+	poolsSynced := false
+	for event := range poolChan {
+		if event.Kind == resource.Sync {
+			err := ipam.settleConflicts(ctx)
+			if err != nil {
+				ipam.logger.Error("Error while settling pool conflicts", logfields.Error, err)
+				// Keep retrying the handling of the sync event until we succeed.
+				// During this time we may receive further updates and deletes.
+				event.Done(err)
+				continue
+			}
+			poolsSynced = true
+			event.Done(nil)
+		} else {
+			ipam.handlePoolEvent(ctx, event)
+		}
+
+		// Pools have been synchronized and we've got more than
+		// one pool, continue initialization.
+		if poolsSynced && len(ipam.pools) > 0 {
+			break
+		}
+	}
+
+	svcChan := ipam.svcResource.Events(ctx, eventsOpts)
+	for event := range svcChan {
+		if event.Kind == resource.Sync {
+			if err := ipam.satisfyServices(ctx); err != nil {
+				ipam.logger.Error("Error while satisfying services", logfields.Error, err)
+				// Keep retrying the handling of the sync event until we succeed.
+				event.Done(err)
+				continue
+			}
+			if err := ipam.updateAllPoolCounts(ctx); err != nil {
+				ipam.logger.Error("Error while updating pool counts", logfields.Error, err)
+				event.Done(err)
+				continue
+			}
+			event.Done(nil)
+			break
+		} else {
+			ipam.handleServiceEvent(ctx, event)
+		}
+	}
+
+	return svcChan
+}
+
 func (ipam *LBIPAM) handlePoolEvent(ctx context.Context, event resource.Event[*cilium_api_v2alpha1.CiliumLoadBalancerIPPool]) {
 	var err error
 	switch event.Kind {
 	case resource.Upsert:
-		err = ipam.poolOnUpsert(ctx, event.Key, event.Object)
+		err = ipam.poolOnUpsert(ctx, event.Object)
 		if err != nil {
-			ipam.logger.WithError(err).Error("pool upsert failed")
+			ipam.logger.Error("pool upsert failed", logfields.Error, err)
 			err = fmt.Errorf("poolOnUpsert: %w", err)
 		}
 	case resource.Delete:
-		err = ipam.poolOnDelete(ctx, event.Key, event.Object)
+		err = ipam.poolOnDelete(ctx, event.Object)
 		if err != nil {
-			ipam.logger.WithError(err).Error("pool delete failed")
+			ipam.logger.Error("pool delete failed", logfields.Error, err)
 			err = fmt.Errorf("poolOnDelete: %w", err)
 		}
 	}
@@ -278,28 +244,22 @@ func (ipam *LBIPAM) handleServiceEvent(ctx context.Context, event resource.Event
 	var err error
 	switch event.Kind {
 	case resource.Upsert:
-		err = ipam.svcOnUpsert(ctx, event.Key, event.Object)
+		err = ipam.svcOnUpsert(ctx, event.Object)
 		if err != nil {
-			ipam.logger.WithError(err).Error("service upsert failed")
+			ipam.logger.Error("service upsert failed", logfields.Error, err)
 			err = fmt.Errorf("svcOnUpsert: %w", err)
 		}
 	case resource.Delete:
-		err = ipam.svcOnDelete(ctx, event.Key, event.Object)
+		err = ipam.svcOnDelete(ctx, event.Object)
 		if err != nil {
-			ipam.logger.WithError(err).Error("service delete failed")
+			ipam.logger.Error("service delete failed", logfields.Error, err)
 			err = fmt.Errorf("svcOnDelete: %w", err)
 		}
 	}
 	event.Done(err)
 }
 
-// RegisterOnReady registers a callback function which will be invoked when LBIPAM is done initializing.
-// Note: mainly used in the integration tests.
-func (ipam *LBIPAM) RegisterOnReady(cb func()) {
-	ipam.initDoneCallbacks = append(ipam.initDoneCallbacks, cb)
-}
-
-func (ipam *LBIPAM) poolOnUpsert(ctx context.Context, k resource.Key, pool *cilium_api_v2alpha1.CiliumLoadBalancerIPPool) error {
+func (ipam *LBIPAM) poolOnUpsert(ctx context.Context, pool *cilium_api_v2alpha1.CiliumLoadBalancerIPPool) error {
 	// Deep copy so we get a version we are allowed to update the status
 	pool = pool.DeepCopy()
 
@@ -332,7 +292,7 @@ func (ipam *LBIPAM) poolOnUpsert(ctx context.Context, k resource.Key, pool *cili
 	return nil
 }
 
-func (ipam *LBIPAM) poolOnDelete(ctx context.Context, k resource.Key, pool *cilium_api_v2alpha1.CiliumLoadBalancerIPPool) error {
+func (ipam *LBIPAM) poolOnDelete(ctx context.Context, pool *cilium_api_v2alpha1.CiliumLoadBalancerIPPool) error {
 	err := ipam.handlePoolDeleted(ctx, pool)
 	if err != nil {
 		return fmt.Errorf("handlePoolDeleted: %w", err)
@@ -351,7 +311,7 @@ func (ipam *LBIPAM) poolOnDelete(ctx context.Context, k resource.Key, pool *cili
 	return nil
 }
 
-func (ipam *LBIPAM) svcOnUpsert(ctx context.Context, k resource.Key, svc *slim_core_v1.Service) error {
+func (ipam *LBIPAM) svcOnUpsert(ctx context.Context, svc *slim_core_v1.Service) error {
 	err := ipam.handleUpsertService(ctx, svc)
 	if err != nil {
 		return fmt.Errorf("handleUpsertService: %w", err)
@@ -365,8 +325,8 @@ func (ipam *LBIPAM) svcOnUpsert(ctx context.Context, k resource.Key, svc *slim_c
 	return nil
 }
 
-func (ipam *LBIPAM) svcOnDelete(ctx context.Context, k resource.Key, svc *slim_core_v1.Service) error {
-	ipam.logger.Debugf("Deleted service '%s/%s'", svc.GetNamespace(), svc.GetName())
+func (ipam *LBIPAM) svcOnDelete(ctx context.Context, svc *slim_core_v1.Service) error {
+	ipam.logger.Debug(fmt.Sprintf("Deleted service '%s/%s'", svc.GetNamespace(), svc.GetName()))
 
 	ipam.handleDeletedService(svc)
 
@@ -409,7 +369,7 @@ func (ipam *LBIPAM) handleUpsertService(ctx context.Context, svc *slim_core_v1.S
 		// we were responsible before, but not anymore
 
 		// Release allocations and other references as if the service was deleted
-		if err := ipam.svcOnDelete(ctx, key, svc); err != nil {
+		if err := ipam.svcOnDelete(ctx, svc); err != nil {
 			return fmt.Errorf("svcOnDelete: %w", err)
 		}
 
@@ -442,7 +402,7 @@ func (ipam *LBIPAM) handleUpsertService(ctx context.Context, svc *slim_core_v1.S
 		return fmt.Errorf("stripOrImportIngresses: %w", err)
 	}
 
-	// Attempt to satisfy this service in particular now. We do this now instread of relying on
+	// Attempt to satisfy this service in particular now. We do this now instead of relying on
 	// ipam.satisfyServices to avoid updating the service twice in quick succession.
 	if !sv.isSatisfied() {
 		modified, err := ipam.satisfyService(sv)
@@ -480,7 +440,8 @@ func (ipam *LBIPAM) serviceViewFromService(key resource.Key, svc *slim_core_v1.S
 	sv.Labels = svcLabels(svc)
 	sv.RequestedFamilies.IPv4, sv.RequestedFamilies.IPv6 = ipam.serviceIPFamilyRequest(svc)
 	sv.RequestedIPs = getSVCRequestedIPs(ipam.logger, svc)
-	sv.SharingKey = getSVCSharingKey(ipam.logger, svc)
+	sv.SharingKey = getSVCSharingKey(svc)
+	sv.SharingCrossNamespace = getSVCSharingCrossNamespace(svc)
 	sv.ExternalTrafficPolicy = svc.Spec.ExternalTrafficPolicy
 	sv.Ports = make([]slim_core_v1.ServicePort, len(svc.Spec.Ports))
 	copy(sv.Ports, svc.Spec.Ports)
@@ -500,8 +461,8 @@ func (ipam *LBIPAM) stripInvalidAllocations(sv *ServiceView) error {
 	for allocIdx := len(sv.AllocatedIPs) - 1; allocIdx >= 0; allocIdx-- {
 		alloc := sv.AllocatedIPs[allocIdx]
 
-		releaseAllocIP := func() error {
-			ipam.logger.Debugf("removing allocation '%s' from '%s'", alloc.IP.String(), sv.Key.String())
+		releaseAllocIP := func() {
+			ipam.logger.Debug(fmt.Sprintf("removing allocation '%s' from '%s'", alloc.IP.String(), sv.Key.String()))
 			sharingGroup, _ := alloc.Origin.alloc.Get(alloc.IP)
 
 			idx := slices.Index(sharingGroup, sv)
@@ -511,21 +472,18 @@ func (ipam *LBIPAM) stripInvalidAllocations(sv *ServiceView) error {
 
 			if len(sharingGroup) == 0 {
 				alloc.Origin.alloc.Free(alloc.IP)
+				ipam.rangesStore.DeleteServiceViewIPForSharingKey(sv.SharingKey, &alloc)
 			} else {
 				alloc.Origin.alloc.Update(alloc.IP, sharingGroup)
 			}
 
 			sv.AllocatedIPs = slices.Delete(sv.AllocatedIPs, allocIdx, allocIdx+1)
-
-			ipam.rangesStore.DeleteServiceViewIPForSharingKey(sv.SharingKey, &alloc)
-
-			return nil
 		}
 
 		// If origin pool no longer exists, remove allocation
 		pool, found := ipam.pools[alloc.Origin.originPool]
 		if !found {
-			errs = errors.Join(errs, releaseAllocIP())
+			releaseAllocIP()
 			continue
 		}
 
@@ -533,37 +491,21 @@ func (ipam *LBIPAM) stripInvalidAllocations(sv *ServiceView) error {
 		if pool.Spec.ServiceSelector != nil {
 			selector, err := slim_meta_v1.LabelSelectorAsSelector(pool.Spec.ServiceSelector)
 			if err != nil {
-				errs = errors.Join(errs, fmt.Errorf("Making selector from pool '%s' label selector", pool.Name))
+				errs = errors.Join(errs, fmt.Errorf("making selector from pool '%s' label selector", pool.Name))
 				continue
 			}
 
 			if !selector.Matches(sv.Labels) {
-				errs = errors.Join(errs, releaseAllocIP())
+				releaseAllocIP()
 				continue
 			}
 		}
 
 		// Check if all AllocatedIPs that are part of a sharing group, if this service is still compatible with them.
 		// If this service is no longer compatible, we have to remove the IP from the sharing group and re-allocate.
-		for _, allocIP := range sv.AllocatedIPs {
-			sharedViews, _ := allocIP.Origin.alloc.Get(allocIP.IP)
-			if len(sharedViews) == 1 {
-				// The allocation isn't shared, we can continue
-				continue
-			}
-
-			compatible := true
-			for _, sharedView := range sharedViews {
-				if sv != sharedView && !sharedView.isCompatible(sv) {
-					compatible = false
-					break
-				}
-			}
-
-			if !compatible {
-				errs = errors.Join(errs, releaseAllocIP())
-				break
-			}
+		if !ipam.checkSharingGroupCompatibility(sv) {
+			releaseAllocIP()
+			continue
 		}
 
 		// If the service is requesting specific IPs
@@ -577,7 +519,7 @@ func (ipam *LBIPAM) stripInvalidAllocations(sv *ServiceView) error {
 			}
 			// If allocated IP has not been requested, remove it
 			if !found {
-				errs = errors.Join(errs, releaseAllocIP())
+				releaseAllocIP()
 				continue
 			}
 		} else {
@@ -586,14 +528,13 @@ func (ipam *LBIPAM) stripInvalidAllocations(sv *ServiceView) error {
 			if isIPv6(alloc.IP) {
 				// Service has an IPv6 address, but its spec doesn't request it anymore, so take it away
 				if !sv.RequestedFamilies.IPv6 {
-					errs = errors.Join(errs, releaseAllocIP())
+					releaseAllocIP()
 					continue
 				}
-
 			} else {
 				// Service has an IPv4 address, but its spec doesn't request it anymore, so take it away
 				if !sv.RequestedFamilies.IPv4 {
-					errs = errors.Join(errs, releaseAllocIP())
+					releaseAllocIP()
 					continue
 				}
 			}
@@ -601,6 +542,26 @@ func (ipam *LBIPAM) stripInvalidAllocations(sv *ServiceView) error {
 	}
 
 	return errs
+}
+
+func (ipam *LBIPAM) checkSharingGroupCompatibility(sv *ServiceView) bool {
+	for _, allocIP := range sv.AllocatedIPs {
+		sharedViews, _ := allocIP.Origin.alloc.Get(allocIP.IP)
+		if len(sharedViews) == 1 {
+			// The allocation isn't shared, we can continue
+			continue
+		}
+
+		for _, sharedView := range sharedViews {
+			if sv != sharedView {
+				if c, _ := sharedView.isCompatible(sv, ipam.lbProtoDiff); !c {
+					return false
+				}
+			}
+		}
+	}
+
+	return true
 }
 
 func (ipam *LBIPAM) stripOrImportIngresses(sv *ServiceView) (statusModified bool, err error) {
@@ -670,13 +631,18 @@ func (ipam *LBIPAM) stripOrImportIngresses(sv *ServiceView) (statusModified bool
 					continue
 				}
 
-				return statusModified, fmt.Errorf("Error while attempting to allocate IP '%s'", ingress.IP)
+				return statusModified, fmt.Errorf("error while attempting to allocate IP '%s'", ingress.IP)
 			}
 
 			sv.AllocatedIPs = append(sv.AllocatedIPs, ServiceViewIP{
 				IP:     ip,
 				Origin: lbRange,
 			})
+
+			// If the `ServiceView` has a sharing key, add the IP to the `rangeStore` index
+			if sv.SharingKey != "" {
+				ipam.rangesStore.AddServiceViewIPForSharingKey(sv.SharingKey, &sv.AllocatedIPs[len(sv.AllocatedIPs)-1])
+			}
 		}
 
 		newIngresses = append(newIngresses, ingress)
@@ -697,24 +663,24 @@ func (ipam *LBIPAM) stripOrImportIngresses(sv *ServiceView) (statusModified bool
 	return statusModified, nil
 }
 
-func getSVCRequestedIPs(log logrus.FieldLogger, svc *slim_core_v1.Service) []netip.Addr {
+func getSVCRequestedIPs(log *slog.Logger, svc *slim_core_v1.Service) []netip.Addr {
 	var ips []netip.Addr
 	if svc.Spec.LoadBalancerIP != "" {
 		ip, err := netip.ParseAddr(svc.Spec.LoadBalancerIP)
 		if err == nil {
 			ips = append(ips, ip)
 		} else {
-			log.WithError(err).Error("Unable to parse service.spec.LoadBalancerIP")
+			log.Error("Unable to parse service.spec.LoadBalancerIP", logfields.Error, err)
 		}
 	}
 
-	if annotation := svc.Annotations[ciliumSvcLBIPSAnnotation]; annotation != "" {
-		for _, ipStr := range strings.Split(annotation, ",") {
+	if value, _ := annotation.Get(svc, annotation.LBIPAMIPsKey, annotation.LBIPAMIPKeyAlias); value != "" {
+		for _, ipStr := range strings.Split(value, ",") {
 			ip, err := netip.ParseAddr(strings.TrimSpace(ipStr))
 			if err == nil {
 				ips = append(ips, ip)
 			} else {
-				log.WithError(err).Error("Unable to parse service.spec.LoadBalancerIP")
+				log.Error("Unable to parse service.spec.LoadBalancerIP", logfields.Error, err)
 			}
 		}
 	}
@@ -724,11 +690,18 @@ func getSVCRequestedIPs(log logrus.FieldLogger, svc *slim_core_v1.Service) []net
 	})
 }
 
-func getSVCSharingKey(log logrus.FieldLogger, svc *slim_core_v1.Service) string {
-	if annotation := svc.Annotations[ciliumSvcLBISKAnnotation]; annotation != "" {
-		return annotation
+func getSVCSharingKey(svc *slim_core_v1.Service) string {
+	if val, _ := annotation.Get(svc, annotation.LBIPAMSharingKey, annotation.LBIPAMSharingKeyAlias); val != "" {
+		return val
 	}
 	return ""
+}
+
+func getSVCSharingCrossNamespace(svc *slim_core_v1.Service) []string {
+	if val, _ := annotation.Get(svc, annotation.LBIPAMSharingAcrossNamespace, annotation.LBIPAMSharingAcrossNamespaceAlias); val != "" {
+		return strings.Split(val, ",")
+	}
+	return []string{}
 }
 
 func (ipam *LBIPAM) handleDeletedService(svc *slim_core_v1.Service) {
@@ -757,15 +730,15 @@ func (ipam *LBIPAM) handleDeletedService(svc *slim_core_v1.Service) {
 			alloc.Origin.alloc.Update(alloc.IP, sharingGroupIPs)
 		} else {
 			alloc.Origin.alloc.Free(alloc.IP)
+			// The `ServiceView` has a sharing key, remove the IP from the `rangeStore` index
+			if sv.SharingKey != "" {
+				ipam.rangesStore.DeleteServiceViewIPForSharingKey(sv.SharingKey, &ServiceViewIP{
+					IP:     alloc.IP,
+					Origin: alloc.Origin,
+				})
+			}
 		}
 
-		// The `ServiceView` has a sharing key, remove the IP from the `rangeStore` index
-		if sv.SharingKey != "" {
-			ipam.rangesStore.DeleteServiceViewIPForSharingKey(sv.SharingKey, &ServiceViewIP{
-				IP:     alloc.IP,
-				Origin: alloc.Origin,
-			})
-		}
 	}
 
 	ipam.serviceStore.Delete(key)
@@ -883,17 +856,19 @@ func (ipam *LBIPAM) satisfySpecificIPRequests(sv *ServiceView) (statusModified b
 			// Check if the ports and external traffic policy of the current service is compatible with the existing `ServiceViews`
 			// This also checks if the sharing key is the same
 			compatible := true
+			incompatibilityReason := ""
 			for _, serviceView := range serviceViews {
-				if !(serviceView.isCompatible(sv)) {
+				if c, r := serviceView.isCompatible(sv, ipam.lbProtoDiff); !c {
 					compatible = false
+					incompatibilityReason = r
 					break
 				}
 			}
 			// if it is, add the service view to the list, and satisfy the IP
 			if !compatible {
-				// The IP was requested and a sharing key was provided, but the IP is already allocated to another service with a different sharing key.
-				msg := fmt.Sprintf("The IP '%s' is already allocated to another service with a different sharing key", reqIP)
-				reason := "already_allocated_different_sharing_key"
+				// The IP was requested and a sharing key was provided, but the service isn't compatible with one of the services sharing the IP.
+				msg := fmt.Sprintf("The IP '%s' is already allocated to an incompatible service. Reason: %s", reqIP, incompatibilityReason)
+				reason := "already_allocated_incompatible_service"
 				if ipam.setSVCSatisfiedCondition(sv, false, reason, msg) {
 					statusModified = true
 				}
@@ -902,18 +877,18 @@ func (ipam *LBIPAM) satisfySpecificIPRequests(sv *ServiceView) (statusModified b
 			serviceViews = append(serviceViews, sv)
 			err = lbRange.alloc.Update(reqIP, serviceViews)
 			if err != nil {
-				ipam.logger.WithError(err).Errorf("Error while attempting to update IP '%s'", reqIP)
+				ipam.logger.Error(fmt.Sprintf("Error while attempting to update IP '%s'", reqIP), logfields.Error, err)
 				continue
 			}
 		} else {
-			ipam.logger.Debugf("Allocate '%s' for '%s'", reqIP.String(), sv.Key.String())
+			ipam.logger.Debug(fmt.Sprintf("Allocate '%s' for '%s'", reqIP.String(), sv.Key.String()))
 			err = lbRange.alloc.Alloc(reqIP, []*ServiceView{sv})
 			if err != nil {
 				if errors.Is(err, ipalloc.ErrInUse) {
 					return statusModified, fmt.Errorf("ipalloc.Alloc: %w", err)
 				}
 
-				ipam.logger.WithError(err).Error("Unable to allocate IP")
+				ipam.logger.Error("Unable to allocate IP", logfields.Error, err)
 				continue
 			}
 		}
@@ -976,7 +951,7 @@ func (ipam *LBIPAM) satisfyGenericIPv4Requests(sv *ServiceView) (statusModified 
 			// Check if the ports and external traffic policy of the current service is compatible with the existing `ServiceViews`
 			compatible := true
 			for _, serviceView := range serviceViews {
-				if !(serviceView.isCompatible(sv)) {
+				if c, _ := serviceView.isCompatible(sv, ipam.lbProtoDiff); !c {
 					compatible = false
 					break
 				}
@@ -1042,7 +1017,7 @@ func (ipam *LBIPAM) satisfyGenericIPv6Requests(sv *ServiceView) (statusModified 
 				// Check if the ports and external traffic policy of the current service is compatible with the existing `ServiceViews`
 				compatible := true
 				for _, serviceView := range serviceViews {
-					if !(serviceView.isCompatible(sv)) {
+					if c, _ := serviceView.isCompatible(sv, ipam.lbProtoDiff); !c {
 						compatible = false
 						break
 					}
@@ -1135,7 +1110,7 @@ func (ipam *LBIPAM) findRangeOfIP(sv *ServiceView, ip netip.Addr) (lbRange *LBRa
 		if pool.Spec.ServiceSelector != nil {
 			selector, err := slim_meta_v1.LabelSelectorAsSelector(pool.Spec.ServiceSelector)
 			if err != nil {
-				return nil, false, fmt.Errorf("Making selector from pool '%s' label selector: %w", pool.Name, err)
+				return nil, false, fmt.Errorf("making selector from pool '%s' label selector: %w", pool.Name, err)
 			}
 
 			if !selector.Matches(sv.Labels) {
@@ -1156,10 +1131,8 @@ func (ipam *LBIPAM) isResponsibleForSVC(svc *slim_core_v1.Service) bool {
 		return false
 	}
 
-	// We will assume that we are the default LB, LB-IPAM shouldn't be enabled clusters that don't support LBClasses
-	// and have multiple LBs.
 	if svc.Spec.LoadBalancerClass == nil {
-		return true
+		return ipam.lbIPAMParams.defaultIPAM
 	}
 
 	if !slices.Contains(ipam.lbClasses, *svc.Spec.LoadBalancerClass) {
@@ -1204,8 +1177,8 @@ func (ipam *LBIPAM) allocateIPAddress(
 
 		pool, found := ipam.pools[lbRange.originPool]
 		if !found {
-			ipam.logger.WithField("pool-name", lbRange.originPool).
-				Warnf("Bad state detected, store contains lbRange for pool '%s' but missing the pool", lbRange.originPool)
+			ipam.logger.Warn(fmt.Sprintf("Bad state detected, store contains lbRange for pool '%s' but missing the pool", lbRange.originPool),
+				"pool-name", lbRange.originPool)
 			continue
 		}
 
@@ -1213,7 +1186,7 @@ func (ipam *LBIPAM) allocateIPAddress(
 		if pool.Spec.ServiceSelector != nil {
 			selector, err := slim_meta_v1.LabelSelectorAsSelector(pool.Spec.ServiceSelector)
 			if err != nil {
-				return netip.Addr{}, nil, fmt.Errorf("Making selector from pool '%s' label selector: %w", pool.Name, err)
+				return netip.Addr{}, nil, fmt.Errorf("making selector from pool '%s' label selector: %w", pool.Name, err)
 			}
 
 			if !selector.Matches(sv.Labels) {
@@ -1230,7 +1203,7 @@ func (ipam *LBIPAM) allocateIPAddress(
 				continue
 			}
 
-			ipam.logger.WithError(err).Error("Allocate next IP from lb range")
+			ipam.logger.Error("Allocate next IP from lb range", logfields.Error, err)
 			continue
 		}
 
@@ -1307,28 +1280,25 @@ func (ipam *LBIPAM) serviceIPFamilyRequest(svc *slim_core_v1.Service) (IPv4Reque
 func (ipam *LBIPAM) handleNewPool(ctx context.Context, pool *cilium_api_v2alpha1.CiliumLoadBalancerIPPool) error {
 	// Sanity check that we do not yet know about this pool.
 	if _, found := ipam.pools[pool.GetName()]; found {
-		ipam.logger.WithField("pool-name", pool.GetName()).
-			Warnf("LB IPPool '%s' has been created, but a LB IP Pool with the same name already exists", pool.GetName())
+		ipam.logger.Warn(fmt.Sprintf("LB IPPool '%s' has been created, but a LB IP Pool with the same name already exists", pool.GetName()),
+			"pool-name", pool.GetName())
 		return nil
 	}
 
 	ipam.pools[pool.GetName()] = pool
-	blocks := append(pool.Spec.Cidrs, pool.Spec.Blocks...)
-	for _, ipBlock := range blocks {
+	for _, ipBlock := range pool.Spec.Blocks {
 		from, to, fromCidr, err := ipRangeFromBlock(ipBlock)
 		if err != nil {
-			return fmt.Errorf("Error parsing ip block: %w", err)
+			return fmt.Errorf("error parsing ip block: %w", err)
 		}
 
 		lbRange, err := NewLBRange(from, to, pool)
 		if err != nil {
-			return fmt.Errorf("Error making LB Range for '%s': %w", ipBlock.Cidr, err)
+			return fmt.Errorf("error making LB Range for '%s': %w", ipBlock.Cidr, err)
 		}
 
-		// If AllowFirstLastIPs is no or unspecified, mark the first and last IP as allocated upon range creation.
-		if fromCidr && pool.Spec.AllowFirstLastIPs != cilium_api_v2alpha1.AllowFirstLastIPYes {
-			// TODO: in 1.16 switch from default no to default yes.
-			// https://github.com/cilium/cilium/issues/28591
+		// If AllowFirstLastIPs is no, mark the first and last IP as allocated upon range creation.
+		if fromCidr && pool.Spec.AllowFirstLastIPs == cilium_api_v2alpha1.AllowFirstLastIPNo {
 			from, to := lbRange.alloc.Range()
 
 			// If the first and last IPs are the same or adjacent, we would reserve the entire range.
@@ -1352,7 +1322,7 @@ func ipRangeFromBlock(block cilium_api_v2alpha1.CiliumLoadBalancerIPPoolIPBlock)
 	if string(block.Cidr) != "" {
 		prefix, err := netip.ParsePrefix(string(block.Cidr))
 		if err != nil {
-			return netip.Addr{}, netip.Addr{}, false, fmt.Errorf("Error parsing cidr '%s': %w", block.Cidr, err)
+			return netip.Addr{}, netip.Addr{}, false, fmt.Errorf("error parsing cidr '%s': %w", block.Cidr, err)
 		}
 
 		to, from = rangeFromPrefix(prefix)
@@ -1378,8 +1348,8 @@ func ipRangeFromBlock(block cilium_api_v2alpha1.CiliumLoadBalancerIPPoolIPBlock)
 func (ipam *LBIPAM) handlePoolModified(ctx context.Context, pool *cilium_api_v2alpha1.CiliumLoadBalancerIPPool) error {
 	changedAllowFirstLastIPs := false
 	if existingPool, ok := ipam.pools[pool.GetName()]; ok {
-		changedAllowFirstLastIPs = (existingPool.Spec.AllowFirstLastIPs == cilium_api_v2alpha1.AllowFirstLastIPYes) !=
-			(pool.Spec.AllowFirstLastIPs == cilium_api_v2alpha1.AllowFirstLastIPYes)
+		changedAllowFirstLastIPs = (existingPool.Spec.AllowFirstLastIPs == cilium_api_v2alpha1.AllowFirstLastIPNo) !=
+			(pool.Spec.AllowFirstLastIPs == cilium_api_v2alpha1.AllowFirstLastIPNo)
 	}
 
 	ipam.pools[pool.GetName()] = pool
@@ -1389,11 +1359,10 @@ func (ipam *LBIPAM) handlePoolModified(ctx context.Context, pool *cilium_api_v2a
 		fromCidr bool
 	}
 	var newRanges []rng
-	blocks := append(pool.Spec.Cidrs, pool.Spec.Blocks...)
-	for _, newBlock := range blocks {
+	for _, newBlock := range pool.Spec.Blocks {
 		from, to, fromCidr, err := ipRangeFromBlock(newBlock)
 		if err != nil {
-			return fmt.Errorf("Error parsing ip block: %w", err)
+			return fmt.Errorf("error parsing ip block: %w", err)
 		}
 
 		newRanges = append(newRanges, rng{
@@ -1404,6 +1373,7 @@ func (ipam *LBIPAM) handlePoolModified(ctx context.Context, pool *cilium_api_v2a
 	}
 
 	existingRanges, _ := ipam.rangesStore.GetRangesForPool(pool.GetName())
+	existingRanges = slices.Clone(existingRanges)
 
 	// Remove existing ranges that no longer exist
 	for _, extRange := range existingRanges {
@@ -1420,9 +1390,7 @@ func (ipam *LBIPAM) handlePoolModified(ctx context.Context, pool *cilium_api_v2a
 		if found {
 			// If the AllowFirstLastIPs state changed
 			if fromCidr && changedAllowFirstLastIPs {
-				// TODO in 1.16 switch from default no to default yes.
-				// https://github.com/cilium/cilium/issues/28591
-				if pool.Spec.AllowFirstLastIPs == cilium_api_v2alpha1.AllowFirstLastIPYes {
+				if pool.Spec.AllowFirstLastIPs != cilium_api_v2alpha1.AllowFirstLastIPNo {
 					// If we are allowing first and last IPs again, free them for allocation
 					from, to := extRange.alloc.Range()
 
@@ -1471,13 +1439,11 @@ func (ipam *LBIPAM) handlePoolModified(ctx context.Context, pool *cilium_api_v2a
 
 		newLBRange, err := NewLBRange(newRange.from, newRange.to, pool)
 		if err != nil {
-			return fmt.Errorf("Error while making new LB range for range '%s - %s': %w", newRange.from, newRange.to, err)
+			return fmt.Errorf("error while making new LB range for range '%s - %s': %w", newRange.from, newRange.to, err)
 		}
 
-		// If AllowFirstLastIPs is no or default, mark the first and last IP as allocated upon range creation.
-		if newRange.fromCidr && pool.Spec.AllowFirstLastIPs != cilium_api_v2alpha1.AllowFirstLastIPYes {
-			// TODO: in 1.16 switch from default no to default yes.
-			// https://github.com/cilium/cilium/issues/28591
+		// If AllowFirstLastIPs is no, mark the first and last IP as allocated upon range creation.
+		if newRange.fromCidr && pool.Spec.AllowFirstLastIPs == cilium_api_v2alpha1.AllowFirstLastIPNo {
 			from, to := newLBRange.alloc.Range()
 
 			// If the first and last IPs are the same or adjacent, we would reserve the entire range.
@@ -1519,7 +1485,7 @@ func (ipam *LBIPAM) revalidateAllServices(ctx context.Context) error {
 			return fmt.Errorf("stripOrImportIngresses: %w", err)
 		}
 
-		// Attempt to satisfy this service in particular now. We do this now instread of relying on
+		// Attempt to satisfy this service in particular now. We do this now instead of relying on
 		// ipam.satisfyServices to avoid updating the service twice in quick succession.
 		if !sv.isSatisfied() {
 			modified, err := ipam.satisfyService(sv)
@@ -1562,7 +1528,7 @@ func (ipam *LBIPAM) updateAllPoolCounts(ctx context.Context) error {
 	ipam.logger.Debug("Updating pool counts")
 	for _, pool := range ipam.pools {
 		if ipam.updatePoolCounts(pool) {
-			ipam.logger.Debugf("Pool counts of '%s' changed, patching", pool.Name)
+			ipam.logger.Debug(fmt.Sprintf("Pool counts of '%s' changed, patching", pool.Name))
 			err := ipam.patchPoolStatus(ctx, pool)
 			if err != nil {
 				return fmt.Errorf("patchPoolStatus: %w", err)
@@ -1676,7 +1642,7 @@ func (ipam *LBIPAM) deleteRangeAllocations(ctx context.Context, delRange *LBRang
 			return fmt.Errorf("stripOrImportIngresses: %w", err)
 		}
 
-		// Attempt to satisfy this service in particular now. We do this now instread of relying on
+		// Attempt to satisfy this service in particular now. We do this now instead of relying on
 		// ipam.satisfyServices to avoid updating the service twice in quick succession.
 		if !sv.isSatisfied() {
 			statusModified, err := ipam.satisfyService(sv)
@@ -1840,16 +1806,16 @@ func (ipam *LBIPAM) markPoolConflicting(
 
 	ipam.metrics.ConflictingPools.Inc()
 
-	ipam.logger.WithFields(logrus.Fields{
-		"pool1-name":  targetPool.Name,
-		"pool1-range": ipNetStr(targetRange),
-		"pool2-name":  ipNetStr(collisionRange),
-		"pool2-range": collisionPool.Name,
-	}).Warnf("Pool '%s' conflicts since range '%s' overlaps range '%s' from IP Pool '%s'",
-		targetPool.Name,
-		ipNetStr(targetRange),
-		ipNetStr(collisionRange),
-		collisionPool.Name,
+	ipam.logger.Warn(
+		fmt.Sprintf("Pool '%s' conflicts since range '%s' overlaps range '%s' from IP Pool '%s'",
+			targetPool.Name,
+			ipNetStr(targetRange),
+			ipNetStr(collisionRange),
+			collisionPool.Name),
+		"pool1-name", targetPool.Name,
+		"pool1-range", ipNetStr(targetRange),
+		"pool2-name", ipNetStr(collisionRange),
+		"pool2-range", collisionPool.Name,
 	)
 
 	conflictMessage := fmt.Sprintf(
@@ -1945,25 +1911,5 @@ func isIPv6(ip netip.Addr) bool {
 
 func rangeFromPrefix(prefix netip.Prefix) (netip.Addr, netip.Addr) {
 	prefix = prefix.Masked()
-	from := prefix.Addr()
-	bitLen := from.BitLen()
-	varBits := bitLen - prefix.Bits()
-	toSlice := from.AsSlice()
-
-	i := len(toSlice) - 1
-	for varBits > 0 {
-		if varBits >= 8 {
-			toSlice[i] = 0xFF
-			varBits -= 8
-			i--
-			continue
-		}
-
-		mask := byte(1) << varBits
-		toSlice[i] |= mask
-		break
-	}
-
-	to, _ := netip.AddrFromSlice(toSlice)
-	return from, to
+	return prefix.Addr(), netipx.PrefixLastIP(prefix)
 }

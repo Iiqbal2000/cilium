@@ -6,9 +6,6 @@
 #include <bpf/ctx/skb.h>
 #include "pktgen.h"
 
-/* Set ETH_HLEN to 14 to indicate that the packet has a 14 byte ethernet header */
-#define ETH_HLEN 14
-
 /* Enable code paths under test */
 #define ENABLE_IPV6
 #define ENABLE_NODEPORT
@@ -96,7 +93,7 @@ int nodeport_no_backend_setup(struct __ctx_buff *ctx)
 	ipcache_v6_add_entry(&backend_ip, 0, 112233, 0, 0);
 
 	/* Jump into the entrypoint */
-	tail_call_static(ctx, &entry_call_map, FROM_NETDEV);
+	tail_call_static(ctx, entry_call_map, FROM_NETDEV);
 
 	/* Fail if we didn't jump */
 	return TEST_ERROR;
@@ -152,10 +149,15 @@ int nodeport_no_backend_check(__maybe_unused const struct __ctx_buff *ctx)
 	 * context with the runner option and importing the packet into
 	 * wireshark
 	 */
-	assert(l4->icmp6_cksum == bpf_htons(0x7da8));
+	assert(l4->icmp6_cksum == bpf_htons(0x9e14));
 
 	struct ratelimit_key key = {
-		.netdev_idx = 1,
+		.usage = RATELIMIT_USAGE_ICMPV6,
+		.key = {
+			.icmpv6 = {
+				.netdev_idx = 1,
+			},
+		},
 	};
 
 	value = map_lookup_elem(&RATELIMIT_MAP, &key);

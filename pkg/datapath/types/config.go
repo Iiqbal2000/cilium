@@ -11,8 +11,16 @@ import (
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/mac"
 	"github.com/cilium/cilium/pkg/node"
+	nodeTypes "github.com/cilium/cilium/pkg/node/types"
 	"github.com/cilium/cilium/pkg/option"
 )
+
+// NodeNeighborEnqueuer provides an interface for clients to push node updates
+// for further processing.
+type NodeNeighborEnqueuer interface {
+	// Enqueue enqueues a node for processing node neighbors updates.
+	Enqueue(*nodeTypes.Node)
+}
 
 // DeviceConfiguration is an interface for injecting configuration of datapath
 // options that affect lookups and logic applied at a per-device level, whether
@@ -40,6 +48,8 @@ type LoadTimeConfiguration interface {
 	IPv4Address() netip.Addr
 	IPv6Address() netip.Addr
 	GetNodeMAC() mac.MAC
+	GetIfIndex() int
+	GetEndpointNetNsCookie() uint64
 }
 
 // CompileTimeConfiguration provides datapath implementations a clean interface
@@ -94,37 +104,37 @@ type ConfigWriter interface {
 	// of configurable options to the specified writer. Options specified
 	// here will apply to base programs and not to endpoints, though
 	// endpoints may have equivalent configurable options.
-	WriteNetdevConfig(io.Writer, DeviceConfiguration) error
+	WriteNetdevConfig(io.Writer, *option.IntOptions) error
 
 	// WriteTemplateConfig writes the implementation-specific configuration
 	// of configurable options for BPF templates to the specified writer.
-	WriteTemplateConfig(w io.Writer, cfg EndpointConfiguration) error
+	WriteTemplateConfig(w io.Writer, nodeCfg *LocalNodeConfiguration, cfg EndpointConfiguration) error
 
 	// WriteEndpointConfig writes the implementation-specific configuration
 	// of configurable options for the endpoint to the specified writer.
-	WriteEndpointConfig(w io.Writer, cfg EndpointConfiguration) error
+	WriteEndpointConfig(w io.Writer, nodeCfg *LocalNodeConfiguration, cfg EndpointConfiguration) error
 }
 
 // RemoteSNATDstAddrExclusionCIDRv4 returns a CIDR for SNAT exclusion. Any
 // packet sent from a local endpoint to an IP address belonging to the CIDR
 // should not be SNAT'd.
-func RemoteSNATDstAddrExclusionCIDRv4() *cidr.CIDR {
-	if c := option.Config.GetIPv4NativeRoutingCIDR(); c != nil {
-		// ipv4-native-routing-cidr is set, so use it
-		return c
+func RemoteSNATDstAddrExclusionCIDRv4(localNode node.LocalNode) *cidr.CIDR {
+	if localNode.IPv4NativeRoutingCIDR != nil {
+		// ipv4-native-routing-cidr is set or has been autodetected, so use it
+		return localNode.IPv4NativeRoutingCIDR
 	}
 
-	return node.GetIPv4AllocRange()
+	return localNode.IPv4AllocCIDR
 }
 
 // RemoteSNATDstAddrExclusionCIDRv6 returns a IPv6 CIDR for SNAT exclusion. Any
 // packet sent from a local endpoint to an IP address belonging to the CIDR
 // should not be SNAT'd.
-func RemoteSNATDstAddrExclusionCIDRv6() *cidr.CIDR {
-	if c := option.Config.GetIPv6NativeRoutingCIDR(); c != nil {
-		// ipv6-native-routing-cidr is set, so use it
-		return c
+func RemoteSNATDstAddrExclusionCIDRv6(localNode node.LocalNode) *cidr.CIDR {
+	if localNode.IPv6NativeRoutingCIDR != nil {
+		// ipv6-native-routing-cidr is set or has been autodetected, so use it
+		return localNode.IPv6NativeRoutingCIDR
 	}
 
-	return node.GetIPv6AllocRange()
+	return localNode.IPv6AllocCIDR
 }

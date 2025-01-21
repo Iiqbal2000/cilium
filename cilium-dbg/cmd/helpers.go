@@ -11,7 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -29,6 +29,7 @@ import (
 	"github.com/cilium/cilium/pkg/maps/policymap"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy/trafficdirection"
+	policyTypes "github.com/cilium/cilium/pkg/policy/types"
 	"github.com/cilium/cilium/pkg/u8proto"
 )
 
@@ -206,14 +207,14 @@ type PolicyUpdateArgs struct {
 	trafficDirection trafficdirection.TrafficDirection
 
 	// label represents the identity of the label provided as argument.
-	label uint32
+	label identity.NumericIdentity
 
 	// port represents the port associated with the command, if specified.
 	port uint16
 
 	// protocols represents the set of protocols associated with the
 	// command, if specified.
-	protocols []uint8
+	protocols []u8proto.U8proto
 
 	isDeny bool
 }
@@ -274,7 +275,7 @@ func parsePolicyUpdateArgsHelper(args []string, isDeny bool) (*PolicyUpdateArgs,
 	trafficDirection := args[1]
 	parsedTd, err := parseTrafficString(trafficDirection)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to convert %s to a valid traffic direction: %s", args[1], err)
+		return nil, fmt.Errorf("Failed to convert %s to a valid traffic direction: %w", args[1], err)
 	}
 
 	mapName, err := endpointToPolicyMapPath(args[0])
@@ -286,24 +287,24 @@ func parsePolicyUpdateArgsHelper(args []string, isDeny bool) (*PolicyUpdateArgs,
 	if err != nil {
 		return nil, fmt.Errorf("Failed to convert %s", args[2])
 	}
-	label := uint32(peerLbl)
+	label := identity.NumericIdentity(peerLbl)
 
 	port := uint16(0)
-	protos := []uint8{}
+	protos := []u8proto.U8proto{}
 	if len(args) > 3 {
 		pp, err := parseL4PortsSlice([]string{args[3]})
 		if err != nil {
-			return nil, fmt.Errorf("Failed to parse L4: %s", err)
+			return nil, fmt.Errorf("Failed to parse L4: %w", err)
 		}
 		port = pp[0].Port
 		if port != 0 {
 			proto, _ := u8proto.ParseProtocol(pp[0].Protocol)
 			if proto == 0 {
 				for _, proto := range u8proto.ProtoIDs {
-					protos = append(protos, uint8(proto))
+					protos = append(protos, proto)
 				}
 			} else {
-				protos = append(protos, uint8(proto))
+				protos = append(protos, proto)
 			}
 		}
 	}
@@ -341,20 +342,21 @@ func updatePolicyKey(pa *PolicyUpdateArgs, add bool) {
 		entry := fmt.Sprintf("%d %d/%s", pa.label, pa.port, u8p.String())
 		if add {
 			var (
-				authType  uint8  // never set
-				proxyPort uint16 // never set
-				err       error
+				proxyPortPriority policyTypes.ProxyPortPriority // never set
+				authReq           policyTypes.AuthRequirement   // never set
+				proxyPort         uint16                        // never set
+				err               error
 			)
 			if pa.isDeny {
-				err = policyMap.Deny(pa.label, pa.port, u8p, pa.trafficDirection)
+				err = policyMap.Deny(pa.trafficDirection, pa.label, u8p, pa.port, policymap.SinglePortPrefixLen)
 			} else {
-				err = policyMap.Allow(pa.label, pa.port, u8p, pa.trafficDirection, authType, proxyPort)
+				err = policyMap.Allow(pa.trafficDirection, pa.label, u8p, pa.port, policymap.SinglePortPrefixLen, proxyPortPriority, authReq, proxyPort)
 			}
 			if err != nil {
 				Fatalf("Cannot add policy key '%s': %s\n", entry, err)
 			}
 		} else {
-			if err := policyMap.Delete(pa.label, pa.port, u8p, pa.trafficDirection); err != nil {
+			if err := policyMap.Delete(pa.trafficDirection, pa.label, u8p, pa.port, policymap.SinglePortPrefixLen); err != nil {
 				Fatalf("Cannot delete policy key '%s': %s\n", entry, err)
 			}
 		}
@@ -367,7 +369,7 @@ func dumpConfig(Opts map[string]string, indented bool) {
 	for k := range Opts {
 		opts = append(opts, k)
 	}
-	sort.Strings(opts)
+	slices.Sort(opts)
 
 	for _, k := range opts {
 		// XXX: Reuse the format function from *option.Library
@@ -467,7 +469,7 @@ func parseL4PortsSlice(slice []string) ([]*models.Port, error) {
 		if !iana.IsSvcName(portStr) {
 			portUint64, err := strconv.ParseUint(portStr, 10, 16)
 			if err != nil {
-				return nil, fmt.Errorf("invalid port %q: %s", portStr, err)
+				return nil, fmt.Errorf("invalid port %q: %w", portStr, err)
 			}
 			port = uint16(portUint64)
 			portStr = ""

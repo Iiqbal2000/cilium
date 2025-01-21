@@ -4,6 +4,7 @@
 package nat
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -96,6 +97,33 @@ func NewMap(name string, family IPFamily, entries int) *Map {
 			WithPressureMetric(),
 		family: family,
 	}
+}
+
+// DumpBatch4 uses batch iteration to walk the map and applies fn for each batch of entries.
+func (m *Map) DumpBatch4(fn func(*tuple.TupleKey4, *NatEntry4)) (count int, err error) {
+	if m.family != IPv4 {
+		return 0, fmt.Errorf("not implemented: wrong ip family: %s", m.family)
+	}
+
+	iter := bpf.NewBatchIterator[tuple.TupleKey4, NatEntry4](&m.Map)
+	for key, entry := range iter.IterateAll(context.Background()) {
+		count++
+		fn(key, entry)
+	}
+	return count, nil
+}
+
+// DumpBatch6 uses batch iteration to walk the map and applies fn for each batch of entries.
+func (m *Map) DumpBatch6(fn func(*tuple.TupleKey6, *NatEntry6)) (count int, err error) {
+	if m.family != IPv6 {
+		return 0, fmt.Errorf("not implemented: wrong ip family: %s", m.family)
+	}
+	iter := bpf.NewBatchIterator[tuple.TupleKey6, NatEntry6](&m.Map)
+	for key, entry := range iter.IterateAll(context.Background()) {
+		count++
+		fn(key, entry)
+	}
+	return count, nil
 }
 
 func (m *Map) Delete(k bpf.MapKey) (deleted bool, err error) {
@@ -216,7 +244,11 @@ func (m *Map) Flush() int {
 	return int(doFlush6(m).deleted)
 }
 
-func DeleteMapping4(m *Map, ctKey *tuple.TupleKey4Global) error {
+func DeleteMapping4(m *Map, tk tuple.TupleKey) error {
+	ctKey, ok := tk.(*tuple.TupleKey4Global)
+	if !ok {
+		return fmt.Errorf("wrong type %T for key", tk)
+	}
 	key := NatKey4{
 		TupleKey4Global: *ctKey,
 	}
@@ -240,7 +272,11 @@ func DeleteMapping4(m *Map, ctKey *tuple.TupleKey4Global) error {
 	return nil
 }
 
-func DeleteMapping6(m *Map, ctKey *tuple.TupleKey6Global) error {
+func DeleteMapping6(m *Map, tk tuple.TupleKey) error {
+	ctKey, ok := tk.(*tuple.TupleKey6Global)
+	if !ok {
+		return fmt.Errorf("wrong type %T for key", tk)
+	}
 	key := NatKey6{
 		TupleKey6Global: *ctKey,
 	}
@@ -265,7 +301,11 @@ func DeleteMapping6(m *Map, ctKey *tuple.TupleKey6Global) error {
 }
 
 // Expects ingress tuple
-func DeleteSwappedMapping4(m *Map, ctKey *tuple.TupleKey4Global) error {
+func DeleteSwappedMapping4(m *Map, tk tuple.TupleKey) error {
+	ctKey, ok := tk.(*tuple.TupleKey4Global)
+	if !ok {
+		return fmt.Errorf("wrong type %T for key", tk)
+	}
 	key := NatKey4{TupleKey4Global: *ctKey}
 	// Because of #5848, we need to reverse only ports
 	port := key.SourcePort
@@ -278,7 +318,11 @@ func DeleteSwappedMapping4(m *Map, ctKey *tuple.TupleKey4Global) error {
 }
 
 // Expects ingress tuple
-func DeleteSwappedMapping6(m *Map, ctKey *tuple.TupleKey6Global) error {
+func DeleteSwappedMapping6(m *Map, tk tuple.TupleKey) error {
+	ctKey, ok := tk.(*tuple.TupleKey6Global)
+	if !ok {
+		return fmt.Errorf("wrong type %T for key", tk)
+	}
 	key := NatKey6{TupleKey6Global: *ctKey}
 	// Because of #5848, we need to reverse only ports
 	port := key.SourcePort

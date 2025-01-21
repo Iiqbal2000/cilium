@@ -7,6 +7,7 @@ export LC_NUMERIC=C
 
 IMG_OWNER=${1:-cilium}
 IMG_TAG=${2:-latest}
+CILIUM_EXTRA_ARGS=${3:-}
 
 ###########
 #  SETUP  #
@@ -34,7 +35,7 @@ clang -O2 -Wall --target=bpf -c test_tc_tunnel.c -o test_tc_tunnel.o
 # * "nginx" runs the nginx server.
 
 docker network create cilium-l4lb
-docker run --privileged --name lb-node -d \
+docker run --privileged --name lb-node -d --restart=on-failure:10 \
     --network cilium-l4lb -v /lib/modules:/lib/modules \
     docker:dind
 docker run --name nginx -d --network cilium-l4lb nginx
@@ -65,13 +66,14 @@ docker exec -t lb-node \
     cilium-agent \
     --enable-ipv4=true \
     --enable-ipv6=false \
+    --enable-k8s=false \
     --datapath-mode=lb-only \
     --bpf-lb-algorithm=maglev \
     --bpf-lb-dsr-dispatch=ipip \
     --bpf-lb-acceleration=native \
     --bpf-lb-mode=dsr \
     --devices="eth0,l4lb-veth1" \
-    --direct-routing-device=eth0
+    --direct-routing-device=eth0 ${CILIUM_EXTRA_ARGS}
 
 IFIDX=$(docker exec -i lb-node \
     /bin/sh -c 'echo $(( $(ip -o l show eth0 | awk "{print $1}" | cut -d: -f1) ))')
@@ -105,15 +107,10 @@ nsenter -t $(docker inspect nginx -f '{{ .State.Pid }}') -n /bin/sh -c \
     "ip a a dev eth0 ${LB_VIP}/32"
 
 docker exec -t lb-node docker exec -t cilium-lb \
-    cilium-dbg service update --id 1 --frontend "${LB_VIP}:80" --backends "${WORKER_IP}:80" --k8s-node-port
+    cilium-dbg service update --id 1 --frontend "${LB_VIP}:80" --backends "${WORKER_IP}:80" --k8s-load-balancer
 
 LB_NODE_IP=$(docker exec lb-node ip -o -4 a s eth0 | awk '{print $4}' | cut -d/ -f1)
 ip r a "${LB_VIP}/32" via "$LB_NODE_IP"
-
-# Add the neighbor entry for the nginx node to avoid the LB failing to forward
-# the requests due to the FIB lookup drops (nsenter, as busybox iproute2
-# doesn't support neigh entries creation).
-nsenter -t $CONTROL_PLANE_PID -n ip neigh add ${WORKER_IP} dev eth0 lladdr ${WORKER_MAC}
 
 # Issue 10 requests to LB
 for i in $(seq 1 10); do
@@ -131,7 +128,7 @@ done
 
 # Set nginx to maintenance
 docker exec -t lb-node docker exec -t cilium-lb \
-    cilium-dbg service update --id 1 --frontend "${LB_VIP}:80" --backends "${WORKER_IP}:80" --backend-weights "0" --k8s-node-port
+    cilium-dbg service update --id 1 --frontend "${LB_VIP}:80" --backends "${WORKER_IP}:80" --backend-weights "0" --k8s-load-balancer
 
 # Do not stop on error
 set +e
@@ -142,6 +139,22 @@ for i in $(seq 1 10); do
     if [ ! "$?" -eq 7 ]; then
         exit -1;
     fi
+done
+
+# Stop on error
+set -e
+docker exec -t lb-node docker exec -t cilium-lb \
+    cilium-dbg service update --id 1 --frontend "${LB_VIP}:80" --backends "${WORKER_IP}:80" --backend-weights "1" --k8s-load-balancer
+
+curl -o /dev/null "${LB_VIP}:80" -m1 || (echo "Failed"; exit -1)
+
+# Restart cilium-agent and issue 50 requests to LB
+docker exec -d lb-node docker restart cilium-lb
+
+# Requests should not timeout when agent is starting up
+for i in $(seq 1 50); do
+    curl -o /dev/null "${LB_VIP}:80" -m1 || (echo "Failed"; exit -1)
+    sleep 0.2
 done
 
 # Cleanup

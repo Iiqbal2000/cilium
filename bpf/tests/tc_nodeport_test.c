@@ -5,7 +5,6 @@
 
 /* Set the LXC source address to be the address of pod one */
 #define LXC_IPV4 (__be32)v4_pod_one
-#include "config_replacement.h"
 
 /* Enable CT debug output */
 #undef QUIET_CT
@@ -13,15 +12,11 @@
 #include <bpf/ctx/skb.h>
 #include "pktgen.h"
 
-/* Set ETH_HLEN to 14 to indicate that the packet has a 14 byte ethernet header */
-#define ETH_HLEN 14
-
 /* Enable code paths under test*/
 #define ENABLE_IPV4
 
-/* Skip ingress policy checks, not needed to validate hairpin flow */
+/* Skip ingress policy checks */
 #define USE_BPF_PROG_FOR_INGRESS_POLICY
-#undef FORCE_LOCAL_POLICY_EVAL_AT_SOURCE
 
 #define ctx_redirect_peer mock_ctx_redirect_peer
 static __always_inline __maybe_unused int
@@ -58,7 +53,8 @@ struct {
  *            \---------------------------/
  */
 
-static __always_inline int build_packet(struct __ctx_buff *ctx)
+static __always_inline int build_packet(struct __ctx_buff *ctx,
+					__be16 sport)
 {
 	struct pktgen builder;
 	volatile const __u8 *src = mac_one;
@@ -72,7 +68,7 @@ static __always_inline int build_packet(struct __ctx_buff *ctx)
 	l4 = pktgen__push_ipv4_tcp_packet(&builder,
 					  (__u8 *)src, (__u8 *)dst,
 					  v4_pod_one, v4_svc_one,
-					  tcp_src_one, tcp_svc_one);
+					  sport, tcp_svc_one);
 	if (!l4)
 		return TEST_ERROR;
 
@@ -90,7 +86,7 @@ static __always_inline int build_packet(struct __ctx_buff *ctx)
 PKTGEN("tc", "hairpin_flow_1_forward_v4")
 int hairpin_flow_forward_pktgen(struct __ctx_buff *ctx)
 {
-	return build_packet(ctx);
+	return build_packet(ctx, tcp_src_one);
 }
 
 /* Test that sending a packet from a pod to its own service gets source nat-ed
@@ -108,10 +104,10 @@ int hairpin_flow_forward_setup(struct __ctx_buff *ctx)
 	/* Add an IPCache entry for pod 1 */
 	ipcache_v4_add_entry(v4_pod_one, 0, 112233, 0, 0);
 
-	endpoint_v4_add_entry(v4_pod_one, 0, 0, 0, NULL, NULL);
+	endpoint_v4_add_entry(v4_pod_one, 0, 0, 0, 0, 0, NULL, NULL);
 
 	/* Jump into the entrypoint */
-	tail_call_static(ctx, &entry_call_map, 0);
+	tail_call_static(ctx, entry_call_map, 0);
 	/* Fail if we didn't jump */
 	return TEST_ERROR;
 }
@@ -148,6 +144,9 @@ int hairpin_flow_forward_check(__maybe_unused const struct __ctx_buff *ctx)
 	if (l3->daddr != v4_pod_one)
 		test_fatal("dest IP hasn't been changed to the pod IP");
 
+	if (l3->check != bpf_htons(-0x4f02))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
+
 	l4 = (void *)l3 + sizeof(struct iphdr);
 
 	if ((void *)l4 + sizeof(struct tcphdr) > data_end)
@@ -158,6 +157,9 @@ int hairpin_flow_forward_check(__maybe_unused const struct __ctx_buff *ctx)
 
 	if (l4->dest != tcp_dst_one)
 		test_fatal("dst TCP port incorrect");
+
+	if (l4->check != bpf_htons(0xb846))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
 
 	struct ipv4_ct_tuple tuple = {};
 	struct ct_entry *ct_entry;
@@ -233,7 +235,7 @@ SETUP("tc", "hairpin_flow_2_forward_ingress_v4")
 int hairpin_flow_forward_ingress_setup(struct __ctx_buff *ctx)
 {
 	/* Jump into the entrypoint */
-	tail_call_static(ctx, &entry_call_map, 1);
+	tail_call_static(ctx, entry_call_map, 1);
 	/* Fail if we didn't jump */
 	return TEST_ERROR;
 }
@@ -270,6 +272,9 @@ int hairpin_flow_forward_ingress_check(__maybe_unused const struct __ctx_buff *c
 	if (l3->daddr != v4_pod_one)
 		test_fatal("dest IP changed");
 
+	if (l3->check != bpf_htons(-0x5002))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
+
 	l4 = (void *)l3 + sizeof(struct iphdr);
 
 	if ((void *)l4 + sizeof(struct tcphdr) > data_end)
@@ -280,6 +285,9 @@ int hairpin_flow_forward_ingress_check(__maybe_unused const struct __ctx_buff *c
 
 	if (l4->dest != tcp_dst_one)
 		test_fatal("dst TCP port changed");
+
+	if (l4->check != bpf_htons(0xb846))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
 
 	struct ipv4_ct_tuple tuple = {};
 	struct ct_entry *ct_entry;
@@ -341,7 +349,7 @@ SETUP("tc", "hairpin_flow_3_reverse_v4")
 int hairpin_flow_rev_setup(struct __ctx_buff *ctx)
 {
 	/* Jump into the entrypoint */
-	tail_call_static(ctx, &entry_call_map, 0);
+	tail_call_static(ctx, entry_call_map, 0);
 	/* Fail if we didn't jump */
 	return TEST_ERROR;
 }
@@ -372,11 +380,104 @@ int hairpin_flow_rev_check(__maybe_unused const struct __ctx_buff *ctx)
 	if ((void *)l3 + sizeof(struct iphdr) > data_end)
 		test_fatal("l3 out of bounds");
 
+	if (l3->saddr != v4_pod_one)
+		test_fatal("src IP changed");
+
+	if (l3->daddr != IPV4_LOOPBACK)
+		test_fatal("dest IP changed");
+
+	l4 = (void *)l3 + sizeof(struct iphdr);
+
+	if ((void *)l4 + sizeof(struct tcphdr) > data_end)
+		test_fatal("l4 out of bounds");
+
+	if (l4->source != tcp_dst_one)
+		test_fatal("src TCP port changed");
+
+	if (l4->dest != tcp_src_one)
+		test_fatal("dst TCP port changed");
+
+	if (l4->check != bpf_htons(0xb836))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+
+	test_finish();
+}
+
+PKTGEN("tc", "hairpin_flow_4_reverse_ingress_v4")
+int hairpin_flow_reverse_ingress_pktgen(struct __ctx_buff *ctx)
+{
+	struct pktgen builder;
+	volatile const __u8 *src = mac_one;
+	volatile const __u8 *dst = mac_two;
+	struct tcphdr *l4;
+	void *data;
+
+	/* Init packet builder */
+	pktgen__init(&builder, ctx);
+
+	l4 = pktgen__push_ipv4_tcp_packet(&builder,
+					  (__u8 *)src, (__u8 *)dst,
+					  v4_pod_one, IPV4_LOOPBACK,
+					  tcp_dst_one, tcp_src_one);
+	if (!l4)
+		return TEST_ERROR;
+
+	l4->ack = 1;
+
+	data = pktgen__push_data(&builder, default_data, sizeof(default_data));
+
+	if (!data)
+		return TEST_ERROR;
+
+	/* Calc lengths, set protocol fields and calc checksums */
+	pktgen__finish(&builder);
+
+	return 0;
+}
+
+SETUP("tc", "hairpin_flow_4_reverse_ingress_v4")
+int hairpin_flow_reverse_ingress_setup(struct __ctx_buff *ctx)
+{
+	/* Jump into the entrypoint */
+	tail_call_static(ctx, entry_call_map, 1);
+	/* Fail if we didn't jump */
+	return TEST_ERROR;
+}
+
+CHECK("tc", "hairpin_flow_4_reverse_ingress_v4")
+int hairpin_flow_reverse_ingress_check(const struct __ctx_buff *ctx)
+{
+	void *data;
+	void *data_end;
+	__u32 *status_code;
+	struct iphdr *l3;
+	struct tcphdr *l4;
+
+	test_init();
+
+	data = (void *)(long)ctx->data;
+	data_end = (void *)(long)ctx->data_end;
+
+	if (data + sizeof(__u32) > data_end)
+		test_fatal("status code out of bounds");
+
+	status_code = data;
+
+	assert(*status_code == CTX_ACT_OK);
+
+	l3 = data + sizeof(__u32) + sizeof(struct ethhdr);
+
+	if ((void *)l3 + sizeof(struct iphdr) > data_end)
+		test_fatal("l3 out of bounds");
+
 	if (l3->saddr != v4_svc_one)
 		test_fatal("src IP was not NAT'ed back to the svc IP");
 
 	if (l3->daddr != v4_pod_one)
 		test_fatal("dest IP hasn't been NAT'ed to the original source IP");
+
+	if (l3->check != bpf_htons(0x402))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
 
 	l4 = (void *)l3 + sizeof(struct iphdr);
 
@@ -389,6 +490,9 @@ int hairpin_flow_rev_check(__maybe_unused const struct __ctx_buff *ctx)
 	if (l4->dest != tcp_src_one)
 		test_fatal("dst TCP port incorrect");
 
+	if (l4->check != bpf_htons(0x6325))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+
 	test_finish();
 }
 
@@ -398,7 +502,7 @@ int tc_drop_no_backend_setup(struct __ctx_buff *ctx)
 {
 	int ret;
 
-	ret = build_packet(ctx);
+	ret = build_packet(ctx, tcp_src_two);
 	if (ret)
 		return ret;
 
@@ -408,7 +512,7 @@ int tc_drop_no_backend_setup(struct __ctx_buff *ctx)
 	policy_add_egress_allow_all_entry();
 
 	/* Jump into the entrypoint */
-	tail_call_static(ctx, &entry_call_map, 0);
+	tail_call_static(ctx, entry_call_map, 0);
 	/* Fail if we didn't jump */
 	return TEST_ERROR;
 }

@@ -5,7 +5,6 @@
 #include <bpf/ctx/skb.h>
 #include "pktgen.h"
 #define ROUTER_IP
-#include "config_replacement.h"
 #undef ROUTER_IP
 
 #define NODE_ID 2333
@@ -109,7 +108,7 @@ int ipv4_ipsec_from_host_setup(struct __ctx_buff *ctx)
 
 	set_encrypt_key_mark(ctx, ENCRYPT_KEY, NODE_ID);
 	set_identity_meta(ctx, SECLABEL_IPV4);
-	tail_call_static(ctx, &entry_call_map, FROM_HOST);
+	tail_call_static(ctx, entry_call_map, FROM_HOST);
 	return TEST_ERROR;
 }
 
@@ -165,6 +164,9 @@ int ipv4_ipsec_from_host_check(__maybe_unused const struct __ctx_buff *ctx)
 
 	if (l3->daddr != v4_pod_two)
 		test_fatal("dest IP was changed");
+
+	if (l3->check != bpf_htons(0xf948))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
 
 	l4 = (void *)l3 + sizeof(struct iphdr);
 
@@ -230,7 +232,7 @@ int ipv6_ipsec_from_host_setup(struct __ctx_buff *ctx)
 
 	set_encrypt_key_mark(ctx, ENCRYPT_KEY, NODE_ID);
 	set_identity_meta(ctx, SECLABEL_IPV6);
-	tail_call_static(ctx, &entry_call_map, FROM_HOST);
+	tail_call_static(ctx, entry_call_map, FROM_HOST);
 	return TEST_ERROR;
 }
 

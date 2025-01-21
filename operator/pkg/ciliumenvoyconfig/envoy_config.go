@@ -24,6 +24,7 @@ import (
 
 	"github.com/cilium/cilium/pkg/envoy"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 )
 
 func (r *ciliumEnvoyConfigReconciler) getEnvoyConfigForService(svc *corev1.Service) (*ciliumv2.CiliumEnvoyConfig, error) {
@@ -219,6 +220,12 @@ func (r *ciliumEnvoyConfigReconciler) getConnectionManager(svc *corev1.Service) 
 				},
 			},
 		},
+		InternalAddressConfig: &envoy_extensions_filters_network_http_connection_manager_v3.HttpConnectionManager_InternalAddressConfig{
+			UnixSockets: false,
+			// only RFC1918 IP addresses will be considered internal
+			// https://datatracker.ietf.org/doc/html/rfc1918
+			CidrRanges: envoy.GetInternalListenerCIDRs(r.enableIpv4, r.enableIpv6),
+		},
 	}
 
 	mutatorFuncs := []httpConnectionManagerMutator{
@@ -288,7 +295,7 @@ func getName(obj metav1.Object) string {
 func (r *ciliumEnvoyConfigReconciler) toAny(message proto.Message) *anypb.Any {
 	a, err := anypb.New(message)
 	if err != nil {
-		r.logger.WithError(err).Errorf("invalid message %s", message)
+		r.logger.Error(fmt.Sprintf("invalid message %s", message), logfields.Error, err)
 		return nil
 	}
 	return a

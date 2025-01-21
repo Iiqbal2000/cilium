@@ -55,7 +55,6 @@ type Server struct {
 	healthServer     *healthServer
 	metricsServer    *http.Server
 	opts             options
-	stop             chan struct{}
 }
 
 // New creates a new Server.
@@ -64,7 +63,7 @@ func New(options ...Option) (*Server, error) {
 	options = append(options, DefaultOptions...)
 	for _, opt := range options {
 		if err := opt(&opts); err != nil {
-			return nil, fmt.Errorf("failed to apply option: %v", err)
+			return nil, fmt.Errorf("failed to apply option: %w", err)
 		}
 	}
 	if opts.clientTLSConfig == nil && !opts.insecureClient {
@@ -74,12 +73,9 @@ func New(options ...Option) (*Server, error) {
 		return nil, ErrNoServerTLSConfig
 	}
 
-	var peerClientBuilder peerTypes.ClientBuilder = &peerTypes.LocalClientBuilder{
-		DialTimeout: opts.dialTimeout,
-	}
+	var peerClientBuilder peerTypes.ClientBuilder = &peerTypes.LocalClientBuilder{}
 	if !strings.HasPrefix(opts.peerTarget, "unix://") {
 		peerClientBuilder = &peerTypes.RemoteClientBuilder{
-			DialTimeout:   opts.dialTimeout,
 			TLSConfig:     opts.clientTLSConfig,
 			TLSServerName: peer.TLSServerName(defaults.PeerServiceName, opts.clusterName),
 		}
@@ -90,12 +86,6 @@ func New(options ...Option) (*Server, error) {
 		pool.WithPeerServiceAddress(opts.peerTarget),
 		pool.WithPeerClientBuilder(peerClientBuilder),
 		pool.WithClientConnBuilder(pool.GRPCClientConnBuilder{
-			DialTimeout: opts.dialTimeout,
-			Options: []grpc.DialOption{
-				grpc.WithBlock(),
-				grpc.FailOnNonTempDialError(true),
-				grpc.WithReturnConnectionError(),
-			},
 			TLSConfig: opts.clientTLSConfig,
 		}),
 		pool.WithRetryTimeout(opts.retryTimeout),
@@ -126,7 +116,7 @@ func New(options ...Option) (*Server, error) {
 	observerOptions := copyObserverOptionsWithLogger(opts.log, opts.observerOptions)
 	observerSrv, err := observer.NewServer(pm, observerOptions...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create observer server: %v", err)
+		return nil, fmt.Errorf("failed to create observer server: %w", err)
 	}
 	healthSrv := newHealthServer(pm, defaults.HealthCheckInterval)
 
@@ -152,7 +142,6 @@ func New(options ...Option) (*Server, error) {
 
 	return &Server{
 		pm:               pm,
-		stop:             make(chan struct{}),
 		server:           grpcServer,
 		grpcHealthServer: grpcHealthServer,
 		metricsServer:    metricsServer,
@@ -179,7 +168,7 @@ func (s *Server) Serve() error {
 		s.healthServer.start()
 		socket, err := net.Listen("tcp", s.opts.listenAddress)
 		if err != nil {
-			return fmt.Errorf("failed to listen on tcp socket %s: %v", s.opts.listenAddress, err)
+			return fmt.Errorf("failed to listen on tcp socket %s: %w", s.opts.listenAddress, err)
 		}
 		return s.server.Serve(socket)
 	})
@@ -188,7 +177,7 @@ func (s *Server) Serve() error {
 		s.opts.log.WithField("addr", s.opts.healthListenAddress).Info("Starting gRPC health server...")
 		socket, err := net.Listen("tcp", s.opts.healthListenAddress)
 		if err != nil {
-			return fmt.Errorf("failed to listen on %s: %v", s.opts.healthListenAddress, err)
+			return fmt.Errorf("failed to listen on %s: %w", s.opts.healthListenAddress, err)
 		}
 		return s.grpcHealthServer.Serve(socket)
 	})
@@ -199,11 +188,11 @@ func (s *Server) Serve() error {
 // Stop terminates the hubble-relay server.
 func (s *Server) Stop() {
 	s.opts.log.Info("Stopping server...")
-	close(s.stop)
 	s.server.Stop()
-	err := s.metricsServer.Shutdown(context.Background())
-	if err != nil {
-		s.opts.log.WithError(err).Info("Failed to gracefully stop metrics server")
+	if s.metricsServer != nil {
+		if err := s.metricsServer.Shutdown(context.Background()); err != nil {
+			s.opts.log.WithError(err).Info("Failed to gracefully stop metrics server")
+		}
 	}
 	s.pm.Stop()
 	s.healthServer.stop()

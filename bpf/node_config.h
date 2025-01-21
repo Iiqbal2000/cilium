@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
 /* Copyright Authors of Cilium */
 
-#ifndef __NODE_CONFIG__
-#define __NODE_CONFIG__
+#pragma once
 
 /*
  *
@@ -18,9 +17,14 @@
 
 #define CLUSTER_ID 0
 
-#ifndef NODE_MAC
-DEFINE_MAC(NODE_MAC, 0xde, 0xad, 0xbe, 0xef, 0xc0, 0xde);
-#define NODE_MAC fetch_mac(NODE_MAC)
+#ifndef THIS_INTERFACE_MAC
+DEFINE_MAC(THIS_INTERFACE_MAC, 0xde, 0xad, 0xbe, 0xef, 0xc0, 0xde);
+#define THIS_INTERFACE_MAC fetch_mac(THIS_INTERFACE_MAC)
+#endif
+
+#ifndef THIS_INTERFACE_IFINDEX
+DECLARE_CONFIG(__u32, interface_ifindex, "ifindex of the interface the bpf program is attached to")
+#define THIS_INTERFACE_IFINDEX CONFIG(interface_ifindex) /* Backwards compatibility */
 #endif
 
 #ifndef ROUTER_IP
@@ -47,6 +51,7 @@ DEFINE_IPV6(HOST_IP, 0xbe, 0xef, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0xa, 0x
 #define TUNNEL_PROTOCOL TUNNEL_PROTOCOL_VXLAN
 #endif
 
+#define UNKNOWN_ID 0
 #define HOST_ID 1
 #define WORLD_ID 2
 #if defined ENABLE_IPV4 && defined ENABLE_IPV6
@@ -62,6 +67,12 @@ DEFINE_IPV6(HOST_IP, 0xbe, 0xef, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0xa, 0x
 #define LOCAL_NODE_ID 6
 #define REMOTE_NODE_ID 6
 #define KUBE_APISERVER_NODE_ID 7
+/* This identity should never be seen on ingress or egress traffic to/from a
+ * node.
+ * It signals that the skb is overlay traffic that must be IPSec encrypted
+ * before it leaves the host.
+ */
+#define ENCRYPTED_OVERLAY_ID 11
 #define HOST_IFINDEX_MAC { .addr = { 0xce, 0x72, 0xa7, 0x03, 0x88, 0x56 } }
 #define NODEPORT_PORT_MIN 30000
 #define NODEPORT_PORT_MAX 32767
@@ -111,10 +122,6 @@ DEFINE_IPV6(HOST_IP, 0xbe, 0xef, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0xa, 0x
 #endif /* ENABLE_NODEPORT */
 #define CAPTURE4_RULES cilium_capture4_rules
 #define CAPTURE4_SIZE 16384
-# ifdef ENABLE_HIGH_SCALE_IPCACHE
-#  define IPV4_NATIVE_ROUTING_CIDR 0xffff0000
-#  define IPV4_NATIVE_ROUTING_CIDR_LEN 16
-# endif /* ENABLE_HIGH_SCALE_IPCACHE */
 #endif /* ENABLE_IPV4 */
 
 #ifdef ENABLE_IPV6
@@ -138,20 +145,20 @@ DEFINE_IPV6(HOST_IP, 0xbe, 0xef, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0xa, 0x
 #define SRV6_POLICY_MAP4 test_cilium_srv6_policy_v4
 #define SRV6_POLICY_MAP6 test_cilium_srv6_policy_v6
 #define SRV6_SID_MAP test_cilium_srv6_sid
-#define SRV6_STATE_MAP4 test_cilium_srv6_state4
-#define SRV6_STATE_MAP6 test_cilium_srv6_state6
 #define ENDPOINTS_MAP test_cilium_lxc
 #define EVENTS_MAP test_cilium_events
+#define EVENTS_MAP_RATE_LIMIT 0
+#define EVENTS_MAP_BURST_LIMIT 0
 #define SIGNAL_MAP test_cilium_signals
 #define METRICS_MAP test_cilium_metrics
-#define POLICY_CALL_MAP test_cilium_policy
 #define AUTH_MAP test_cilium_auth
 #define CONFIG_MAP test_cilium_runtime_config
 #define IPCACHE_MAP test_cilium_ipcache
-#define NODE_MAP test_cilium_node_map
+#define NODE_MAP_V2 test_cilium_node_map
 #define ENCRYPT_MAP test_cilium_encrypt_state
 #define L2_RESPONDER_MAP4 test_cilium_l2_responder_v4
 #define RATELIMIT_MAP test_cilium_ratelimit
+#define RATELIMIT_METRICS_MAP test_cilium_ratelimit_metrics
 #define TUNNEL_MAP test_cilium_tunnel_map
 #define VTEP_MAP test_cilium_vtep_map
 #define LB6_REVERSE_NAT_MAP test_cilium_lb6_reverse_nat
@@ -162,6 +169,7 @@ DEFINE_IPV6(HOST_IP, 0xbe, 0xef, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0xa, 0x
 #define LB4_REVERSE_NAT_MAP test_cilium_lb4_reverse_nat
 #define LB4_SERVICES_MAP_V2 test_cilium_lb4_services
 #define LB4_BACKEND_MAP test_cilium_lb4_backends
+#define LB_ACT_MAP test_cilium_lb_act
 #define LB4_REVERSE_NAT_SK_MAP test_cilium_lb4_reverse_sk
 #define LB4_REVERSE_NAT_SK_MAP_SIZE 262144
 #define LB4_AFFINITY_MAP test_cilium_lb4_affinity
@@ -170,6 +178,8 @@ DEFINE_IPV6(HOST_IP, 0xbe, 0xef, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0xa, 0x
 #define LB_MAGLEV_LUT_SIZE 32749
 #define LB4_MAGLEV_MAP_OUTER test_cilium_lb4_maglev_outer
 #define LB6_MAGLEV_MAP_OUTER test_cilium_lb6_maglev_outer
+#define LB4_SKIP_MAP test_cilium_skip_lb4
+#define LB6_SKIP_MAP test_cilium_skip_lb6
 #define THROTTLE_MAP test_cilium_throttle
 #define THROTTLE_MAP_SIZE 65536
 #define ENABLE_ARP_RESPONDER
@@ -184,6 +194,8 @@ DEFINE_IPV6(HOST_IP, 0xbe, 0xef, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0xa, 0x
 #define CILIUM_LB_AFFINITY_MAP_MAX_ENTRIES	65536
 #define CILIUM_LB_REV_NAT_MAP_MAX_ENTRIES	65536
 #define CILIUM_LB_MAGLEV_MAP_MAX_ENTRIES	65536
+#define CILIUM_LB_SKIP_MAP_MAX_ENTRIES		100
+#define CILIUM_LB_ACT_MAP_MAX_ENTRIES	    65536
 #define POLICY_MAP_SIZE 16384
 #define AUTH_MAP_SIZE 512000
 #define CONFIG_MAP_SIZE 256
@@ -193,7 +205,6 @@ DEFINE_IPV6(HOST_IP, 0xbe, 0xef, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0xa, 0x
 #define SRV6_VRF_MAP_SIZE 16384
 #define SRV6_POLICY_MAP_SIZE 16384
 #define SRV6_SID_MAP_SIZE 16384
-#define SRV6_STATE_MAP_SIZE 16384
 #define L2_RESPONSER_MAP4_SIZE 4096
 #define POLICY_PROG_MAP_SIZE ENDPOINTS_MAP_SIZE
 #define IPV4_FRAG_DATAGRAMS_MAP test_cilium_ipv4_frag_datagrams
@@ -218,13 +229,10 @@ DEFINE_IPV6(HOST_IP, 0xbe, 0xef, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0xa, 0x
 #define CT_MAP_SIZE_TCP 4096
 #define CT_MAP_SIZE_ANY 4096
 #define CONNTRACK_ACCOUNTING
+#define POLICY_ACCOUNTING
 #define LB4_HEALTH_MAP test_cilium_lb4_health
 #define LB6_HEALTH_MAP test_cilium_lb6_health
 #endif /* ENABLE_NODEPORT || ENABLE_HOST_FIREWALL */
-#ifdef ENABLE_HIGH_SCALE_IPCACHE
-# define WORLD_CIDRS4_MAP test_cilium_world_cidrs4
-# define WORLD_CIDRS4_MAP_SIZE 16384
-#endif /* ENABLE_HIGH_SCALE_IPCACHE */
 
 #ifdef ENABLE_NODEPORT
 #ifdef ENABLE_IPV4
@@ -273,6 +281,11 @@ DEFINE_IPV6(HOST_IP, 0xbe, 0xef, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0xa, 0x
 
 #ifdef ENABLE_WIREGUARD
 # define WG_IFINDEX	42
+# define WG_PORT    51871
+# ifdef ENCRYPTION_STRICT_MODE
+#  define STRICT_IPV4_NET	0
+#  define STRICT_IPV4_NET_SIZE	8
+# endif
 #endif
 
 #ifdef ENABLE_VTEP
@@ -319,4 +332,4 @@ return false;
 #define IDENTITY_MAX 65535
 #endif
 
-#endif /* __NODE_CONFIG__ */
+#define CALLS_MAP test_cilium_calls_65535

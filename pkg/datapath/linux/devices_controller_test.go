@@ -7,43 +7,33 @@ package linux
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 	"os"
-	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/hivetest"
+	"github.com/cilium/statedb"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netlink/nl"
-	"github.com/vishvananda/netns"
 	"go.uber.org/goleak"
 	"golang.org/x/sys/unix"
 
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	"github.com/cilium/cilium/pkg/logging"
-	"github.com/cilium/cilium/pkg/statedb"
 	"github.com/cilium/cilium/pkg/testutils"
+	"github.com/cilium/cilium/pkg/testutils/netns"
 )
-
-func withFreshNetNS(t *testing.T, test func(netns.NsHandle)) {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
-	oldNetNS, err := netns.Get()
-	assert.NoError(t, err)
-	testNetNS, err := netns.New()
-	assert.NoError(t, err)
-	defer func() { assert.NoError(t, testNetNS.Close()) }()
-	defer func() { assert.NoError(t, netns.Set(oldNetNS)) }()
-	test(testNetNS)
-}
 
 func devicesControllerTestSetup(t *testing.T) {
 	t.Cleanup(func() {
@@ -84,13 +74,41 @@ func TestDevicesController(t *testing.T) {
 
 	logging.SetLogLevelToDebug()
 
-	routeExists := func(routes []*tables.Route, linkIndex int, dst, src string) bool {
+	addrToString := func(addr netip.Addr) string {
+		if !addr.IsValid() {
+			return ""
+		}
+		return addr.String()
+	}
+
+	routeExists := func(routes []*tables.Route, linkIndex int, dst, src, gw string) bool {
 		for _, r := range routes {
-			if r.LinkIndex == linkIndex && r.Dst.String() == dst && r.Src.String() == src {
+			// undefined IP will stringify as "invalid IP", turn them into "".
+			actualDst, actualSrc, actualGw := r.Dst.String(), addrToString(r.Src), addrToString(r.Gw)
+			if r.LinkIndex == linkIndex && actualDst == dst && actualSrc == src &&
+				actualGw == gw {
 				return true
 			}
 		}
 		return false
+	}
+
+	neighborExists := func(neighbors []*tables.Neighbor, linkIndex int, ip, mac string, flags tables.NeighborFlags) bool {
+		for _, n := range neighbors {
+			if n.LinkIndex == linkIndex && n.IPAddr.String() == ip && n.HardwareAddr.String() == mac && n.Flags == flags {
+				return true
+			}
+		}
+		return false
+	}
+
+	v4Routes := func(routes []*tables.Route) (out []*tables.Route) {
+		for _, r := range routes {
+			if r.Dst.Addr().Is4() {
+				out = append(out, r)
+			}
+		}
+		return
 	}
 
 	orphanRoutes := func(devs []*tables.Device, routes []*tables.Route) bool {
@@ -108,6 +126,21 @@ func TestDevicesController(t *testing.T) {
 		return false
 	}
 
+	orphanNeighbors := func(devs []*tables.Device, neighbors []*tables.Neighbor) bool {
+		indexes := map[int]bool{}
+		for _, dev := range devs {
+			indexes[dev.Index] = true
+		}
+		for _, n := range neighbors {
+			if !indexes[n.LinkIndex] {
+				// A neighbor exists without a device.
+				t.Logf("Orphan neighbor found: %+v", n)
+				return true
+			}
+		}
+		return false
+	}
+
 	// The test steps perform an action, wait for devices table to change
 	// and then validate the change. Since we may see intermediate states
 	// in the devices table (as there's multiple netlink updates that may
@@ -116,17 +149,17 @@ func TestDevicesController(t *testing.T) {
 	testSteps := []struct {
 		name    string
 		prepare func(*testing.T)
-		check   func(*testing.T, []*tables.Device, []*tables.Route) bool
+		check   func(*testing.T, []*tables.Device, []*tables.Route, []*tables.Neighbor) bool
 	}{
 		{
 			"initial",
 			func(*testing.T) {},
-			func(t *testing.T, devs []*tables.Device, routes []*tables.Route) bool {
+			func(t *testing.T, devs []*tables.Device, routes []*tables.Route, neighbors []*tables.Neighbor) bool {
 				return len(devs) == 1 &&
 					devs[0].Name == "dummy0" &&
 					devs[0].Index > 0 &&
 					devs[0].Selected &&
-					routeExists(routes, devs[0].Index, "192.168.0.0/24", "192.168.0.1")
+					routeExists(routes, devs[0].Index, "192.168.0.0/24", "192.168.0.1", "")
 			},
 		},
 		{
@@ -134,17 +167,26 @@ func TestDevicesController(t *testing.T) {
 			func(t *testing.T) {
 				// Create another dummy to check that the table updates.
 				require.NoError(t, createDummy("dummy1", "192.168.1.1/24", false))
+
+				// Add a default route
+				assert.NoError(t,
+					addRoute(addRouteParams{iface: "dummy1", gw: "192.168.1.254", table: unix.RT_TABLE_MAIN}))
+
+				// Add a static neighbor entry for the GW:
+				assert.NoError(t,
+					addNeighbor(addNeighborParams{iface: "dummy1", ip: "192.168.1.254", mac: "00:00:5e:00:53:01", flags: netlink.NTF_EXT_LEARNED}))
 			},
-			func(t *testing.T, devs []*tables.Device, routes []*tables.Route) bool {
+			func(t *testing.T, devs []*tables.Device, routes []*tables.Route, neighbors []*tables.Neighbor) bool {
 				// Since we're indexing by ifindex, we expect these to be in the order
 				// they were added.
 				return len(devs) == 2 &&
 					"dummy0" == devs[0].Name &&
-					routeExists(routes, devs[0].Index, "192.168.0.0/24", "192.168.0.1") &&
+					routeExists(routes, devs[0].Index, "192.168.0.0/24", "192.168.0.1", "") &&
 					devs[0].Selected &&
 					"dummy1" == devs[1].Name &&
 					devs[1].Selected &&
-					routeExists(routes, devs[1].Index, "192.168.1.0/24", "192.168.1.1")
+					routeExists(routes, devs[1].Index, "192.168.1.0/24", "192.168.1.1", "") &&
+					neighborExists(neighbors, devs[1].Index, "192.168.1.254", "00:00:5e:00:53:01", tables.NTF_EXT_LEARNED)
 			},
 		},
 
@@ -153,7 +195,7 @@ func TestDevicesController(t *testing.T) {
 			func(t *testing.T) {
 				require.NoError(t, addAddrScoped("dummy1", "192.168.1.2/24", netlink.SCOPE_SITE, unix.IFA_F_SECONDARY))
 			},
-			func(t *testing.T, devs []*tables.Device, routes []*tables.Route) bool {
+			func(t *testing.T, devs []*tables.Device, routes []*tables.Route, neighbors []*tables.Neighbor) bool {
 				// Since we're indexing by ifindex, we expect these to be in the order
 				// they were added.
 				return len(devs) == 2 &&
@@ -169,7 +211,7 @@ func TestDevicesController(t *testing.T) {
 			func(t *testing.T) {
 				require.NoError(t, createVeth("veth0", "192.168.4.1/24", false))
 			},
-			func(t *testing.T, devs []*tables.Device, routes []*tables.Route) bool {
+			func(t *testing.T, devs []*tables.Device, routes []*tables.Route, neighbors []*tables.Neighbor) bool {
 				// No changes expected to previous step.
 				return len(devs) == 2 &&
 					"dummy0" == devs[0].Name &&
@@ -178,32 +220,67 @@ func TestDevicesController(t *testing.T) {
 		},
 
 		{
-			"delete-dummy0",
+			"veth-with-default-gw",
 			func(t *testing.T) {
-				require.NoError(t, deleteLink("dummy0"))
+				// Remove default route + neighbor from dummy1
+				assert.NoError(t,
+					delRoute(addRouteParams{iface: "dummy1", gw: "192.168.1.254", table: unix.RT_TABLE_MAIN}))
+				assert.NoError(t,
+					delNeighbor(addNeighborParams{iface: "dummy1", ip: "192.168.1.254", mac: "00:00:5e:00:53:01", flags: netlink.NTF_EXT_LEARNED}))
+
+				// And add default route + neighbor for veth0.
+				assert.NoError(t,
+					addRoute(addRouteParams{iface: "veth0", gw: "192.168.4.254", table: unix.RT_TABLE_MAIN}))
+				assert.NoError(t,
+					addNeighbor(addNeighborParams{iface: "veth0", ip: "192.168.1.254", mac: "00:00:5e:00:53:01", flags: netlink.NTF_EXT_LEARNED}))
 			},
-			func(t *testing.T, devs []*tables.Device, routes []*tables.Route) bool {
-				return len(devs) == 1 &&
-					"dummy1" == devs[0].Name &&
-					containsAddress(devs[0], "192.168.1.1", primaryAddress)
+			func(t *testing.T, devs []*tables.Device, routes []*tables.Route, neighbors []*tables.Neighbor) bool {
+				return len(devs) == 3 &&
+					devs[0].Name == "dummy0" &&
+					devs[1].Name == "dummy1" &&
+					devs[2].Name == "veth0" &&
+					containsAddress(devs[2], "192.168.4.1", primaryAddress) &&
+					routeExists(routes, devs[2].Index, "0.0.0.0/0", "", "192.168.4.254") &&
+					neighborExists(neighbors, devs[2].Index, "192.168.1.254", "00:00:5e:00:53:01", tables.NTF_EXT_LEARNED)
 			},
 		},
 
 		{
-			"veth-with-default-gw",
-			func(t *testing.T) {
-				assert.NoError(t,
-					addRoute(addRouteParams{iface: "veth0", gw: "192.168.4.254", table: unix.RT_TABLE_MAIN}))
-			},
-			func(t *testing.T, devs []*tables.Device, routes []*tables.Route) bool {
-				return len(devs) == 2 &&
-					devs[0].Name == "dummy1" &&
-					devs[0].Selected &&
-					devs[1].Name == "veth0" &&
-					containsAddress(devs[1], "192.168.4.1", primaryAddress) &&
-					devs[1].Selected
+			"check-all-v4-routes",
+			func(t *testing.T) {},
+			func(t *testing.T, devs []*tables.Device, routes []*tables.Route, neighbors []*tables.Neighbor) bool {
+				routes = v4Routes(routes)
+				json, _ := json.Marshal(routes)
+				os.WriteFile("/tmp/routes.json", json, 0644)
+				return routeExists(routes, devs[0].Index, "192.168.0.0/24", "192.168.0.1", "") &&
+					routeExists(routes, devs[0].Index, "192.168.0.1/32", "192.168.0.1", "") &&
+					routeExists(routes, devs[0].Index, "192.168.0.255/32", "192.168.0.1", "") &&
+
+					routeExists(routes, devs[1].Index, "192.168.1.0/24", "192.168.1.1", "") &&
+					routeExists(routes, devs[1].Index, "192.168.1.1/32", "192.168.1.1", "") &&
+					routeExists(routes, devs[1].Index, "192.168.1.2/32", "192.168.1.1", "") &&
+					routeExists(routes, devs[1].Index, "192.168.1.255/32", "192.168.1.1", "") &&
+
+					routeExists(routes, devs[2].Index, "192.168.4.0/24", "192.168.4.1", "") &&
+					routeExists(routes, devs[2].Index, "192.168.4.1/32", "192.168.4.1", "") &&
+					routeExists(routes, devs[2].Index, "192.168.4.255/32", "192.168.4.1", "") &&
+					routeExists(routes, devs[2].Index, "0.0.0.0/0", "", "192.168.4.254") &&
+					len(routes) == 11
 			},
 		},
+
+		{
+			"delete-dummy0",
+			func(t *testing.T) {
+				require.NoError(t, deleteLink("dummy0"))
+			},
+			func(t *testing.T, devs []*tables.Device, routes []*tables.Route, neighbors []*tables.Neighbor) bool {
+				return len(devs) == 2 &&
+					"dummy1" == devs[0].Name &&
+					"veth0" == devs[1].Name
+			},
+		},
+
 		{
 			"bond-is-selected",
 			func(t *testing.T) {
@@ -211,7 +288,7 @@ func TestDevicesController(t *testing.T) {
 				require.NoError(t, createBond("bond0", "192.168.6.1/24", false))
 				require.NoError(t, setBondMaster("dummy1", "bond0"))
 			},
-			func(t *testing.T, devs []*tables.Device, routes []*tables.Route) bool {
+			func(t *testing.T, devs []*tables.Device, routes []*tables.Route, neighbors []*tables.Neighbor) bool {
 				// Slaved devices are ignored, so we should only see bond0.
 				return len(devs) == 1 &&
 					devs[0].Name == "bond0" &&
@@ -226,7 +303,7 @@ func TestDevicesController(t *testing.T) {
 				assert.NoError(t, deleteLink("bond0"))
 				assert.NoError(t, setLinkUp("dummy1"))
 			},
-			func(t *testing.T, devs []*tables.Device, routes []*tables.Route) bool {
+			func(t *testing.T, devs []*tables.Device, routes []*tables.Route, neighbors []*tables.Neighbor) bool {
 				return len(devs) == 1 &&
 					devs[0].Name == "dummy1" &&
 					devs[0].Selected
@@ -238,44 +315,43 @@ func TestDevicesController(t *testing.T) {
 				require.NoError(t, createBridge("br0", "192.168.5.1/24", false))
 				require.NoError(t, setMaster("dummy1", "br0"))
 			},
-			func(t *testing.T, devs []*tables.Device, routes []*tables.Route) bool {
+			func(t *testing.T, devs []*tables.Device, routes []*tables.Route, neighbors []*tables.Neighbor) bool {
 				return len(devs) == 0
 			},
 		},
 	}
 
-	withFreshNetNS(t, func(ns netns.NsHandle) {
-
+	tlog := hivetest.Logger(t)
+	ns := netns.NewNetNS(t)
+	ns.Do(func() error {
 		var (
-			db           *statedb.DB
-			devicesTable statedb.Table[*tables.Device]
-			routesTable  statedb.Table[*tables.Route]
+			db             *statedb.DB
+			devicesTable   statedb.Table[*tables.Device]
+			routesTable    statedb.Table[*tables.Route]
+			neighborsTable statedb.Table[*tables.Neighbor]
 		)
 		h := hive.New(
-			statedb.Cell,
 			DevicesControllerCell,
 			cell.Provide(func() (*netlinkFuncs, error) {
 				// Provide the normal netlink interface, but restrict it to the test network
 				// namespace.
-				return makeNetlinkFuncs(ns)
+				return makeNetlinkFuncs()
 			}),
 
-			cell.Provide(func() DevicesConfig {
-				return DevicesConfig{
-					Devices: []string{},
-				}
-			}),
-
-			cell.Invoke(func(db_ *statedb.DB, devicesTable_ statedb.Table[*tables.Device], routesTable_ statedb.Table[*tables.Route]) {
+			cell.Invoke(func(db_ *statedb.DB, devicesTable_ statedb.Table[*tables.Device], routesTable_ statedb.Table[*tables.Route], neighborsTable_ statedb.Table[*tables.Neighbor]) {
 				db = db_
 				devicesTable = devicesTable_
 				routesTable = routesTable_
+				neighborsTable = neighborsTable_
 			}))
+		hive.AddConfigOverride(h, func(c *DevicesConfig) {
+			c.EnableStateDBNeighborSync = true
+		})
 
 		// Create a dummy device before starting to exercise initialize()
 		require.NoError(t, createDummy("dummy0", "192.168.0.1/24", false))
 
-		err := h.Start(ctx)
+		err := h.Start(tlog, ctx)
 		require.NoError(t, err)
 
 		for _, step := range testSteps {
@@ -284,16 +360,19 @@ func TestDevicesController(t *testing.T) {
 			// Get the new set of devices
 			for {
 				txn := db.ReadTxn()
-				allDevsIter, _ := devicesTable.All(txn)
-				allDevs := statedb.Collect(allDevsIter)
+				allDevs := statedb.Collect(devicesTable.All(txn))
 				devs, devsInvalidated := tables.SelectedDevices(devicesTable, txn)
 
-				routesIter, routesIterInvalidated := routesTable.All(txn)
+				routesIter, routesIterInvalidated := routesTable.AllWatch(txn)
 				routes := statedb.Collect(routesIter)
 
+				neighborsIter, neighborsIterInvalidated := neighborsTable.AllWatch(txn)
+				neighbors := statedb.Collect(neighborsIter)
+
 				// Stop if the test case passes and there are no orphan routes left in the
-				// route table.
-				if step.check(t, devs, routes) && !orphanRoutes(allDevs, routes) {
+				// route / neighbor table.
+				if step.check(t, devs, routes, neighbors) &&
+					!orphanRoutes(allDevs, routes) && !orphanNeighbors(allDevs, neighbors) {
 					break
 				}
 
@@ -301,6 +380,7 @@ func TestDevicesController(t *testing.T) {
 				select {
 				case <-routesIterInvalidated:
 				case <-devsInvalidated:
+				case <-neighborsIterInvalidated:
 				case <-ctx.Done():
 					txn.WriteJSON(os.Stdout)
 					t.Fatalf("Test case %q timed out while waiting for devices", step.name)
@@ -312,8 +392,9 @@ func TestDevicesController(t *testing.T) {
 			}
 		}
 
-		err = h.Stop(ctx)
+		err = h.Stop(tlog, ctx)
 		require.NoError(t, err)
+		return nil
 	})
 }
 
@@ -326,30 +407,32 @@ func TestDevicesController_Wildcards(t *testing.T) {
 	testutils.PrivilegedTest(t)
 	devicesControllerTestSetup(t)
 
-	withFreshNetNS(t, func(ns netns.NsHandle) {
-
+	tlog := hivetest.Logger(t)
+	ns := netns.NewNetNS(t)
+	ns.Do(func() error {
 		var (
 			db           *statedb.DB
 			devicesTable statedb.Table[*tables.Device]
 		)
 		h := hive.New(
-			statedb.Cell,
 			DevicesControllerCell,
-			cell.Provide(func() DevicesConfig {
-				return DevicesConfig{
-					Devices: []string{"dummy+"},
-				}
-			}),
-			cell.Provide(func() (*netlinkFuncs, error) { return makeNetlinkFuncs(ns) }),
+			cell.Provide(func() (*netlinkFuncs, error) { return makeNetlinkFuncs() }),
 			cell.Invoke(func(db_ *statedb.DB, devicesTable_ statedb.Table[*tables.Device]) {
 				db = db_
 				devicesTable = devicesTable_
 			}))
+		hive.AddConfigOverride(h, func(c *DevicesConfig) {
+			c.Devices = []string{"dummy+"}
+		})
 
-		err := h.Start(ctx)
+		err := h.Start(tlog, ctx)
 		require.NoError(t, err)
 		require.NoError(t, createDummy("dummy0", "192.168.0.1/24", false))
 		require.NoError(t, createDummy("nonviable", "192.168.1.1/24", false))
+
+		// This device satisfies the autodetection rule, but should not be included
+		// because the ForceDeviceDetection option is not enabled
+		require.NoError(t, createDummy("eth0", "1.2.3.4/24", false))
 
 		for {
 			rxn := db.ReadTxn()
@@ -367,8 +450,79 @@ func TestDevicesController_Wildcards(t *testing.T) {
 			}
 		}
 
-		err = h.Stop(context.TODO())
+		err = h.Stop(tlog, context.TODO())
 		assert.NoError(t, err)
+		return nil
+	})
+}
+
+// TestDevicesController_with_ForcedDetection tests the behavior of device detection when forced detection is enabled.
+// It expects all devices matching a specific pattern to be detected will append to detected devices and marked as selected.
+func TestDevicesController_with_ForcedDetection(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	testutils.PrivilegedTest(t)
+	devicesControllerTestSetup(t)
+
+	tlog := hivetest.Logger(t)
+	ns := netns.NewNetNS(t)
+	ns.Do(func() error {
+		var (
+			db           *statedb.DB
+			devicesTable statedb.Table[*tables.Device]
+			h            *hive.Hive
+		)
+
+		// Function to set up the hive and run device detection
+		runDeviceDetection := func(devicePattern string, forceDetection bool) error {
+			h = hive.New(
+				DevicesControllerCell,
+				cell.Provide(func() (*netlinkFuncs, error) { return makeNetlinkFuncs() }),
+				cell.Invoke(func(db_ *statedb.DB, devicesTable_ statedb.Table[*tables.Device]) {
+					db = db_
+					devicesTable = devicesTable_
+				}),
+			)
+			hive.AddConfigOverride(h, func(c *DevicesConfig) {
+				c.Devices = []string{devicePattern}
+				c.ForceDeviceDetection = forceDetection
+			})
+
+			return h.Start(tlog, ctx)
+		}
+
+		// Function to check the expected number of devices
+		testDevices := func(expectedCount int) bool {
+			rxn := db.ReadTxn()
+			devs, invalidated := tables.SelectedDevices(devicesTable, rxn)
+			if len(devs) == expectedCount {
+				return true
+			}
+
+			select {
+			case <-ctx.Done():
+				t.Fatalf("Test timed out while waiting for devices, last seen: %v", devs)
+				return false
+			case <-invalidated:
+				return false
+			}
+		}
+
+		// Create dummy interfaces as per test requirements
+		require.NoError(t, createDummy("dummy0", "192.168.0.1/24", false))
+		require.NoError(t, createDummy("dummy1", "192.168.1.1/24", false))
+
+		// This device does not match the "dummy+" pattern, but should be included
+		// because the ForceDeviceDetection option is enabled
+		require.NoError(t, createDummy("eth0", "1.2.3.4/24", false))
+
+		// Test with forced detection enabled
+		require.NoError(t, runDeviceDetection("dummy+", true))
+		require.True(t, testDevices(3), "Expecting all three devices to be detected")
+		require.NoError(t, h.Stop(tlog, ctx))
+
+		return nil
 	})
 }
 
@@ -380,8 +534,6 @@ func TestDevicesController_Restarts(t *testing.T) {
 		db           *statedb.DB
 		devicesTable statedb.Table[*tables.Device]
 	)
-
-	logging.SetLogLevelToDebug()
 
 	// Is this the first subscription?
 	var first atomic.Bool
@@ -408,6 +560,8 @@ func TestDevicesController_Restarts(t *testing.T) {
 			}
 			return nil, nil
 		},
+
+		NeighList: func(linkIndex, family int) ([]netlink.Neigh, error) { return nil, nil },
 
 		RouteListFiltered: func(family int, filter *netlink.Route, filterMask uint64) ([]netlink.Route, error) {
 			return nil, nil
@@ -480,24 +634,43 @@ func TestDevicesController_Restarts(t *testing.T) {
 			}()
 			return nil
 		},
+		NeighSubscribe: func(ch chan<- netlink.NeighUpdate, done <-chan struct{}, errorCallback func(error)) error {
+			go func() {
+				defer close(ch)
+				if !first.Load() {
+					select {
+					case <-done:
+					case ch <- netlink.NeighUpdate{
+						Type: unix.RTM_NEWNEIGH,
+						Neigh: netlink.Neigh{
+							LinkIndex:    1,
+							IP:           net.ParseIP("1.2.3.4"),
+							HardwareAddr: []byte{1, 2, 3, 4, 5, 6},
+						},
+					}:
+					}
+				}
+				<-done
+			}()
+			return nil
+		},
 	}
 
+	tlog := hivetest.Logger(t, hivetest.LogLevel(slog.LevelDebug))
 	h := hive.New(
-		statedb.Cell,
 		DevicesControllerCell,
-		cell.Provide(func() DevicesConfig { return DevicesConfig{} }),
 		cell.Provide(func() *netlinkFuncs { return &funcs }),
 		cell.Invoke(func(db_ *statedb.DB, devicesTable_ statedb.Table[*tables.Device]) {
 			db = db_
 			devicesTable = devicesTable_
 		}))
 
-	err := h.Start(ctx)
+	err := h.Start(tlog, ctx)
 	assert.NoError(t, err)
 
 	for {
 		rxn := db.ReadTxn()
-		iter, invalidated := devicesTable.All(rxn)
+		iter, invalidated := devicesTable.AllWatch(rxn)
 		devs := statedb.Collect(iter)
 
 		// We expect the 'stale' device to have been flushed by the restart
@@ -514,7 +687,263 @@ func TestDevicesController_Restarts(t *testing.T) {
 		}
 	}
 
-	err = h.Stop(ctx)
+	err = h.Stop(tlog, ctx)
 	assert.NoError(t, err)
 
+}
+
+func createLink(linkTemplate netlink.Link, iface, ipAddr string, flagMulticast bool) error {
+	var flags net.Flags
+	if flagMulticast {
+		flags = net.FlagMulticast
+	}
+	*linkTemplate.Attrs() = netlink.LinkAttrs{
+		Name:  iface,
+		Flags: flags,
+	}
+
+	if err := netlink.LinkAdd(linkTemplate); err != nil {
+		return err
+	}
+
+	if ipAddr != "" {
+		if err := addAddr(iface, ipAddr); err != nil {
+			return err
+		}
+	}
+
+	link, err := netlink.LinkByName(iface)
+	if err != nil {
+		return err
+	}
+
+	if err := netlink.LinkSetUp(link); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func deleteLink(name string) error {
+	link, err := netlink.LinkByName(name)
+	if err != nil {
+		return err
+	}
+	return netlink.LinkDel(link)
+}
+
+func createDummy(iface, ipAddr string, flagMulticast bool) error {
+	return createLink(&netlink.Dummy{}, iface, ipAddr, flagMulticast)
+}
+
+func createVeth(iface, ipAddr string, flagMulticast bool) error {
+	return createLink(&netlink.Veth{PeerName: iface + "_"}, iface, ipAddr, flagMulticast)
+}
+
+func createBridge(iface, ipAddr string, flagMulticast bool) error {
+	return createLink(&netlink.Bridge{}, iface, ipAddr, flagMulticast)
+}
+
+func createBond(iface, ipAddr string, flagMulticast bool) error {
+	bond := netlink.NewLinkBond(netlink.LinkAttrs{})
+	bond.Mode = netlink.BOND_MODE_BALANCE_RR
+	return createLink(bond, iface, ipAddr, flagMulticast)
+}
+
+func setLinkUp(iface string) error {
+	link, err := netlink.LinkByName(iface)
+	if err != nil {
+		return err
+	}
+	return netlink.LinkSetUp(link)
+}
+
+func setMaster(iface string, master string) error {
+	masterLink, err := netlink.LinkByName(master)
+	if err != nil {
+		return err
+	}
+	link, err := netlink.LinkByName(iface)
+	if err != nil {
+		return err
+	}
+	return netlink.LinkSetMaster(link, masterLink)
+}
+
+func setBondMaster(iface string, master string) error {
+	masterLink, err := netlink.LinkByName(master)
+	if err != nil {
+		return err
+	}
+	link, err := netlink.LinkByName(iface)
+	if err != nil {
+		return err
+	}
+	netlink.LinkSetDown(link)
+	defer netlink.LinkSetUp(link)
+	return netlink.LinkSetBondSlave(link, masterLink.(*netlink.Bond))
+}
+func addAddr(iface string, cidr string) error {
+	return addAddrScoped(iface, cidr, netlink.SCOPE_SITE, 0)
+}
+
+func addAddrScoped(iface string, cidr string, scope netlink.Scope, flags int) error {
+	ip, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return fmt.Errorf("ParseCIDR: %w", err)
+	}
+	ipnet.IP = ip
+	link, err := netlink.LinkByName(iface)
+	if err != nil {
+		return fmt.Errorf("LinkByName: %w", err)
+	}
+
+	if err := netlink.AddrAdd(link, &netlink.Addr{IPNet: ipnet, Scope: int(scope), Flags: flags}); err != nil {
+		return fmt.Errorf("AddrAdd: %w", err)
+	}
+	return nil
+}
+
+type addRouteParams struct {
+	iface string
+	gw    string
+	src   string
+	dst   string
+	table int
+	scope netlink.Scope
+}
+
+func addRoute(p addRouteParams) error {
+	link, err := netlink.LinkByName(p.iface)
+	if err != nil {
+		return err
+	}
+
+	var dst *net.IPNet
+	if p.dst != "" {
+		_, dst, err = net.ParseCIDR(p.dst)
+		if err != nil {
+			return err
+		}
+	}
+
+	var src net.IP
+	if p.src != "" {
+		src = net.ParseIP(p.src)
+	}
+
+	if p.table == 0 {
+		p.table = unix.RT_TABLE_MAIN
+	}
+
+	route := &netlink.Route{
+		LinkIndex: link.Attrs().Index,
+		Dst:       dst,
+		Src:       src,
+		Gw:        net.ParseIP(p.gw),
+		Table:     p.table,
+		Scope:     p.scope,
+	}
+	if err := netlink.RouteAdd(route); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func delRoute(p addRouteParams) error {
+	link, err := netlink.LinkByName(p.iface)
+	if err != nil {
+		return err
+	}
+
+	var dst *net.IPNet
+	if p.dst != "" {
+		_, dst, err = net.ParseCIDR(p.dst)
+		if err != nil {
+			return err
+		}
+	}
+
+	var src net.IP
+	if p.src != "" {
+		src = net.ParseIP(p.src)
+	}
+
+	if p.table == 0 {
+		p.table = unix.RT_TABLE_MAIN
+	}
+
+	route := &netlink.Route{
+		LinkIndex: link.Attrs().Index,
+		Dst:       dst,
+		Src:       src,
+		Gw:        net.ParseIP(p.gw),
+		Table:     p.table,
+		Scope:     p.scope,
+	}
+	if err := netlink.RouteDel(route); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+type addNeighborParams struct {
+	iface string
+	ip    string
+	mac   string
+	flags int
+}
+
+func addNeighbor(p addNeighborParams) error {
+	link, err := netlink.LinkByName(p.iface)
+	if err != nil {
+		return err
+	}
+
+	hwAddr, err := net.ParseMAC(p.mac)
+	if err != nil {
+		return err
+	}
+
+	neigh := &netlink.Neigh{
+		LinkIndex:    link.Attrs().Index,
+		Type:         netlink.NDA_DST,
+		State:        netlink.NUD_PERMANENT,
+		IP:           net.ParseIP(p.ip),
+		HardwareAddr: hwAddr,
+		Flags:        p.flags,
+	}
+	if err := netlink.NeighAdd(neigh); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func delNeighbor(p addNeighborParams) error {
+	link, err := netlink.LinkByName(p.iface)
+	if err != nil {
+		return err
+	}
+
+	hwAddr, err := net.ParseMAC(p.mac)
+	if err != nil {
+		return err
+	}
+
+	neigh := &netlink.Neigh{
+		LinkIndex:    link.Attrs().Index,
+		Type:         netlink.NDA_DST,
+		State:        netlink.NUD_PERMANENT,
+		IP:           net.ParseIP(p.ip),
+		HardwareAddr: hwAddr,
+		Flags:        p.flags,
+	}
+	if err := netlink.NeighDel(neigh); err != nil {
+		return err
+	}
+
+	return nil
 }

@@ -9,13 +9,11 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/cilium/hive/cell"
+	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/stretchr/testify/assert"
-
-	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	"github.com/cilium/cilium/pkg/k8s/client"
 	"github.com/cilium/cilium/pkg/node"
 	nodeTypes "github.com/cilium/cilium/pkg/node/types"
@@ -33,7 +31,7 @@ var (
 				"foo": "bar",
 			},
 			Annotations: map[string]string{
-				"baz": "quux",
+				"cilium.io/baz": "quux",
 			},
 		},
 		Spec: corev1.NodeSpec{
@@ -77,7 +75,7 @@ func validateLocalNodeInit(lns *node.LocalNodeStore) error {
 	assert.Equal(errs, "10.0.0.1", node.GetNodeIP(false).String())
 	assert.Equal(errs, "20.0.0.2", node.GetExternalIP(false).String())
 	assert.Contains(errs, node.Labels, "foo")
-	assert.Contains(errs, node.Annotations, "baz")
+	assert.Contains(errs, node.Annotations, "cilium.io/baz")
 
 	if errs.err != nil {
 		return fmt.Errorf("validateLocalNodeInit: %w", errs.err)
@@ -148,9 +146,9 @@ func init() {
 				})
 
 			validateLNSInit = cell.Invoke(
-				func(lc hive.Lifecycle, lns *node.LocalNodeStore) {
-					lc.Append(hive.Hook{
-						OnStart: func(hive.HookContext) error {
+				func(lc cell.Lifecycle, lns *node.LocalNodeStore) {
+					lc.Append(cell.Hook{
+						OnStart: func(cell.HookContext) error {
 							return validateLocalNodeInit(lns)
 						},
 					})

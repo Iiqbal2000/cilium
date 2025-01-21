@@ -13,23 +13,24 @@ on:
 permissions: read-all
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.after }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.after || github.event.merge_group && github.run_id }}
+  cancel-in-progress: ${{ !github.event.merge_group }}
 
 jobs:
   check_changes:
     name: Deduce required tests from code changes
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     outputs:
       docs-tree: ${{ steps.docs-tree.outputs.src }}
     steps:
       - name: Checkout code
         if: ${{ !github.event.pull_request }}
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+          fetch-depth: 0
       - name: Check code changes
-        uses: dorny/paths-filter@4512585405083f25c027a35db413c2b3b9006d50 # v2.11.1
+        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
         id: docs-tree
         with:
           # For `push` events, compare against the `ref` base branch
@@ -54,14 +55,42 @@ jobs:
     needs: check_changes
     if: ${{ needs.check_changes.outputs.docs-tree == 'true' }}
     name: Validate & Build HTML
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+          # Needed to detect missing redirects
+          fetch-depth: 0
       - name: Build HTML
-        uses: docker://quay.io/cilium/docs-builder:d88a9684e1be32661e9e56d6b7e1e1350db7a1b1@sha256:f051371b2a910088a43dc5bd4289c9ca3a8754a8afb15f60f86f385660c1fd09
+        uses: docker://quay.io/cilium/docs-builder:550ca417f5dc0b13fa7f117cc117443b23120f5e@sha256:febb1339085d9bcabcfd547ab2125e67e1c6468f0bc33f62f9326e790efb938a
         with:
           entrypoint: ./Documentation/check-build.sh
           args: html
+
+  check-generated-documentation:
+    name: Check generated documentation
+    if: ${{ github.event_name != 'merge_group' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          # Needed to detect missing redirects
+          fetch-depth: 0
+      - name: Install Go
+        uses: actions/setup-go@3041bf56c941b39c61721a86cd11f3bb1338122a # v5.2.0
+        with:
+          # renovate: datasource=golang-version depName=go
+          go-version: 1.23.5
+
+      # Building Cilium as precondition to generate documentation artifacts.
+      - name: Build Cilium
+        run: |
+          make -C Documentation cilium-build
+
+      - name: Check generated documentation
+        run: |
+          SKIP_BUILD=true make -C Documentation check

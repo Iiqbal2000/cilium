@@ -9,12 +9,10 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	"github.com/sirupsen/logrus"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
-	gatewayv1alpha2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 
 	controllerruntime "github.com/cilium/cilium/operator/pkg/controller-runtime"
@@ -32,19 +30,16 @@ import (
 // the resource is valid and accepted. The Accepted resources will be then included
 // in parent Gateway for further processing.
 func (r *grpcRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	scopedLog := log.WithContext(ctx).WithFields(logrus.Fields{
-		logfields.Controller: grpcRoute,
-		logfields.Resource:   req.NamespacedName,
-	})
+	scopedLog := r.logger.With(logfields.Controller, grpcRoute, logfields.Resource, req.NamespacedName)
 	scopedLog.Info("Reconciling GRPCRoute")
 
 	// Fetch the GRPCRoute instance
-	original := &gatewayv1alpha2.GRPCRoute{}
+	original := &gatewayv1.GRPCRoute{}
 	if err := r.Client.Get(ctx, req.NamespacedName, original); err != nil {
 		if k8serrors.IsNotFound(err) {
 			return controllerruntime.Success()
 		}
-		scopedLog.WithError(err).Error("Unable to fetch GRPCRoute")
+		scopedLog.ErrorContext(ctx, "Unable to fetch GRPCRoute", logfields.Error, err)
 		return controllerruntime.Fail(err)
 	}
 
@@ -54,22 +49,17 @@ func (r *grpcRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	gr := original.DeepCopy()
-	defer func() {
-		if err := r.updateStatus(ctx, original, gr); err != nil {
-			scopedLog.WithError(err).Error("Failed to update GRPCRoute status")
-		}
-	}()
 
 	// check if the backend is allowed
 	grants := &gatewayv1beta1.ReferenceGrantList{}
 	if err := r.Client.List(ctx, grants); err != nil {
-		return controllerruntime.Fail(fmt.Errorf("failed to retrieve reference grants: %w", err))
+		return r.handleReconcileErrorWithStatus(ctx, fmt.Errorf("failed to retrieve reference grants: %w", err), original, gr)
 	}
 
 	// input for the validators
 	i := &routechecks.GRPCRouteInput{
 		Ctx:       ctx,
-		Logger:    scopedLog.WithField(logfields.Resource, gr),
+		Logger:    scopedLog.With(logfields.Resource, gr),
 		Client:    r.Client,
 		Grants:    grants,
 		GRPCRoute: gr,
@@ -94,16 +84,16 @@ func (r *grpcRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		})
 
 		// run the actual validators
-		for _, fn := range []routechecks.CheckGatewayFunc{
-			routechecks.CheckGatewayAllowedForNamespace,
+		for _, fn := range []routechecks.CheckParentFunc{
 			routechecks.CheckGatewayRouteKindAllowed,
 			routechecks.CheckGatewayMatchingPorts,
 			routechecks.CheckGatewayMatchingHostnames,
 			routechecks.CheckGatewayMatchingSection,
+			routechecks.CheckGatewayAllowedForNamespace,
 		} {
 			continueCheck, err := fn(i, parent)
 			if err != nil {
-				return ctrl.Result{}, err
+				return r.handleReconcileErrorWithStatus(ctx, fmt.Errorf("failed to apply Gateway check: %w", err), original, gr)
 			}
 
 			if !continueCheck {
@@ -114,19 +104,24 @@ func (r *grpcRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	for _, fn := range []routechecks.CheckRuleFunc{
 		routechecks.CheckAgainstCrossNamespaceBackendReferences,
-		routechecks.CheckBackendIsService,
+		routechecks.CheckBackend,
+		routechecks.CheckHasServiceImportSupport,
 		routechecks.CheckBackendIsExistingService,
 	} {
 		if continueCheck, err := fn(i); err != nil || !continueCheck {
-			return ctrl.Result{}, err
+			return r.handleReconcileErrorWithStatus(ctx, fmt.Errorf("failed to apply Backend check: %w", err), original, gr)
 		}
+	}
+
+	if err := r.updateStatus(ctx, original, gr); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to update GRPCRoute status: %w", err)
 	}
 
 	scopedLog.Info("Successfully reconciled GRPCRoute")
 	return controllerruntime.Success()
 }
 
-func (r *grpcRouteReconciler) updateStatus(ctx context.Context, original *gatewayv1alpha2.GRPCRoute, new *gatewayv1alpha2.GRPCRoute) error {
+func (r *grpcRouteReconciler) updateStatus(ctx context.Context, original *gatewayv1.GRPCRoute, new *gatewayv1.GRPCRoute) error {
 	oldStatus := original.Status.DeepCopy()
 	newStatus := new.Status.DeepCopy()
 
@@ -135,4 +130,12 @@ func (r *grpcRouteReconciler) updateStatus(ctx context.Context, original *gatewa
 		return nil
 	}
 	return r.Client.Status().Update(ctx, new)
+}
+
+func (r *grpcRouteReconciler) handleReconcileErrorWithStatus(ctx context.Context, reconcileErr error, original *gatewayv1.GRPCRoute, modified *gatewayv1.GRPCRoute) (ctrl.Result, error) {
+	if err := r.updateStatus(ctx, original, modified); err != nil {
+		return controllerruntime.Fail(fmt.Errorf("failed to update GRPCRoute status while handling the reconcile error: %w: %w", reconcileErr, err))
+	}
+
+	return controllerruntime.Fail(reconcileErr)
 }

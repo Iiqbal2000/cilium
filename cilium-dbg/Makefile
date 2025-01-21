@@ -1,9 +1,15 @@
 # Copyright Authors of Cilium
 # SPDX-License-Identifier: Apache-2.0
 
+.DEFAULT_GOAL := all
+
 ROOT_DIR := $(shell dirname "$(realpath $(lastword $(MAKEFILE_LIST)))")
 
 include ${ROOT_DIR}/../Makefile.defs
+
+# Add the ability to override variables
+# ROOT_DIR changes to repo root after including Makefile.defs
+-include ${ROOT_DIR}/Makefile.override
 
 TARGET := cilium-dbg
 TARGET_OLD := cilium
@@ -26,7 +32,7 @@ install: install-binary install-bash-completion-only
 install-binary:
 	$(QUIET)$(INSTALL) -m 0755 -d $(DESTDIR)$(BINDIR)
 	$(QUIET)$(INSTALL) -m 0755 $(TARGET) $(DESTDIR)$(BINDIR)
-	$(QUIET)ln -rs $(DESTDIR)$(BINDIR)/$(TARGET) $(DESTDIR)$(BINDIR)/$(TARGET_OLD)
+	$(QUIET)ln -frs $(DESTDIR)$(BINDIR)/$(TARGET) $(DESTDIR)$(BINDIR)/$(TARGET_OLD)
 
 install-bash-completion: $(TARGET) install-bash-completion-only
 

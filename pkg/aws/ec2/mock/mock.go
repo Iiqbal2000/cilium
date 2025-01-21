@@ -8,7 +8,14 @@ import (
 	"fmt"
 	"net"
 
+	ec2_types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/smithy-go"
+	"github.com/google/uuid"
+	log "github.com/sirupsen/logrus"
+	"golang.org/x/time/rate"
+
 	"github.com/cilium/cilium/pkg/api/helpers"
+	"github.com/cilium/cilium/pkg/aws/ec2"
 	eniTypes "github.com/cilium/cilium/pkg/aws/eni/types"
 	"github.com/cilium/cilium/pkg/aws/types"
 	"github.com/cilium/cilium/pkg/ip"
@@ -18,10 +25,6 @@ import (
 	ipamTypes "github.com/cilium/cilium/pkg/ipam/types"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/time"
-
-	"github.com/google/uuid"
-	log "github.com/sirupsen/logrus"
-	"golang.org/x/time/rate"
 )
 
 // ENIMap is a map of ENI interfaced indexed by ENI ID
@@ -39,6 +42,7 @@ const (
 	AssignPrivateIpAddresses
 	UnassignPrivateIpAddresses
 	TagENI
+	AssociateEIP
 	MaxOperation
 )
 
@@ -50,6 +54,7 @@ type API struct {
 	subnets        map[string]*ipamTypes.Subnet
 	vpcs           map[string]*ipamTypes.VirtualNetwork
 	securityGroups map[string]*types.SecurityGroup
+	instanceTypes  []ec2_types.InstanceTypeInfo
 	errors         map[Operation]error
 	allocator      *ipallocator.Range
 	pdAllocator    *cidrset.CidrSet
@@ -82,6 +87,7 @@ func NewAPI(subnets []*ipamTypes.Subnet, vpcs []*ipamTypes.VirtualNetwork, secur
 		subnets:        map[string]*ipamTypes.Subnet{},
 		vpcs:           map[string]*ipamTypes.VirtualNetwork{},
 		securityGroups: map[string]*types.SecurityGroup{},
+		instanceTypes:  []ec2_types.InstanceTypeInfo{},
 		allocator:      podCidrRange,
 		pdAllocator:    pdCidrRange,
 		errors:         map[Operation]error{},
@@ -129,6 +135,12 @@ func (e *API) UpdateENIs(enis map[string]ENIMap) {
 			e.enis[instanceID][eniID] = eni.DeepCopy()
 		}
 	}
+	e.mutex.Unlock()
+}
+
+func (e *API) UpdateInstanceTypes(instanceTypes []ec2_types.InstanceTypeInfo) {
+	e.mutex.Lock()
+	e.instanceTypes = instanceTypes
 	e.mutex.Unlock()
 }
 
@@ -424,7 +436,10 @@ func assignPrefixToENI(e *API, eni *eniTypes.ENI, prefixes int32) error {
 	}
 
 	if int(prefixes)*option.ENIPDBlockSizeIPv4 > subnet.AvailableAddresses {
-		return fmt.Errorf("subnet %s has not enough addresses available", eni.Subnet.ID)
+		return &smithy.GenericAPIError{
+			Code:    ec2.InvalidParameterValueStr,
+			Message: ec2.SubnetFullErrMsgStr,
+		}
 	}
 
 	for i := int32(0); i < prefixes; i++ {
@@ -436,7 +451,7 @@ func assignPrefixToENI(e *API, eni *eniTypes.ENI, prefixes int32) error {
 
 		prefixStr := pfx.String()
 		eni.Prefixes = append(eni.Prefixes, prefixStr)
-		prefixIPs, err := ip.PrefixToIps(prefixStr)
+		prefixIPs, err := ip.PrefixToIps(prefixStr, 0)
 		if err != nil {
 			return fmt.Errorf("unable to convert prefix %s to ips", prefixStr)
 		}
@@ -484,7 +499,7 @@ func (e *API) UnassignENIPrefixes(ctx context.Context, eniID string, prefixes []
 			return fmt.Errorf("Invalid CIDR block %s", prefix)
 		}
 		e.pdAllocator.Release(ipNet)
-		ips, _ := ip.PrefixToIps(prefix)
+		ips, _ := ip.PrefixToIps(prefix, 0)
 		addresses = append(addresses, ips...)
 	}
 
@@ -555,6 +570,34 @@ func (e *API) GetInstance(ctx context.Context, vpcs ipamTypes.VirtualNetworkMap,
 	}
 
 	return &instance, nil
+}
+
+func (e *API) AssociateEIP(ctx context.Context, instanceID string, eipTags ipamTypes.Tags) (string, error) {
+	e.rateLimit()
+	e.delaySim.Delay(AssociateEIP)
+
+	e.mutex.Lock()
+	defer e.mutex.Unlock()
+
+	if err, ok := e.errors[AssociateEIP]; ok {
+		return "", err
+	}
+
+	ipAddr := "192.0.2.254"
+
+	// Assign the EIP to the ENI 0 of the instance
+	for iid, enis := range e.enis {
+		if iid == instanceID {
+			for _, eni := range enis {
+				if eni.Number == 0 {
+					eni.PublicIP = ipAddr
+					return ipAddr, nil
+				}
+			}
+		}
+	}
+
+	return "", fmt.Errorf("unable to find ENI 0 for instance %s", instanceID)
 }
 
 func (e *API) GetInstances(ctx context.Context, vpcs ipamTypes.VirtualNetworkMap, subnets ipamTypes.SubnetMap) (*ipamTypes.InstanceMap, error) {
@@ -645,4 +688,8 @@ func (e *API) GetSecurityGroups(ctx context.Context) (types.SecurityGroupMap, er
 		securityGroups[sg.ID] = sg.DeepCopy()
 	}
 	return securityGroups, nil
+}
+
+func (e *API) GetInstanceTypes(ctx context.Context) ([]ec2_types.InstanceTypeInfo, error) {
+	return e.instanceTypes, nil
 }

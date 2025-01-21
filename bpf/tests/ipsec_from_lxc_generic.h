@@ -5,7 +5,6 @@
 #include <bpf/ctx/skb.h>
 #include "pktgen.h"
 #define ROUTER_IP
-#include "config_replacement.h"
 #undef ROUTER_IP
 
 #define NODE_ID 2333
@@ -18,6 +17,7 @@
 #include "bpf_lxc.c"
 
 #include "lib/ipcache.h"
+#include "lib/node.h"
 #include "lib/policy.h"
 
 #define FROM_CONTAINER 0
@@ -75,7 +75,7 @@ int ipv4_from_lxc_no_node_id_setup(struct __ctx_buff *ctx)
 
 	map_update_elem(&ENCRYPT_MAP, &encrypt_key, &encrypt_value, BPF_ANY);
 
-	tail_call_static(ctx, &entry_call_map, FROM_CONTAINER);
+	tail_call_static(ctx, entry_call_map, FROM_CONTAINER);
 	return TEST_ERROR;
 }
 
@@ -122,14 +122,9 @@ int ipv4_from_lxc_encrypt_pktgen(struct __ctx_buff *ctx)
 SETUP("tc", "02_ipv4_from_lxc_encrypt")
 int ipv4_from_lxc_encrypt_setup(struct __ctx_buff *ctx)
 {
-	struct node_key node_ip = {};
-	__u32 node_id = NODE_ID;
+	node_v4_add_entry(v4_node_two, NODE_ID, 0);
 
-	node_ip.family = ENDPOINT_KEY_IPV4;
-	node_ip.ip4 = v4_node_two;
-	map_update_elem(&NODE_MAP, &node_ip, &node_id, BPF_ANY);
-
-	tail_call_static(ctx, &entry_call_map, FROM_CONTAINER);
+	tail_call_static(ctx, entry_call_map, FROM_CONTAINER);
 	return TEST_ERROR;
 }
 
@@ -193,6 +188,9 @@ int ipv4_from_lxc_encrypt_check(__maybe_unused const struct __ctx_buff *ctx)
 	if (l4->dest != tcp_svc_one)
 		test_fatal("dst TCP port was changed");
 
+	if (l4->check != bpf_htons(0x589c))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+
 	payload = (void *)l4 + sizeof(struct tcphdr);
 	if ((void *)payload + sizeof(default_data) > data_end)
 		test_fatal("paylaod out of bounds\n");
@@ -219,7 +217,7 @@ int ipv4_from_lxc_new_local_key_setup(struct __ctx_buff *ctx)
 
 	map_update_elem(&ENCRYPT_MAP, &encrypt_key, &encrypt_value, BPF_ANY);
 
-	tail_call_static(ctx, &entry_call_map, FROM_CONTAINER);
+	tail_call_static(ctx, entry_call_map, FROM_CONTAINER);
 	return TEST_ERROR;
 }
 
@@ -264,7 +262,7 @@ int ipv4_from_lxc_new_remote_key_setup(struct __ctx_buff *ctx)
 
 	map_update_elem(&ENCRYPT_MAP, &encrypt_key, &encrypt_value, BPF_ANY);
 
-	tail_call_static(ctx, &entry_call_map, FROM_CONTAINER);
+	tail_call_static(ctx, entry_call_map, FROM_CONTAINER);
 	return TEST_ERROR;
 }
 
@@ -327,14 +325,9 @@ int ipv6_from_lxc_encrypt_setup(struct __ctx_buff *ctx)
 
 	map_update_elem(&ENCRYPT_MAP, &encrypt_key, &encrypt_value, BPF_ANY);
 
-	struct node_key node_ip = {};
-	__u32 node_id = NODE_ID;
+	node_v4_add_entry(v4_node_two, NODE_ID, 0);
 
-	node_ip.family = ENDPOINT_KEY_IPV4;
-	node_ip.ip4 = v4_node_two;
-	map_update_elem(&NODE_MAP, &node_ip, &node_id, BPF_ANY);
-
-	tail_call_static(ctx, &entry_call_map, FROM_CONTAINER);
+	tail_call_static(ctx, entry_call_map, FROM_CONTAINER);
 	return TEST_ERROR;
 }
 
@@ -397,6 +390,9 @@ int ipv6_from_lxc_encrypt_check(__maybe_unused const struct __ctx_buff *ctx)
 
 	if (l4->dest != tcp_svc_one)
 		test_fatal("dst TCP port was changed");
+
+	if (l4->check != bpf_htons(0xdfe3))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
 
 	payload = (void *)l4 + sizeof(struct tcphdr);
 	if ((void *)payload + sizeof(default_data) > data_end)

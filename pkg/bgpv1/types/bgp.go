@@ -6,11 +6,24 @@ package types
 import (
 	"context"
 	"net/netip"
+	"strings"
 
 	"github.com/osrg/gobgp/v3/pkg/packet/bgp"
 
 	"github.com/cilium/cilium/api/v1/models"
 	v2alpha1api "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
+)
+
+// BGP metric labels
+const (
+	LabelClusterConfig = "bgp_cluster_config"
+	LabelVRouter       = "vrouter"
+	LabelNeighbor      = "neighbor"
+	LabelNeighborAsn   = "neighbor_asn"
+	LabelAfi           = "afi"
+	LabelSafi          = "safi"
+
+	MetricsSubsystem = "bgp_control_plane"
 )
 
 // BGPGlobal contains high level BGP configuration for given instance.
@@ -27,12 +40,16 @@ type RouteSelectionOptions struct {
 	AdvertiseInactiveRoutes bool
 }
 
+// StateNotificationCh is a channel used to notify the state of the BGP instance has changed
+type StateNotificationCh chan struct{}
+
 // Path is an object representing a single routing Path. It is an analogue of GoBGP's Path object,
 // but only contains minimal fields required for Cilium usecases.
 type Path struct {
 	// read/write
 	NLRI           bgp.AddrPrefixInterface
 	PathAttributes []bgp.PathAttributeInterface
+	Family         Family // can be empty, in which case it will be inferred from NLRI
 
 	// readonly
 	AgeNanoseconds int64 // time duration in nanoseconds since the Path was created
@@ -42,8 +59,14 @@ type Path struct {
 
 // NeighborRequest contains neighbor parameters used when enabling or disabling peer
 type NeighborRequest struct {
+	// Deprecated: field kept for backward compatibility.
+	//
+	// Both Neighbor and Peer should not be used at the same time.
+	// Neighbor field is used in BGPv1 and Peer, PeerConfig fields are used in BGPv2.
 	Neighbor *v2alpha1api.CiliumBGPNeighbor
-	VR       *v2alpha1api.CiliumBGPVirtualRouter
+
+	Peer       *v2alpha1api.CiliumBGPNodePeer
+	PeerConfig *v2alpha1api.CiliumBGPPeerConfigSpec
 	// Password is the "AuthSecret" in the Neighbor, fetched from a secret
 	Password string
 }
@@ -100,6 +123,21 @@ type RoutePolicyConditions struct {
 	MatchNeighbors []string
 	// MatchPrefixes matches ANY of the provided prefixes. If empty matches all prefixes.
 	MatchPrefixes []*RoutePolicyPrefixMatch
+	// MatchFamilies matches ANY of the provided address families. If empty matches all address families.
+	MatchFamilies []Family
+}
+
+// String() constructs a string identifier
+func (r RoutePolicyConditions) String() string {
+	values := []string{}
+	values = append(values, r.MatchNeighbors...)
+	for _, family := range r.MatchFamilies {
+		values = append(values, family.String())
+	}
+	for _, prefix := range r.MatchPrefixes {
+		values = append(values, prefix.CIDR.String())
+	}
+	return strings.Join(values, "-")
 }
 
 // RoutePolicyAction defines the action taken on a route matched by a routing policy.
@@ -173,7 +211,8 @@ type RoutePolicy struct {
 
 // RoutePolicyRequest contains parameters for adding or removing a routing policy.
 type RoutePolicyRequest struct {
-	Policy *RoutePolicy
+	DefaultExportAction RoutePolicyAction
+	Policy              *RoutePolicy
 }
 
 // GetPeerStateResponse contains state of peers configured in given instance
@@ -188,13 +227,20 @@ type GetBGPResponse struct {
 
 // ServerParameters contains information for underlying bgp implementation layer to initializing BGP process.
 type ServerParameters struct {
-	Global BGPGlobal
+	Global            BGPGlobal
+	StateNotification StateNotificationCh
 }
 
 // Family holds Address Family Indicator (AFI) and Subsequent Address Family Indicator for Multi-Protocol BGP
+//
+// +deepequal-gen=true
 type Family struct {
 	Afi  Afi
 	Safi Safi
+}
+
+func (f Family) String() string {
+	return f.Afi.String() + "-" + f.Safi.String()
 }
 
 // Route represents a single route in the RIB of underlying router

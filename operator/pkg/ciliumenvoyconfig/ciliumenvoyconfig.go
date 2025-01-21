@@ -4,7 +4,8 @@
 package ciliumenvoyconfig
 
 import (
-	"github.com/sirupsen/logrus"
+	"log/slog"
+
 	corev1 "k8s.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -15,15 +16,18 @@ import (
 // ciliumEnvoyConfigReconciler syncs secrets to dedicated namespace.
 type ciliumEnvoyConfigReconciler struct {
 	client client.Client
-	logger logrus.FieldLogger
+	logger *slog.Logger
 
 	algorithm          string
 	ports              []string
 	maxRetries         int
 	idleTimeoutSeconds int
+	enableIpv4         bool
+	enableIpv6         bool
 }
 
-func newCiliumEnvoyConfigReconciler(c client.Client, logger logrus.FieldLogger, defaultAlgorithm string, ports []string, maxRetries int, idleTimeoutSeconds int) *ciliumEnvoyConfigReconciler {
+func newCiliumEnvoyConfigReconciler(c client.Client, logger *slog.Logger, defaultAlgorithm string, ports []string,
+	maxRetries int, idleTimeoutSeconds int, enableIpv4 bool, enableIpv6 bool) *ciliumEnvoyConfigReconciler {
 	return &ciliumEnvoyConfigReconciler{
 		client: c,
 		logger: logger,
@@ -32,6 +36,8 @@ func newCiliumEnvoyConfigReconciler(c client.Client, logger logrus.FieldLogger, 
 		ports:              ports,
 		maxRetries:         maxRetries,
 		idleTimeoutSeconds: idleTimeoutSeconds,
+		enableIpv4:         enableIpv4,
+		enableIpv6:         enableIpv6,
 	}
 }
 

@@ -12,7 +12,6 @@
 #define ENABLE_HOST_ROUTING
 #define ENABLE_IPV4
 #define ENABLE_IPV6
-#define SKIP_ICMPV6_NS_HANDLING
 
 #define TEST_IP_LOCAL		v4_pod_one
 #define TEST_IP_REMOTE		v4_pod_two
@@ -110,8 +109,8 @@ int ipv4_l3_to_l2_fast_redirect_setup(struct __ctx_buff *ctx)
 	void *data_end = (void *)(long)ctx->data_end;
 	__u64 flags = BPF_F_ADJ_ROOM_FIXED_GSO;
 
-	endpoint_v4_add_entry(TEST_IP_LOCAL, 0, TEST_LXC_ID_LOCAL, 0,
-			      (__u8 *)ep_mac, (__u8 *)node_mac);
+	endpoint_v4_add_entry(TEST_IP_LOCAL, 0, TEST_LXC_ID_LOCAL, 0, 0,
+			      0, (__u8 *)ep_mac, (__u8 *)node_mac);
 
 	/* As commented in PKTGEN, now we strip the L2 header. Bpf helper
 	 * skb_adjust_room will use L2 header to overwrite L3 header, so we play
@@ -123,7 +122,7 @@ int ipv4_l3_to_l2_fast_redirect_setup(struct __ctx_buff *ctx)
 
 	skb_adjust_room(ctx, -__ETH_HLEN, BPF_ADJ_ROOM_MAC, flags);
 
-	tail_call_static(ctx, &entry_call_map, 0);
+	tail_call_static(ctx, entry_call_map, 0);
 	return TEST_ERROR;
 }
 
@@ -175,6 +174,9 @@ int ipv4_l3_to_l2_fast_redirect_check(__maybe_unused const struct __ctx_buff *ct
 	if (l3->daddr != TEST_IP_LOCAL)
 		test_fatal("dest IP was changed");
 
+	if (l3->check != bpf_htons(0xfa68))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
+
 	l4 = (void *)l3 + sizeof(struct iphdr);
 
 	if ((void *)l4 + sizeof(struct tcphdr) > data_end)
@@ -185,6 +187,9 @@ int ipv4_l3_to_l2_fast_redirect_check(__maybe_unused const struct __ctx_buff *ct
 
 	if (l4->dest != tcp_svc_one)
 		test_fatal("dst TCP port was changed");
+
+	if (l4->check != bpf_htons(0x589c))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
 
 	payload = (void *)l4 + sizeof(struct tcphdr);
 	if ((void *)payload + sizeof(default_data) > data_end)
@@ -200,7 +205,7 @@ PKTGEN("tc", "ipv6_l3_to_l2_fast_redirect")
 int ipv6_l3_to_l2_fast_redirect_pktgen(struct __ctx_buff *ctx)
 {
 	struct pktgen builder;
-	struct tcphdr *l4;
+	struct udphdr *l4;
 	void *data;
 
 	/* Init packet builder */
@@ -213,7 +218,7 @@ int ipv6_l3_to_l2_fast_redirect_pktgen(struct __ctx_buff *ctx)
 	 * Therefore we workaround the issue by pushing L2 header in the PKTGEN
 	 * and stripping it in the SETUP.
 	 */
-	l4 = pktgen__push_ipv6_tcp_packet(&builder,
+	l4 = pktgen__push_ipv6_udp_packet(&builder,
 					  (__u8 *)node_mac, (__u8 *)ep_mac,
 					  (__u8 *)TEST_IPV6_REMOTE,
 					  (__u8 *)TEST_IPV6_LOCAL,
@@ -238,7 +243,7 @@ int ipv6_l3_to_l2_fast_redirect_setup(struct __ctx_buff *ctx)
 	void *data_end = (void *)(long)ctx->data_end;
 	__u64 flags = BPF_F_ADJ_ROOM_FIXED_GSO;
 
-	endpoint_v6_add_entry((union v6addr *)TEST_IPV6_LOCAL, 0, TEST_LXC_ID_LOCAL, 0,
+	endpoint_v6_add_entry((union v6addr *)TEST_IPV6_LOCAL, 0, TEST_LXC_ID_LOCAL, 0, 0,
 			      (__u8 *)ep_mac, (__u8 *)node_mac);
 
 	/* As commented in PKTGEN, now we strip the L2 header. Bpf helper
@@ -251,7 +256,7 @@ int ipv6_l3_to_l2_fast_redirect_setup(struct __ctx_buff *ctx)
 
 	skb_adjust_room(ctx, -__ETH_HLEN, BPF_ADJ_ROOM_MAC, flags);
 
-	tail_call_static(ctx, &entry_call_map, 0);
+	tail_call_static(ctx, entry_call_map, 0);
 	return TEST_ERROR;
 }
 
@@ -263,7 +268,7 @@ int ipv6_l3_to_l2_fast_redirect_check(__maybe_unused const struct __ctx_buff *ct
 	__u32 *status_code;
 	struct ethhdr *l2;
 	struct ipv6hdr *l3;
-	struct tcphdr *l4;
+	struct udphdr *l4;
 	__u8 *payload;
 
 	test_init();
@@ -305,21 +310,24 @@ int ipv6_l3_to_l2_fast_redirect_check(__maybe_unused const struct __ctx_buff *ct
 
 	l4 = (void *)l3 + sizeof(struct ipv6hdr);
 
-	if ((void *)l4 + sizeof(struct tcphdr) > data_end)
+	if ((void *)l4 + sizeof(struct udphdr) > data_end)
 		test_fatal("l4 out of bounds");
 
 	if (l4->source != tcp_src_one)
-		test_fatal("src TCP port was changed");
+		test_fatal("l4 src port was changed");
 
 	if (l4->dest != tcp_svc_one)
-		test_fatal("dst TCP port was changed");
+		test_fatal("l4 dst port was changed");
 
-	payload = (void *)l4 + sizeof(struct tcphdr);
+	if (l4->check != bpf_htons(0x71ad))
+		test_fatal("l4 checksum is invalid: %x", bpf_htons(l4->check));
+
+	payload = (void *)l4 + sizeof(struct udphdr);
 	if ((void *)payload + sizeof(default_data) > data_end)
 		test_fatal("paylaod out of bounds\n");
 
 	if (memcmp(payload, default_data, sizeof(default_data)) != 0)
-		test_fatal("tcp payload was changed");
+		test_fatal("l4 payload was changed");
 
 	test_finish();
 }

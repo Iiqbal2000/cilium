@@ -15,10 +15,12 @@ type ``LoadBalancer``. This functionality is usually left up to a cloud provider
 however, when deploying in a private cloud environment, these facilities are not
 always available.
 
-LB IPAM works in conjunction with features like the :ref:`bgp_control_plane`. Where
+LB IPAM works in conjunction with features such as :ref:`bgp_control_plane` and :ref:`l2_announcements`. Where
 LB IPAM is responsible for allocation and assigning of IPs to Service objects and
 other features are responsible for load balancing and/or advertisement of these
 IPs. 
+
+Use :ref:`bgp_control_plane` to advertise the IP addresses assigned by LB IPAM over BGP and :ref:`l2_announcements` to advertise them locally.
 
 LB IPAM is always enabled but dormant. The controller is awoken when the first
 IP Pool is added to the cluster.
@@ -62,25 +64,26 @@ An IP pool can have multiple blocks of IPs. A block can be specified with CIDR
 notation (<prefix>/<bits>) or a range notation with a start and stop IP. As
 pictured in :ref:`lb_ipam_pools`.
 
-CIDRs are often used to specify routable IP ranges. By convention, the first
-and the last IP of a CIDR are reserved. The first IP is the 
+When CIDRs are used to specify routable IP ranges, you might not want to allocate
+the first and the last IP of a CIDR. Typically the first IP is the 
 "network address" and the last IP is the "broadcast address". In some networks
 these IPs are not usable and they do not always play well with all network 
-equipment. LB-IPAM will not assign these by default. Exceptions are /32 and 
-/31 IPv4 CIDRs and /128 and /127 IPv6 CIDRs since these only have 1 or 2 IPs 
-respectively.
+equipment. By default, LB-IPAM uses all IPs in a given CIDR.
 
-If you wish to use the first and last IPs of CIDRs, you can set the 
-``.spec.allowFirstLastIPs`` field to ``yes``.
+If you wish to reserve the first and last IPs of CIDRs, you can set the 
+``.spec.allowFirstLastIPs`` field to ``No``.
 
-Since Ranges are typically used to indicate subsections of routable IP ranges,
-no IPs are reserved.
+This option is ignored for /32 and /31 IPv4 CIDRs and /128 and /127 IPv6 CIDRs 
+since these only have 1 or 2 IPs respectively.
+
+This setting only applies to blocks specified with ``.spec.blocks[].cidr`` and not to
+blocks specified with ``.spec.blocks[].start`` and ``.spec.blocks[].stop``.
 
 .. warning::
 
-  In v1.15, ``.spec.allowFirstLastIPs`` defaults to ``no``. This will change to
-  ``yes`` in v1.16. Please set this field explicitly if you rely on the field
-  being set to ``no``.
+  In v1.15, ``.spec.allowFirstLastIPs`` defaults to ``No``. This has changed to
+  ``Yes`` in v1.16. Please set this field explicitly if you rely on the field
+  being set to ``No``.
 
 Service Selectors
 -----------------
@@ -386,10 +389,33 @@ for allocation (if the feature is enabled):
 loadBalancerClass               Feature
 ------------------------------- ------------------------
 ``io.cilium/bgp-control-plane`` :ref:`bgp_control_plane`
+------------------------------- ------------------------
+``io.cilium/l2-announcer``      :ref:`l2_announcements`
 =============================== ========================
 
 If the ``.spec.loadBalancerClass`` is set to a class which isn't handled by Cilium's LB IPAM, 
 then Cilium's LB IPAM will ignore the service entirely, not even setting a condition in the status. 
+
+By default, if the ``.spec.loadBalancerClass`` field is not set, Cilium's LB IPAM will assume it can 
+allocate IPs for the service from its configured pools. If this isn't the desired behavior, you can 
+configure LB-IPAM to only allocate IPs for services from its configured pools when it has a recognized 
+load balancer class by setting the following configuration in the Helm chart or ConfigMap:
+
+.. tabs::
+    .. group-tab:: Helm
+
+        .. parsed-literal::
+
+            $ helm upgrade cilium |CHART_RELEASE| \\
+               --namespace kube-system \\
+               --reuse-values \\
+               --set defaultLBServiceIPAM=none
+
+    .. group-tab:: ConfigMap
+
+        .. code-block:: yaml
+
+            default-lb-service-ipam: none
 
 Requesting IPs
 --------------
@@ -398,7 +424,7 @@ Services can request specific IPs. The legacy way of doing so is via ``.spec.loa
 which takes a single IP address. This method has been deprecated in k8s v1.24 but is supported
 until its future removal.
 
-The new way of requesting specific IPs is to use annotations, ``io.cilium/lb-ipam-ips`` in the case
+The new way of requesting specific IPs is to use annotations, ``lbipam.cilium.io/ips`` in the case
 of Cilium LB IPAM. This annotation takes a comma-separated list of IP addresses, allowing for
 multiple IPs to be requested at once.
 
@@ -418,7 +444,7 @@ for the network and broadcast addresses respectively.
       labels:
         color: blue
       annotations:
-        "io.cilium/lb-ipam-ips": "20.0.10.100,20.0.10.200"
+        "lbipam.cilium.io/ips": "20.0.10.100,20.0.10.200"
     spec:
       type: LoadBalancer
       ports:
@@ -433,7 +459,7 @@ for the network and broadcast addresses respectively.
 Sharing Keys
 ------------
 
-Services can share the same IP or set of IPs with other services. This is done by setting the ``io.cilium/lb-ipam-sharing-key`` annotation on the service.
+Services can share the same IP or set of IPs with other services. This is done by setting the ``lbipam.cilium.io/sharing-key`` annotation on the service.
 Services that have the same sharing key annotation will share the same IP or set of IPs. The sharing key is a string that can be any value.
 
 .. code-block:: yaml
@@ -446,7 +472,7 @@ Services that have the same sharing key annotation will share the same IP or set
     labels:
       color: blue
     annotations:
-      "io.cilium/lb-ipam-sharing-key": "1234"
+      "lbipam.cilium.io/sharing-key": "1234"
   spec:
     type: LoadBalancer
     ports:
@@ -460,7 +486,7 @@ Services that have the same sharing key annotation will share the same IP or set
     labels:
       color: red
     annotations:
-      "io.cilium/lb-ipam-sharing-key": "1234"
+      "lbipam.cilium.io/sharing-key": "1234"
   spec:
     type: LoadBalancer
     ports:
@@ -468,10 +494,12 @@ Services that have the same sharing key annotation will share the same IP or set
 
 .. code-block:: shell-session
 
-  $ kubeclt -n example get svc
+  $ kubectl -n example get svc
   NAME           TYPE           CLUSTER-IP     EXTERNAL-IP               PORT(S)          AGE
   service-blue   LoadBalancer   10.96.26.105   20.0.10.100               1234:30363/TCP   43s
   service-red    LoadBalancer   10.96.26.106   20.0.10.100               2345:30131/TCP   43s
 
 As long as the services do not have conflicting ports, they will be allocated the same IP. If the services have conflicting ports, they will be allocated different IPs, which will be added to the set of IPs belonging to the sharing key.
 If a service has a sharing key and also requests a specific IP, the service will be allocated the requested IP and it will be added to the set of IPs belonging to that sharing key.
+
+By default, sharing IPs across namespaces is not allowed. To allow sharing across a namespace, set the ``lbipam.cilium.io/sharing-cross-namespace`` annotation to the namespaces the service can be shared with. The value must be a comma-separated list of namespaces. The annotation must be present on both services. You can allow all namespaces with ``*``.

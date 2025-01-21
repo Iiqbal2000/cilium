@@ -7,13 +7,13 @@ import (
 	"context"
 	"sync"
 
+	"github.com/cilium/stream"
 	"github.com/sirupsen/logrus"
 
 	"github.com/cilium/cilium/pkg/controller"
 	"github.com/cilium/cilium/pkg/idpool"
-	"github.com/cilium/cilium/pkg/kvstore"
 	"github.com/cilium/cilium/pkg/lock"
-	"github.com/cilium/cilium/pkg/stream"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/time"
 )
 
@@ -32,7 +32,8 @@ type cache struct {
 
 	allocator *Allocator
 
-	stopChan chan struct{}
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	// mutex protects all cache data structures
 	mutex lock.RWMutex
@@ -69,11 +70,13 @@ type cache struct {
 }
 
 func newCache(a *Allocator) (c cache) {
+	ctx, cancel := context.WithCancel(context.Background())
 	c = cache{
 		allocator:   a,
 		cache:       idMap{},
 		keyCache:    keyMap{},
-		stopChan:    make(chan struct{}),
+		ctx:         ctx,
+		cancel:      cancel,
 		controllers: controller.NewManager(),
 	}
 	c.changeSrc, c.emitChange, c.completeChangeSrc = stream.Multicast[AllocatorChange]()
@@ -88,12 +91,10 @@ type CacheMutations interface {
 	// OnListDone is called when the initial full-sync is complete.
 	OnListDone()
 
-	// OnAdd is called when a new key->ID appears.
-	OnAdd(id idpool.ID, key AllocatorKey)
-
-	// OnModify is called when a key->ID mapping is modified. This may happen
-	// when leases are updated, and does not mean the actual mapping had changed.
-	OnModify(id idpool.ID, key AllocatorKey)
+	// OnUpsert is called when either a new key->ID mapping appears or an existing
+	// one is modified. The latter case may occur e.g., when leases are updated,
+	// and does not mean that the actual mapping had changed.
+	OnUpsert(id idpool.ID, key AllocatorKey)
 
 	// OnDelete is called when a key->ID mapping is removed. This may trigger
 	// master-key protection, if enabled, where the local allocator will recreate
@@ -102,7 +103,7 @@ type CacheMutations interface {
 	OnDelete(id idpool.ID, key AllocatorKey)
 }
 
-func (c *cache) sendEvent(typ kvstore.EventType, id idpool.ID, key AllocatorKey) {
+func (c *cache) sendEvent(typ AllocatorChangeKind, id idpool.ID, key AllocatorKey) {
 	if events := c.allocator.events; events != nil {
 		events <- AllocatorEvent{Typ: typ, ID: id, Key: key}
 	}
@@ -123,40 +124,47 @@ func (c *cache) OnListDone() {
 	close(c.listDone)
 }
 
-func (c *cache) OnAdd(id idpool.ID, key AllocatorKey) {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-
-	c.nextCache[id] = key
-	if key != nil {
-		c.nextKeyCache[c.allocator.encodeKey(key)] = id
+func (c *cache) OnUpsert(id idpool.ID, key AllocatorKey) {
+	for _, validator := range c.allocator.cacheValidators {
+		if err := validator(AllocatorChangeUpsert, id, key); err != nil {
+			log.WithError(err).WithFields(logrus.Fields{
+				logfields.Identity: id,
+				logfields.Event:    AllocatorChangeUpsert,
+			}).Warning("Skipping event for invalid identity")
+			return
+		}
 	}
-	c.allocator.idPool.Remove(id)
 
-	c.emitChange(AllocatorChange{Kind: AllocatorChangeUpsert, ID: id, Key: key})
-
-	c.sendEvent(kvstore.EventTypeCreate, id, key)
-}
-
-func (c *cache) OnModify(id idpool.ID, key AllocatorKey) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
 	if k, ok := c.nextCache[id]; ok {
-		delete(c.nextKeyCache, c.allocator.encodeKey(k))
+		delete(c.nextKeyCache, k.GetKey())
 	}
 
 	c.nextCache[id] = key
 	if key != nil {
-		c.nextKeyCache[c.allocator.encodeKey(key)] = id
+		c.nextKeyCache[key.GetKey()] = id
 	}
+
+	c.allocator.idPool.Remove(id)
 
 	c.emitChange(AllocatorChange{Kind: AllocatorChangeUpsert, ID: id, Key: key})
 
-	c.sendEvent(kvstore.EventTypeModify, id, key)
+	c.sendEvent(AllocatorChangeUpsert, id, key)
 }
 
 func (c *cache) OnDelete(id idpool.ID, key AllocatorKey) {
+	for _, validator := range c.allocator.cacheValidators {
+		if err := validator(AllocatorChangeDelete, id, key); err != nil {
+			log.WithError(err).WithFields(logrus.Fields{
+				logfields.Identity: id,
+				logfields.Event:    AllocatorChangeDelete,
+			}).Warning("Skipping event for invalid identity")
+			return
+		}
+	}
+
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
@@ -214,7 +222,7 @@ func (c *cache) onDeleteLocked(id idpool.ID, key AllocatorKey, recreateMissingLo
 	}
 
 	if k, ok := c.nextCache[id]; ok && k != nil {
-		delete(c.nextKeyCache, c.allocator.encodeKey(k))
+		delete(c.nextKeyCache, k.GetKey())
 	}
 
 	delete(c.nextCache, id)
@@ -222,7 +230,7 @@ func (c *cache) onDeleteLocked(id idpool.ID, key AllocatorKey, recreateMissingLo
 
 	c.emitChange(AllocatorChange{Kind: AllocatorChangeDelete, ID: id, Key: key})
 
-	c.sendEvent(kvstore.EventTypeDelete, id, key)
+	c.sendEvent(AllocatorChangeDelete, id, key)
 }
 
 // start requests a LIST operation from the kvstore and starts watching the
@@ -240,7 +248,7 @@ func (c *cache) start() waitChan {
 	c.stopWatchWg.Add(1)
 
 	go func() {
-		c.allocator.backend.ListAndWatch(context.TODO(), c, c.stopChan)
+		c.allocator.backend.ListAndWatch(c.ctx, c)
 		c.stopWatchWg.Done()
 	}()
 
@@ -248,7 +256,7 @@ func (c *cache) start() waitChan {
 }
 
 func (c *cache) stop() {
-	close(c.stopChan)
+	c.cancel()
 	c.stopWatchWg.Wait()
 	// Drain/stop any remaining sync identity controllers.
 	// Backend watch is now stopped, any running controllers attempting to
@@ -322,7 +330,7 @@ func (c *cache) foreach(cb RangeFunc) {
 func (c *cache) insert(key AllocatorKey, val idpool.ID) {
 	c.mutex.Lock()
 	c.nextCache[val] = key
-	c.nextKeyCache[c.allocator.encodeKey(key)] = val
+	c.nextKeyCache[key.GetKey()] = val
 	c.mutex.Unlock()
 }
 

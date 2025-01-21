@@ -79,6 +79,14 @@ type Endpoint struct {
 	// conditions contains information about the current status of the endpoint.
 	Conditions EndpointConditions `json:"conditions,omitempty" protobuf:"bytes,2,opt,name=conditions"`
 
+	// hostname of this endpoint. This field may be used by consumers of
+	// endpoints to distinguish endpoints from each other (e.g. in DNS names).
+	// Multiple endpoints which use the same hostname should be considered
+	// fungible (e.g. multiple A values in DNS). Must be lowercase and pass DNS
+	// Label (RFC 1123) validation.
+	// +optional
+	Hostname *string `json:"hostname,omitempty" protobuf:"bytes,3,opt,name=hostname"`
+
 	// topology contains arbitrary topology information associated with the
 	// endpoint. These key/value pairs must conform with the label format.
 	// https://kubernetes.io/docs/concepts/overview/working-with-objects/labels
@@ -142,7 +150,7 @@ type ForZone struct {
 // EndpointPort represents a Port used by an EndpointSlice
 type EndpointPort struct {
 	// name represents the name of this port. All ports in an EndpointSlice must have a unique name.
-	// If the EndpointSlice is dervied from a Kubernetes service, this corresponds to the Service.ports[].name.
+	// If the EndpointSlice is derived from a Kubernetes service, this corresponds to the Service.ports[].name.
 	// Name must either be an empty string or pass DNS_LABEL validation:
 	// * must be no more than 63 characters long.
 	// * must consist of lower case alphanumeric characters or '-'.

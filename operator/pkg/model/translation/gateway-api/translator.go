@@ -4,50 +4,68 @@
 package gateway_api
 
 import (
-	"crypto/sha256"
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"github.com/cilium/cilium/operator/pkg/model"
 	"github.com/cilium/cilium/operator/pkg/model/translation"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
+	"github.com/cilium/cilium/pkg/shortener"
 )
 
-var _ translation.Translator = (*translator)(nil)
+var _ translation.Translator = (*gatewayAPITranslator)(nil)
 
 const (
 	ciliumGatewayPrefix = "cilium-gateway-"
-	owningGatewayLabel  = "io.cilium.gateway/owning-gateway"
+	// Deprecated: owningGatewayLabel will be removed later in favour of gatewayNameLabel
+	owningGatewayLabel = "io.cilium.gateway/owning-gateway"
+	gatewayNameLabel   = "gateway.networking.k8s.io/gateway-name"
 )
 
-type translator struct {
-	secretsNamespace string
+type gatewayAPITranslator struct {
+	cecTranslator translation.CECTranslator
 
-	idleTimeoutSeconds int
+	hostNetworkEnabled    bool
+	externalTrafficPolicy string
 }
 
-// NewTranslator returns a new translator for Gateway API.
-func NewTranslator(secretsNamespace string, idleTimeoutSeconds int) translation.Translator {
-	return &translator{
-		secretsNamespace:   secretsNamespace,
-		idleTimeoutSeconds: idleTimeoutSeconds,
+func NewTranslator(cecTranslator translation.CECTranslator, hostNetworkEnabled bool, externalTrafficPolicy string) translation.Translator {
+	return &gatewayAPITranslator{
+		cecTranslator:         cecTranslator,
+		hostNetworkEnabled:    hostNetworkEnabled,
+		externalTrafficPolicy: externalTrafficPolicy,
 	}
 }
 
-func (t *translator) Translate(m *model.Model) (*ciliumv2.CiliumEnvoyConfig, *corev1.Service, *corev1.Endpoints, error) {
+func (t *gatewayAPITranslator) Translate(m *model.Model) (*ciliumv2.CiliumEnvoyConfig, *corev1.Service, *corev1.Endpoints, error) {
 	listeners := m.GetListeners()
 	if len(listeners) == 0 || len(listeners[0].GetSources()) == 0 {
 		return nil, nil, nil, fmt.Errorf("model source can't be empty")
 	}
 
+	// source is the main object that is the source of the model.Model
 	var source *model.FullyQualifiedResource
+	// owner is the object that will be the owner of the created CEC
+	// for Gateways, source == owner == the created LB service
+	// for Services (that is, GAMMA), source is the parent Service, and owner
+	// is the HTTPRoute.
+	var owner *model.FullyQualifiedResource
+
 	var ports []uint32
 	for _, l := range listeners {
-		source = &l.GetSources()[0]
+		sources := l.GetSources()
+		source = &sources[0]
+		owner = source
+		// If there's more than one source in the listener, then this model is a GAMMA one,
+		// and includes a HTTPRoute source as the second one.
+		if len(sources) > 1 {
+			owner = &sources[1]
+		}
 
 		ports = append(ports, l.GetPort())
 	}
@@ -56,34 +74,44 @@ func (t *translator) Translate(m *model.Model) (*ciliumv2.CiliumEnvoyConfig, *co
 		return nil, nil, nil, fmt.Errorf("model source name can't be empty")
 	}
 
-	trans := translation.NewTranslator(ciliumGatewayPrefix+source.Name, source.Namespace, t.secretsNamespace, false, false, true, t.idleTimeoutSeconds)
-	cec, _, _, err := trans.Translate(m)
+	// generatedName is the name of the generated objects.
+	// for Gateways, this is "cilium-gateway-<servicename>"
+	// for GAMMA, this is just "<servicename>"
+	generatedName := ciliumGatewayPrefix + source.Name
+
+	// TODO: remove this hack
+	if source.Kind == "Service" {
+		generatedName = source.Name
+	}
+	cec, err := t.cecTranslator.Translate(source.Namespace, generatedName, m)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
-	// Set the owner reference to the CEC object.
-	cec.OwnerReferences = []metav1.OwnerReference{
-		{
-			APIVersion: gatewayv1beta1.GroupVersion.String(),
-			Kind:       source.Kind,
-			Name:       source.Name,
-			UID:        types.UID(source.UID),
-			Controller: model.AddressOf(true),
-		},
-	}
-
-	allLabels, allAnnotations := map[string]string{}, map[string]string{}
+	var allLabels, allAnnotations map[string]string
 	// Merge all the labels and annotations from the listeners.
 	// Normally, the labels and annotations are the same for all the listeners having same gateway.
 	for _, l := range listeners {
 		allAnnotations = mergeMap(allAnnotations, l.GetAnnotations())
 		allLabels = mergeMap(allLabels, l.GetLabels())
 	}
-	return cec, getService(source, ports, allLabels, allAnnotations), getEndpoints(*source), err
+
+	if err = decorateCEC(cec, owner, allLabels, allAnnotations); err != nil {
+		return nil, nil, nil, err
+	}
+
+	ep := getEndpoints(*source, allLabels, allAnnotations)
+	lbSvc := getService(source, ports, allLabels, allAnnotations, t.externalTrafficPolicy)
+
+	if t.hostNetworkEnabled {
+		lbSvc.Spec.Type = corev1.ServiceTypeClusterIP
+		lbSvc.Spec.ExternalTrafficPolicy = corev1.ServiceExternalTrafficPolicy("")
+	}
+
+	return cec, lbSvc, ep, err
 }
 
-func getService(resource *model.FullyQualifiedResource, allPorts []uint32, labels, annotations map[string]string) *corev1.Service {
+func getService(resource *model.FullyQualifiedResource, allPorts []uint32, labels, annotations map[string]string, externalTrafficPolicy string) *corev1.Service {
 	uniquePorts := map[uint32]struct{}{}
 	for _, p := range allPorts {
 		uniquePorts[p] = struct{}{}
@@ -98,11 +126,16 @@ func getService(resource *model.FullyQualifiedResource, allPorts []uint32, label
 		})
 	}
 
+	shortenName := shortener.ShortenK8sResourceName(resource.Name)
+
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        shorten(ciliumGatewayPrefix + resource.Name),
-			Namespace:   resource.Namespace,
-			Labels:      mergeMap(map[string]string{owningGatewayLabel: resource.Name}, labels),
+			Name:      shortener.ShortenK8sResourceName(ciliumGatewayPrefix + resource.Name),
+			Namespace: resource.Namespace,
+			Labels: mergeMap(map[string]string{
+				owningGatewayLabel: shortenName,
+				gatewayNameLabel:   shortenName,
+			}, labels),
 			Annotations: annotations,
 			OwnerReferences: []metav1.OwnerReference{
 				{
@@ -110,30 +143,37 @@ func getService(resource *model.FullyQualifiedResource, allPorts []uint32, label
 					Kind:       resource.Kind,
 					Name:       resource.Name,
 					UID:        types.UID(resource.UID),
-					Controller: model.AddressOf(true),
+					Controller: ptr.To(true),
 				},
 			},
 		},
 		Spec: corev1.ServiceSpec{
-			Type:  corev1.ServiceTypeLoadBalancer,
-			Ports: ports,
+			Type:                  corev1.ServiceTypeLoadBalancer,
+			ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicy(externalTrafficPolicy),
+			Ports:                 ports,
 		},
 	}
 }
 
-func getEndpoints(resource model.FullyQualifiedResource) *corev1.Endpoints {
+func getEndpoints(resource model.FullyQualifiedResource, labels, annotations map[string]string) *corev1.Endpoints {
+	shortedName := shortener.ShortenK8sResourceName(resource.Name)
+
 	return &corev1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      shorten(ciliumGatewayPrefix + resource.Name),
+			Name:      shortener.ShortenK8sResourceName(ciliumGatewayPrefix + resource.Name),
 			Namespace: resource.Namespace,
-			Labels:    map[string]string{owningGatewayLabel: resource.Name},
+			Labels: mergeMap(map[string]string{
+				owningGatewayLabel: shortedName,
+				gatewayNameLabel:   shortedName,
+			}, labels),
+			Annotations: annotations,
 			OwnerReferences: []metav1.OwnerReference{
 				{
 					APIVersion: gatewayv1beta1.GroupVersion.String(),
 					Kind:       resource.Kind,
 					Name:       resource.Name,
 					UID:        types.UID(resource.UID),
-					Controller: model.AddressOf(true),
+					Controller: ptr.To(true),
 				},
 			},
 		},
@@ -149,39 +189,30 @@ func getEndpoints(resource model.FullyQualifiedResource) *corev1.Endpoints {
 	}
 }
 
-// shorten shortens the string to 63 characters.
-// this is the implicit required for all the resource naming in k8s.
-func shorten(s string) string {
-	if len(s) > 63 {
-		return s[:52] + "-" + encodeHash(hash(s))
+func decorateCEC(cec *ciliumv2.CiliumEnvoyConfig, resource *model.FullyQualifiedResource, labels, annotations map[string]string) error {
+	if cec == nil || resource == nil {
+		return fmt.Errorf("CEC or resource can't be nil")
 	}
-	return s
-}
 
-// encodeHash encodes the first 10 characters of the hex string.
-// https://github.com/kubernetes/kubernetes/blob/f0dcf0614036d8c3cd1c9f3b3cf8df4bb1d8e44e/staging/src/k8s.io/kubectl/pkg/util/hash/hash.go#L105
-func encodeHash(hex string) string {
-	enc := []rune(hex[:10])
-	for i := range enc {
-		switch enc[i] {
-		case '0':
-			enc[i] = 'g'
-		case '1':
-			enc[i] = 'h'
-		case '3':
-			enc[i] = 'k'
-		case 'a':
-			enc[i] = 'm'
-		case 'e':
-			enc[i] = 't'
-		}
+	// Set the owner reference to the CEC object.
+	cec.OwnerReferences = []metav1.OwnerReference{
+		{
+			APIVersion: resource.Group + "/" + resource.Version,
+			Kind:       resource.Kind,
+			Name:       resource.Name,
+			UID:        types.UID(resource.UID),
+			Controller: ptr.To(true),
+		},
 	}
-	return string(enc)
-}
 
-// hash hashes `data` with sha256 and returns the hex string
-func hash(data string) string {
-	return fmt.Sprintf("%x", sha256.Sum256([]byte(data)))
+	if cec.Labels == nil {
+		cec.Labels = make(map[string]string)
+	}
+	cec.Labels = mergeMap(cec.Labels, labels)
+	cec.Labels[gatewayNameLabel] = shortener.ShortenK8sResourceName(resource.Name)
+	cec.Annotations = mergeMap(cec.Annotations, annotations)
+
+	return nil
 }
 
 func mergeMap(left, right map[string]string) map[string]string {

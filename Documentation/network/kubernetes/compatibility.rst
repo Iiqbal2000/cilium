@@ -17,12 +17,12 @@ All Kubernetes versions listed are e2e tested and guaranteed to be compatible
 with Cilium. Older and newer Kubernetes versions, while not listed, will depend
 on the forward / backward compatibility offered by Kubernetes.
 
-+------------------+---------------------------+----------------------------------+
-| k8s Version      | k8s NetworkPolicy API     | CiliumNetworkPolicy              |
-+------------------+---------------------------+----------------------------------+
-|                  |                           | ``cilium.io/v2`` has a           |
-| 1.26, 1.27, 1.28 | * `networking.k8s.io/v1`_ | :term:`CustomResourceDefinition` |
-+------------------+---------------------------+----------------------------------+
++------------------------+---------------------------+----------------------------------+
+| k8s Version            | k8s NetworkPolicy API     | CiliumNetworkPolicy              |
++------------------------+---------------------------+----------------------------------+
+|                        |                           | ``cilium.io/v2`` has a           |
+| 1.29, 1.30, 1.31, 1.32 | * `networking.k8s.io/v1`_ | :term:`CustomResourceDefinition` |
++------------------------+---------------------------+----------------------------------+
 
 As a general rule, Cilium aims to run e2e tests using the latest build from the
 development branch against currently supported Kubernetes versions defined in
@@ -38,7 +38,7 @@ Kubernetes offerings using multiple Kubernetes versions. See the following links
 for the current test matrix for each cloud provider:
 
 - :git-tree:`AKS <.github/actions/azure/k8s-versions.yaml>`
-- :git-tree:`EKS <.github/actions/aws/k8s-versions.yaml>`
+- :git-tree:`EKS <.github/actions/eks/k8s-versions.yaml>`
 - :git-tree:`GKE <.github/actions/gke/k8s-versions.yaml>`
 
 Cilium CRD schema validation

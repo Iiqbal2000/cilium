@@ -71,7 +71,10 @@ New pools can be added at run-time. The list of CIDRs in each pool can also be
 extended at run-time. In-use CIDRs may not be removed from an existing pool, and
 existing pools may not be deleted if they are still in use by a Cilium node.
 The mask size of a pool is immutable and the same for all nodes. Neither restriction
-is enforced until :gh-issue:`26966` is resolved.
+is enforced until :gh-issue:`26966` is resolved. The first and last address of a
+``CiliumPodIPPool`` are reserved and cannot be allocated. Pools with less than 3
+addresses (/31, /32, /127, /128) do not have this limitation.
+
 
 Configuration
 *************
@@ -135,6 +138,14 @@ scheduled on the node, but not yet received an IP), and ``preAllocIPs`` is the
 minimum number of IPs that we want to pre-allocate as a buffer, i.e. the value
 taken from the ``ipam-multi-pool-pre-allocation`` map.
 
+Routing to Allocated PodCIDRs
+-----------------------------
+
+PodCIDRs allocated from ``CiliumPodIPPools`` can be announced to the network by the
+:ref:`bgp_control_plane` (:ref:`bgp_control_plane_multipool_ipam`). Alternatively,
+the ``autoDirectNodeRoutes`` Helm option can be used to enable automatic routing
+between nodes on a L2 network.
+
  .. _ipam_crd_multi_pool_limitations:
 
 Limitations
@@ -145,7 +156,7 @@ Multi-Pool IPAM mode:
 
 .. warning::
    - Tunnel mode is not supported. Multi-Pool IPAM may only be used in direct routing mode.
-   - Transparent encryption is only supported with WireGuard and cannot be used with IPSec.
+   - Transparent encryption is only supported with WireGuard and cannot be used with IPsec.
    - IPAM pools with overlapping CIDRs are not supported. Each pod IP must be
      unique in the cluster due the way Cilium determines the security identity
      of endpoints by way of the IPCache.
@@ -158,5 +169,3 @@ Multi-Pool IPAM mode:
      you may want to use ``ip-masq-agent``, which allows multiple disjunct non-masquerading
      CIDRs to be defined. See :ref:`concepts_masquerading` for details on how to use the
      ``ip-masq-agent`` feature.
-   - Announcing PodCIDRs by way of the built-in :ref:`bgp` mode is not yet
-     supported.  Use ``auto-direct-node-routes`` instead.

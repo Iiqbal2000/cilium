@@ -7,13 +7,12 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/cilium/cilium/pkg/bgpv1/gobgp"
-
 	gobgpapi "github.com/osrg/gobgp/v3/api"
 	"github.com/osrg/gobgp/v3/pkg/apiutil"
-	"github.com/osrg/gobgp/v3/pkg/packet/bgp"
 	gobgpb "github.com/osrg/gobgp/v3/pkg/packet/bgp"
 	"github.com/osrg/gobgp/v3/pkg/server"
+
+	"github.com/cilium/cilium/pkg/bgpv1/gobgp"
 )
 
 // goBGP configuration used in tests
@@ -151,7 +150,7 @@ type routeEvent struct {
 	prefix              string
 	prefixLen           uint8
 	isWithdrawn         bool
-	extraPathAttributes []bgp.PathAttributeInterface // non-standard path attributes (other than Origin / ASPath / NextHop / MpReachNLRI)
+	extraPathAttributes []gobgpb.PathAttributeInterface // non-standard path attributes (other than Origin / ASPath / NextHop / MpReachNLRI)
 }
 
 // peerEvent contains information about peer state change of gobgp
@@ -325,7 +324,7 @@ func (g *goBGP) waitForSessionState(ctx context.Context, expectedStates []string
 				}
 			}
 		case <-ctx.Done():
-			return fmt.Errorf("did not receive expected peering state %q, %v", expectedStates, ctx.Err())
+			return fmt.Errorf("did not receive expected peering state %q: %w", expectedStates, ctx.Err())
 		}
 	}
 }
@@ -340,7 +339,7 @@ func (g *goBGP) getRouteEvents(ctx context.Context, numExpectedEvents int) ([]ro
 			log.Infof("GoBGP test instance: Route Event: %v", r)
 			receivedEvents = append(receivedEvents, r)
 		case <-ctx.Done():
-			return receivedEvents, fmt.Errorf("time elapsed waiting for all route events - received %d, expected %d : %v",
+			return receivedEvents, fmt.Errorf("time elapsed waiting for all route events - received %d, expected %d : %w",
 				len(receivedEvents), numExpectedEvents, ctx.Err())
 		}
 	}
@@ -350,17 +349,17 @@ func (g *goBGP) getRouteEvents(ctx context.Context, numExpectedEvents int) ([]ro
 
 // filterStandardPathAttributes filters standard path attributes (usually present on all routes) from the
 // provided list of the path attributes.
-func (g *goBGP) filterStandardPathAttributes(attrs []bgp.PathAttributeInterface) []bgp.PathAttributeInterface {
-	var res []bgp.PathAttributeInterface
+func (g *goBGP) filterStandardPathAttributes(attrs []gobgpb.PathAttributeInterface) []gobgpb.PathAttributeInterface {
+	var res []gobgpb.PathAttributeInterface
 	for _, a := range attrs {
 		switch a.(type) {
-		case *bgp.PathAttributeOrigin:
+		case *gobgpb.PathAttributeOrigin:
 			continue
-		case *bgp.PathAttributeAsPath:
+		case *gobgpb.PathAttributeAsPath:
 			continue
-		case *bgp.PathAttributeNextHop:
+		case *gobgpb.PathAttributeNextHop:
 			continue
-		case *bgp.PathAttributeMpReachNLRI:
+		case *gobgpb.PathAttributeMpReachNLRI:
 			continue
 		}
 		res = append(res, a)

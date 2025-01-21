@@ -9,13 +9,14 @@ import (
 	"testing"
 
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 
 	"github.com/cilium/cilium/pkg/bgpv1/manager/instance"
 	"github.com/cilium/cilium/pkg/bgpv1/types"
 	ipamtypes "github.com/cilium/cilium/pkg/ipam/types"
 	v2api "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	v2alpha1api "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
+	"github.com/cilium/cilium/pkg/option"
 )
 
 func TestExportPodCIDRReconciler(t *testing.T) {
@@ -79,6 +80,9 @@ func TestExportPodCIDRReconciler(t *testing.T) {
 		},
 	}
 
+	// Dummy daemon config and logger
+	daemonConfig := &option.DaemonConfig{IPAM: "Kubernetes"}
+
 	for _, tt := range table {
 		t.Run(tt.name, func(t *testing.T) {
 			// setup our test server, create a BgpServer, advertise the tt.advertised
@@ -92,7 +96,7 @@ func TestExportPodCIDRReconciler(t *testing.T) {
 			}
 			oldc := &v2alpha1api.CiliumBGPVirtualRouter{
 				LocalASN:      64125,
-				ExportPodCIDR: pointer.Bool(tt.enabled),
+				ExportPodCIDR: ptr.To[bool](tt.enabled),
 				Neighbors:     []v2alpha1api.CiliumBGPNeighbor{},
 			}
 			testSC, err := instance.NewServerWithConfig(context.Background(), log, srvParams)
@@ -100,7 +104,7 @@ func TestExportPodCIDRReconciler(t *testing.T) {
 				t.Fatalf("failed to create test bgp server: %v", err)
 			}
 			testSC.Config = oldc
-			reconciler := NewExportPodCIDRReconciler().Reconciler.(*ExportPodCIDRReconciler)
+			reconciler := NewExportPodCIDRReconciler(daemonConfig).Reconciler.(*ExportPodCIDRReconciler)
 			podCIDRAnnouncements := reconciler.getMetadata(testSC)
 			for _, cidr := range tt.advertised {
 				advrtResp, err := testSC.Server.AdvertisePath(context.Background(), types.PathRequest{
@@ -115,11 +119,11 @@ func TestExportPodCIDRReconciler(t *testing.T) {
 
 			newc := &v2alpha1api.CiliumBGPVirtualRouter{
 				LocalASN:      64125,
-				ExportPodCIDR: pointer.Bool(tt.shouldEnable),
+				ExportPodCIDR: ptr.To[bool](tt.shouldEnable),
 				Neighbors:     []v2alpha1api.CiliumBGPNeighbor{},
 			}
 
-			exportPodCIDRReconciler := NewExportPodCIDRReconciler().Reconciler
+			exportPodCIDRReconciler := NewExportPodCIDRReconciler(daemonConfig).Reconciler
 			params := ReconcileParams{
 				CurrentServer: testSC,
 				DesiredConfig: newc,
@@ -135,10 +139,15 @@ func TestExportPodCIDRReconciler(t *testing.T) {
 				},
 			}
 
-			// run the reconciler
-			err = exportPodCIDRReconciler.Reconcile(context.Background(), params)
-			if err != nil {
-				t.Fatalf("failed to reconcile new pod cidr advertisements: %v", err)
+			// Run the reconciler twice to ensure idempotency. This
+			// simulates the retrying behavior of the controller.
+			for i := 0; i < 2; i++ {
+				t.Run(tt.name, func(t *testing.T) {
+					err = exportPodCIDRReconciler.Reconcile(context.Background(), params)
+					if err != nil {
+						t.Fatalf("failed to reconcile new pod cidr advertisements: %v", err)
+					}
+				})
 			}
 			podCIDRAnnouncements = reconciler.getMetadata(testSC)
 
@@ -152,7 +161,7 @@ func TestExportPodCIDRReconciler(t *testing.T) {
 
 			log.Printf("%+v %+v", podCIDRAnnouncements, tt.updated)
 
-			// ensure we see tt.updated in testSC.PodCIDRAnnoucements
+			// ensure we see tt.updated in testSC.PodCIDRAnnouncements
 			for _, cidr := range tt.updated {
 				prefix := netip.MustParsePrefix(cidr)
 				var seen bool

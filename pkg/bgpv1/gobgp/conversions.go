@@ -33,9 +33,14 @@ func ToGoBGPPath(p *types.Path) (*gobgp.Path, error) {
 	// It is calculated by subtraction of the AgeNanoseconds from the current timestamp.
 	ageTimestamp := timestamppb.New(time.Now().Add(time.Duration(-1 * p.AgeNanoseconds)))
 
-	family := &gobgp.Family{
-		Afi:  gobgp.Family_Afi(p.NLRI.AFI()),
-		Safi: gobgp.Family_Safi(p.NLRI.SAFI()),
+	family := toGoBGPFamily(p.Family)
+
+	// infer family from NLRI if not provided
+	if family.Afi == gobgp.Family_AFI_UNKNOWN {
+		family = &gobgp.Family{
+			Afi:  gobgp.Family_Afi(p.NLRI.AFI()),
+			Safi: gobgp.Family_Safi(p.NLRI.SAFI()),
+		}
 	}
 
 	return &gobgp.Path{
@@ -68,6 +73,7 @@ func ToAgentPath(p *gobgp.Path) (*types.Path, error) {
 
 	return &types.Path{
 		NLRI:           nlri,
+		Family:         toAgentFamily(p.Family),
 		PathAttributes: pattrs,
 		AgeNanoseconds: ageNano,
 		Best:           p.Best,
@@ -94,6 +100,71 @@ func ToAgentPaths(paths []*gobgp.Path) ([]*types.Path, error) {
 	}
 
 	return ps, nil
+}
+
+func toGoBGPFamily(family types.Family) *gobgp.Family {
+	return &gobgp.Family{
+		Afi:  toGoBGPAfi(family.Afi),
+		Safi: toGoBGPSafi(family.Safi),
+	}
+}
+
+func toGoBGPAfi(a types.Afi) gobgp.Family_Afi {
+	switch a {
+	case types.AfiUnknown:
+		return gobgp.Family_AFI_UNKNOWN
+	case types.AfiIPv4:
+		return gobgp.Family_AFI_IP
+	case types.AfiIPv6:
+		return gobgp.Family_AFI_IP6
+	case types.AfiL2VPN:
+		return gobgp.Family_AFI_L2VPN
+	case types.AfiLS:
+		return gobgp.Family_AFI_LS
+	case types.AfiOpaque:
+		return gobgp.Family_AFI_OPAQUE
+	default:
+		return gobgp.Family_AFI_UNKNOWN
+	}
+}
+
+func toGoBGPSafi(s types.Safi) gobgp.Family_Safi {
+	switch s {
+	case types.SafiUnknown:
+		return gobgp.Family_SAFI_UNKNOWN
+	case types.SafiUnicast:
+		return gobgp.Family_SAFI_UNICAST
+	case types.SafiMulticast:
+		return gobgp.Family_SAFI_MULTICAST
+	case types.SafiMplsLabel:
+		return gobgp.Family_SAFI_MPLS_LABEL
+	case types.SafiEncapsulation:
+		return gobgp.Family_SAFI_ENCAPSULATION
+	case types.SafiVpls:
+		return gobgp.Family_SAFI_VPLS
+	case types.SafiEvpn:
+		return gobgp.Family_SAFI_EVPN
+	case types.SafiLs:
+		return gobgp.Family_SAFI_LS
+	case types.SafiSrPolicy:
+		return gobgp.Family_SAFI_SR_POLICY
+	case types.SafiMup:
+		return gobgp.Family_SAFI_MUP
+	case types.SafiMplsVpn:
+		return gobgp.Family_SAFI_MPLS_VPN
+	case types.SafiMplsVpnMulticast:
+		return gobgp.Family_SAFI_MPLS_VPN_MULTICAST
+	case types.SafiRouteTargetConstraints:
+		return gobgp.Family_SAFI_ROUTE_TARGET_CONSTRAINTS
+	case types.SafiFlowSpecUnicast:
+		return gobgp.Family_SAFI_FLOW_SPEC_UNICAST
+	case types.SafiFlowSpecVpn:
+		return gobgp.Family_SAFI_FLOW_SPEC_VPN
+	case types.SafiKeyValue:
+		return gobgp.Family_SAFI_KEY_VALUE
+	default:
+		return gobgp.Family_SAFI_UNKNOWN
+	}
 }
 
 func toGoBGPPolicy(apiPolicy *types.RoutePolicy) (*gobgp.Policy, []*gobgp.DefinedSet) {
@@ -168,6 +239,13 @@ func toGoBGPPolicyStatement(apiStatement *types.RoutePolicyStatement, name strin
 		definedSets = append(definedSets, ds)
 	}
 
+	// match address families
+	if len(apiStatement.Conditions.MatchFamilies) > 0 {
+		for _, family := range apiStatement.Conditions.MatchFamilies {
+			s.Conditions.AfiSafiIn = append(s.Conditions.AfiSafiIn, toGoBGPFamily(family))
+		}
+	}
+
 	// community actions
 	if len(apiStatement.Actions.AddCommunities) > 0 {
 		s.Actions.Community = &gobgp.CommunityAction{
@@ -212,6 +290,9 @@ func toAgentPolicyStatement(s *gobgp.Statement, definedSets map[string]*gobgp.De
 				}
 			}
 		}
+		for _, family := range s.Conditions.AfiSafiIn {
+			stmt.Conditions.MatchFamilies = append(stmt.Conditions.MatchFamilies, toAgentFamily(family))
+		}
 	}
 	if s.Actions != nil {
 		stmt.Actions.RouteAction = toAgentRouteAction(s.Actions.RouteAction)
@@ -234,11 +315,11 @@ func policyStatementName(policyName string, cnt int) string {
 }
 
 func policyNeighborDefinedSetName(policyStatementName string) string {
-	return fmt.Sprintf(policyStatementName + "-neighbor")
+	return policyStatementName + "-neighbor"
 }
 
 func policyPrefixDefinedSetName(policyStatementName string) string {
-	return fmt.Sprintf(policyStatementName + "-prefix")
+	return policyStatementName + "-prefix"
 }
 
 func toGoBGPRouteAction(a types.RoutePolicyAction) gobgp.RouteAction {
@@ -286,4 +367,105 @@ func toGoBGPSoftResetDirection(direction types.SoftResetDirection) gobgp.ResetPe
 		return gobgp.ResetPeerRequest_OUT
 	}
 	return gobgp.ResetPeerRequest_BOTH
+}
+
+// toAgentSessionState translates gobgp session state to cilium bgp session state.
+func toAgentSessionState(s gobgp.PeerState_SessionState) types.SessionState {
+	switch s {
+	case gobgp.PeerState_UNKNOWN:
+		return types.SessionUnknown
+	case gobgp.PeerState_IDLE:
+		return types.SessionIdle
+	case gobgp.PeerState_CONNECT:
+		return types.SessionConnect
+	case gobgp.PeerState_ACTIVE:
+		return types.SessionActive
+	case gobgp.PeerState_OPENSENT:
+		return types.SessionOpenSent
+	case gobgp.PeerState_OPENCONFIRM:
+		return types.SessionOpenConfirm
+	case gobgp.PeerState_ESTABLISHED:
+		return types.SessionEstablished
+	default:
+		return types.SessionUnknown
+	}
+}
+
+func toAgentFamily(family *gobgp.Family) types.Family {
+	return types.Family{
+		Afi:  toAgentAfi(family.Afi),
+		Safi: toAgentSafi(family.Safi),
+	}
+}
+
+// toAgentAfi translates gobgp AFI to cilium bgp AFI.
+func toAgentAfi(a gobgp.Family_Afi) types.Afi {
+	switch a {
+	case gobgp.Family_AFI_UNKNOWN:
+		return types.AfiUnknown
+	case gobgp.Family_AFI_IP:
+		return types.AfiIPv4
+	case gobgp.Family_AFI_IP6:
+		return types.AfiIPv6
+	case gobgp.Family_AFI_L2VPN:
+		return types.AfiL2VPN
+	case gobgp.Family_AFI_LS:
+		return types.AfiLS
+	case gobgp.Family_AFI_OPAQUE:
+		return types.AfiOpaque
+	default:
+		return types.AfiUnknown
+	}
+}
+
+func toAgentSafi(s gobgp.Family_Safi) types.Safi {
+	switch s {
+	case gobgp.Family_SAFI_UNKNOWN:
+		return types.SafiUnknown
+	case gobgp.Family_SAFI_UNICAST:
+		return types.SafiUnicast
+	case gobgp.Family_SAFI_MULTICAST:
+		return types.SafiMulticast
+	case gobgp.Family_SAFI_MPLS_LABEL:
+		return types.SafiMplsLabel
+	case gobgp.Family_SAFI_ENCAPSULATION:
+		return types.SafiEncapsulation
+	case gobgp.Family_SAFI_VPLS:
+		return types.SafiVpls
+	case gobgp.Family_SAFI_EVPN:
+		return types.SafiEvpn
+	case gobgp.Family_SAFI_LS:
+		return types.SafiLs
+	case gobgp.Family_SAFI_SR_POLICY:
+		return types.SafiSrPolicy
+	case gobgp.Family_SAFI_MUP:
+		return types.SafiMup
+	case gobgp.Family_SAFI_MPLS_VPN:
+		return types.SafiMplsVpn
+	case gobgp.Family_SAFI_MPLS_VPN_MULTICAST:
+		return types.SafiMplsVpnMulticast
+	case gobgp.Family_SAFI_ROUTE_TARGET_CONSTRAINTS:
+		return types.SafiRouteTargetConstraints
+	case gobgp.Family_SAFI_FLOW_SPEC_UNICAST:
+		return types.SafiFlowSpecUnicast
+	case gobgp.Family_SAFI_FLOW_SPEC_VPN:
+		return types.SafiFlowSpecVpn
+	case gobgp.Family_SAFI_KEY_VALUE:
+		return types.SafiKeyValue
+	default:
+		return types.SafiUnknown
+	}
+}
+
+func toGoBGPTableType(t types.TableType) (gobgp.TableType, error) {
+	switch t {
+	case types.TableTypeLocRIB:
+		return gobgp.TableType_LOCAL, nil
+	case types.TableTypeAdjRIBIn:
+		return gobgp.TableType_ADJ_IN, nil
+	case types.TableTypeAdjRIBOut:
+		return gobgp.TableType_ADJ_OUT, nil
+	default:
+		return gobgp.TableType_LOCAL, fmt.Errorf("unknown table type %d", t)
+	}
 }

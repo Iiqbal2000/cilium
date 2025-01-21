@@ -6,23 +6,19 @@
 /* Enable debug output */
 #define DEBUG
 
-/* Set NODE_MAC equal to mac_two */
-#define NODE_MAC { .addr = {0x13, 0x37, 0x13, 0x37, 0x13, 0x37} }
+/* Set THIS_INTERFACE_MAC equal to mac_two */
+#define THIS_INTERFACE_MAC { .addr = {0x13, 0x37, 0x13, 0x37, 0x13, 0x37} }
 
 #define SECCTX_FROM_IPCACHE 1
 
 /* Set the LXC source address to be the address of pod one */
 #define LXC_IPV4 (__be32)v4_pod_one
-#include "config_replacement.h"
 
 /* Enable CT debug output */
 #undef QUIET_CT
 
 #include <bpf/ctx/skb.h>
 #include "pktgen.h"
-
-/* Set ETH_HLEN to 14 to indicate that the packet has a 14 byte ethernet header */
-#define ETH_HLEN 14
 
 /* Enable code paths under test */
 #define ENABLE_IPV4
@@ -101,7 +97,7 @@ SETUP("tc", "0_no_entry")
 int l2_announcement_arp_no_entry_setup(struct __ctx_buff *ctx)
 {
 	/* Jump into the entrypoint */
-	tail_call_static(ctx, &entry_call_map, 0);
+	tail_call_static(ctx, entry_call_map, 0);
 	/* Fail if we didn't jump */
 	return TEST_ERROR;
 }
@@ -137,13 +133,13 @@ int l2_announcement_arp_no_entry_check(__maybe_unused const struct __ctx_buff *c
 	if ((void *)l3 + sizeof(struct arphdreth) > data_end)
 		test_fatal("l3 out of bounds");
 
-	assert(memcmp(l2->h_source, (__u8 *)mac_one, ETH_HLEN) != 0);
-	assert(memcmp(l2->h_dest, (__u8 *)mac_bcast, ETH_HLEN) != 0);
+	assert(memcmp(l2->h_source, (__u8 *)mac_one, ETH_ALEN) == 0);
+	assert(memcmp(l2->h_dest, (__u8 *)mac_bcast, ETH_ALEN) == 0);
 	assert(l3->ar_op == bpf_htons(ARPOP_REQUEST));
 	assert(l3->ar_sip == v4_ext_one);
 	assert(l3->ar_tip == v4_svc_one);
-	assert(memcmp(l3->ar_sha, (__u8 *)mac_one, ETH_HLEN) != 0);
-	assert(memcmp(l3->ar_tha, (__u8 *)mac_bcast, ETH_HLEN) != 0);
+	assert(memcmp(l3->ar_sha, (__u8 *)mac_one, ETH_ALEN) == 0);
+	assert(memcmp(l3->ar_tha, (__u8 *)mac_bcast, ETH_ALEN) == 0);
 
 	test_finish();
 }
@@ -174,7 +170,7 @@ int l2_announcement_arp_happy_path_setup(struct __ctx_buff *ctx)
 	map_update_elem(&CONFIG_MAP, &index, &time, BPF_ANY);
 
 	/* Jump into the entrypoint */
-	tail_call_static(ctx, &entry_call_map, 0);
+	tail_call_static(ctx, entry_call_map, 0);
 	/* Fail if we didn't jump */
 	return TEST_ERROR;
 }
@@ -209,13 +205,13 @@ int l2_announcement_arp_happy_path_check(__maybe_unused const struct __ctx_buff 
 	if ((void *)l3 + sizeof(struct arphdreth) > data_end)
 		test_fatal("l3 out of bounds");
 
-	assert(memcmp(l2->h_source, (__u8 *)mac_two, ETH_HLEN) != 0);
-	assert(memcmp(l2->h_dest, (__u8 *)mac_one, ETH_HLEN) != 0);
+	assert(memcmp(l2->h_source, (__u8 *)mac_two, ETH_ALEN) == 0);
+	assert(memcmp(l2->h_dest, (__u8 *)mac_one, ETH_ALEN) == 0);
 	assert(l3->ar_op == bpf_htons(ARPOP_REPLY));
 	assert(l3->ar_sip == v4_svc_one);
 	assert(l3->ar_tip == v4_ext_one);
-	assert(memcmp(l3->ar_sha, (__u8 *)mac_two, ETH_HLEN) != 0);
-	assert(memcmp(l3->ar_tha, (__u8 *)mac_one, ETH_HLEN) != 0);
+	assert(memcmp(l3->ar_sha, (__u8 *)mac_two, ETH_ALEN) == 0);
+	assert(memcmp(l3->ar_tha, (__u8 *)mac_one, ETH_ALEN) == 0);
 
 	test_finish();
 }

@@ -8,16 +8,17 @@ import (
 	"net"
 	"strconv"
 
+	"github.com/sirupsen/logrus"
+
 	"github.com/cilium/cilium/pkg/annotation"
 	"github.com/cilium/cilium/pkg/cidr"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
+	"github.com/cilium/cilium/pkg/labelsfilter"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/node/addressing"
 	nodeTypes "github.com/cilium/cilium/pkg/node/types"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/source"
-
-	"github.com/sirupsen/logrus"
 )
 
 // ParseNodeAddressType converts a Kubernetes NodeAddressType to a Cilium
@@ -134,8 +135,14 @@ func ParseNode(k8sNode *slim_corev1.Node, source source.Source) *nodeTypes.Node 
 		}
 	}
 
-	newNode.Labels = k8sNode.GetLabels()
-	newNode.Annotations = k8sNode.GetAnnotations()
+	newNode.Labels = labelsfilter.FilterLabelsByRegex(option.Config.ExcludeNodeLabelPatterns, k8sNode.GetLabels())
+	newNode.Annotations = make(map[string]string)
+	// Propagate only Cilium specific annotations.
+	for key, value := range k8sNode.GetAnnotations() {
+		if annotation.CiliumPrefixRegex.MatchString(key) {
+			newNode.Annotations[key] = value
+		}
+	}
 
 	if !option.Config.AnnotateK8sNode {
 		return newNode

@@ -21,18 +21,12 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # renovate: datasource=github-releases depName=kubernetes-sigs/kind
-  kind_version: v0.20.0
   cluster_name: cilium-testing
-  cilium_cli_ci_version:
-  CILIUM_CLI_MODE: helm
-  # renovate: datasource=docker depName=quay.io/cilium/kindest-node
-  k8s_version: v1.28.3
 
 jobs:
   kubernetes-e2e-net-conformance:
     name: Installation and Conformance Test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -41,13 +35,19 @@ jobs:
         ipFamily: ["ipv4"]
     env:
       IP_FAMILY: ${{ matrix.ipFamily }}
+      job_name: "Installation and Conformance Test"
 
     steps:
-      - name: Checkout main branch to access local actions
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - name: Collect Workflow Telemetry
+        uses: catchpoint/workflow-telemetry-action@94c3c3d9567a0205de6da68a76c428ce4e769af1 # v2.0.0
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          comment_on_pr: false
+
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
           persist-credentials: false
+
       - name: Set Environment Variables
         uses: ./.github/actions/set-env-variables
 
@@ -60,28 +60,28 @@ jobs:
         run: |
           TMP_DIR=$(mktemp -d)
           # Test binaries
-          curl -L https://dl.k8s.io/${{ env.k8s_version }}/kubernetes-test-linux-amd64.tar.gz -o ${TMP_DIR}/kubernetes-test-linux-amd64.tar.gz
+          curl -L https://dl.k8s.io/${{ env.KIND_K8S_VERSION }}/kubernetes-test-linux-amd64.tar.gz -o ${TMP_DIR}/kubernetes-test-linux-amd64.tar.gz
           tar xvzf ${TMP_DIR}/kubernetes-test-linux-amd64.tar.gz \
             --directory ${TMP_DIR} \
             --strip-components=3 kubernetes/test/bin/ginkgo kubernetes/test/bin/e2e.test
           # kubectl
-          curl -L https://dl.k8s.io/${{ env.k8s_version }}/bin/linux/amd64/kubectl -o ${TMP_DIR}/kubectl
+          curl -L https://dl.k8s.io/${{ env.KIND_K8S_VERSION }}/bin/linux/amd64/kubectl -o ${TMP_DIR}/kubectl
           # kind
-          curl -Lo ${TMP_DIR}/kind https://kind.sigs.k8s.io/dl/${{ env.kind_version }}/kind-linux-amd64
+          curl -Lo ${TMP_DIR}/kind https://kind.sigs.k8s.io/dl/${{ env.KIND_VERSION }}/kind-linux-amd64
           # Install
           sudo cp ${TMP_DIR}/ginkgo /usr/local/bin/ginkgo
           sudo cp ${TMP_DIR}/e2e.test /usr/local/bin/e2e.test
           sudo cp ${TMP_DIR}/kubectl /usr/local/bin/kubectl
           sudo cp ${TMP_DIR}/kind /usr/local/bin/kind
-          sudo chmod +x /usr/local/bin/*
+          sudo chmod +x /usr/local/bin/ginkgo /usr/local/bin/e2e.test /usr/local/bin/kubectl /usr/local/bin/kind
           sudo rm -rf ${TMP_DIR}
 
       - name: Create multi node cluster
         run: |
           cat <<EOF | /usr/local/bin/kind create cluster \
             --name ${{ env.cluster_name}}           \
-            --image quay.io/cilium/kindest-node:${{ env.k8s_version }}  \
-            -v7 --wait 1m --retain --config=-
+            --image ${{ env.KIND_K8S_IMAGE }}  \
+            -v7 --retain --config=-
           kind: Cluster
           apiVersion: kind.x-k8s.io/v1alpha4
           networking:
@@ -126,7 +126,7 @@ jobs:
         id: default_vars
         uses: ./.github/actions/helm-default
         with:
-          image-tag: ${{ github.event.pull_request.head.sha }}
+          image-tag: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up job variables
         id: vars
@@ -136,23 +136,16 @@ jobs:
           CILIUM_INSTALL_DEFAULTS="${{ steps.default_vars.outputs.cilium_install_defaults }} \
             --helm-set=cni.chainingMode=portmap \
             --helm-set=kubeProxyReplacement=true \
-            --helm-set=sessionAffinity=true \
             --helm-set=identityChangeGracePeriod="0s""
           echo cilium_install_defaults=${CILIUM_INSTALL_DEFAULTS} >> $GITHUB_OUTPUT
           echo sha=${{ steps.default_vars.outputs.sha }} >> $GITHUB_OUTPUT
 
       - name: Install Cilium CLI
-        uses: cilium/cilium-cli@446392499db483906bcc3ade85f023912a79e5ee # v0.15.14
+        uses: cilium/cilium-cli@f313219850d324b516748ff7b00a6f9fa30d34ae # v0.16.23
         with:
-          repository: ${{ env.CILIUM_CLI_RELEASE_REPO }}
-          release-version: ${{ env.CILIUM_CLI_VERSION }}
-          ci-version: ${{ env.cilium_cli_ci_version }}
-
-      - name: Checkout code
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
-        with:
-          ref: ${{ steps.vars.outputs.sha }}
-          persist-credentials: false
+          skip-build: ${{ env.CILIUM_CLI_SKIP_BUILD }}
+          image-repo: ${{ env.CILIUM_CLI_IMAGE_REPO }}
+          image-tag: ${{ steps.vars.outputs.sha }}
 
       - name: Wait for images to be available
         timeout-minutes: 30
@@ -196,7 +189,7 @@ jobs:
           export E2E_REPORT_DIR=${PWD}/_artifacts
           /usr/local/bin/ginkgo --nodes=5                \
             --focus="(HostPort.*\[Conformance\].*|Services.*\[Conformance\].*|Net.*ol.*)"     \
-            --skip="(Legacy|HostPort.validates.that.there.is.no.conflict.between.pods.with.same.hostPort.but.different.hostIP.and.protocol|should.allow.egress.access.to.server.in.CIDR.block|should.enforce.except.clause.while.egress.access.to.server.in.CIDR.block|should.ensure.an.IP.overlapping.both.IPBlock.CIDR.and.IPBlock.Except.is.allowed|Feature:SCTPConnectivity)" \
+            --skip="(Legacy|HostPort.validates.that.there.is.no.conflict.between.pods.with.same.hostPort.but.different.hostIP.and.protocol|should.allow.egress.access.to.server.in.CIDR.block|should.enforce.except.clause.while.egress.access.to.server.in.CIDR.block|should.ensure.an.IP.overlapping.both.IPBlock.CIDR.and.IPBlock.Except.is.allowed|Feature:SCTPConnectivity|should.serve.endpoints.on.same.port.and.different.protocols)" \
             /usr/local/bin/e2e.test                       \
             --                                            \
             --kubeconfig=${PWD}/_artifacts/kubeconfig.conf     \
@@ -205,26 +198,39 @@ jobs:
             --report-dir=${E2E_REPORT_DIR}                \
             --disable-log-dump=true
 
+      - name: Features tested
+        uses: ./.github/actions/feature-status
+        with:
+          title: "Summary of all features tested"
+          json-filename: "${{ env.job_name }}"
+
       - name: Post-test information gathering
         if: ${{ !success() && steps.install-cilium.outcome != 'skipped' }}
         run: |
           kubectl get pods --all-namespaces -o wide
           cilium status
           cilium sysdump --output-filename cilium-sysdump-final
-          /usr/local/bin/kind export logs --name  ${{ env.cluster_name }} --loglevel=debug ./_artifacts/logs
+          /usr/local/bin/kind export logs --name  ${{ env.cluster_name }} --verbosity=3 ./_artifacts/logs
         shell: bash {0} # Disable default fail-fast behaviour so that all commands run independently
 
       - name: Upload artifacts
         if: ${{ !success() }}
-        uses: actions/upload-artifact@a8a3f3ad30e3422c9c7b888a15615d19a852ae32 # v3.1.3
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
         with:
           name: cilium-sysdumps
           path: cilium-sysdump-*.zip
           retention-days: 5
 
+      - name: Upload features tested
+        if: ${{ always() }}
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        with:
+          name: features-tested
+          path: ${{ env.job_name }}*.json
+
       - name: Upload cluster logs
         if: ${{ !success() }}
-        uses: actions/upload-artifact@a8a3f3ad30e3422c9c7b888a15615d19a852ae32 # v3.1.3
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
         with:
           name: kind-logs
           path: ./_artifacts/logs
@@ -232,7 +238,7 @@ jobs:
 
       - name: Upload Kubernetes e2e Junit Reports
         if: ${{ success() }}
-        uses: actions/upload-artifact@a8a3f3ad30e3422c9c7b888a15615d19a852ae32 # v3
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
         with:
           name: kubernetes-e2e-junit
           path: './_artifacts/*.xml'

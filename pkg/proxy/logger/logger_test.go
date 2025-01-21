@@ -7,15 +7,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/gob"
-	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/cilium/dns"
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/hivetest"
 
 	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	"github.com/cilium/cilium/pkg/maps/eventsmap"
 	"github.com/cilium/cilium/pkg/monitor/agent"
 	"github.com/cilium/cilium/pkg/monitor/agent/listener"
@@ -41,7 +42,7 @@ func mockLogRecord() *LogRecord {
 			accesslog.VerdictForwarded,
 			"just a benchmark",
 		),
-		LogTags.Addressing(AddressingInfo{
+		LogTags.Addressing(context.Background(), AddressingInfo{
 			DstIPPort:   "15478",
 			DstIdentity: 16,
 			SrcIPPort:   "53",
@@ -49,10 +50,10 @@ func mockLogRecord() *LogRecord {
 		}),
 		LogTags.DNS(&accesslog.LogRecordDNS{
 			Query: "data.test.svc.cluster.local",
-			IPs: []net.IP{
-				net.IPv4(1, 1, 1, 1),
-				net.IPv4(2, 2, 2, 2),
-				net.IPv4(3, 3, 3, 3),
+			IPs: []netip.Addr{
+				netip.MustParseAddr("1.1.1.1"),
+				netip.MustParseAddr("2.2.2.2"),
+				netip.MustParseAddr("3.3.3.3"),
 			},
 			TTL: 43200,
 			CNAMEs: []string{
@@ -226,16 +227,16 @@ func benchWithListeners(listener *MockMonitorListener, b *testing.B) {
 }
 
 func BenchmarkLogNotifierWithNoListeners(b *testing.B) {
-	bench := cell.Invoke(func(lc hive.Lifecycle, monitor agent.Agent) error {
+	bench := cell.Invoke(func(lc cell.Lifecycle, monitor agent.Agent) error {
 		notifier := NewMockLogNotifier(monitor)
 		SetNotifier(notifier)
 
-		lc.Append(hive.Hook{
-			OnStart: func(ctx hive.HookContext) error {
+		lc.Append(cell.Hook{
+			OnStart: func(ctx cell.HookContext) error {
 				benchWithoutListeners(b)
 				return nil
 			},
-			OnStop: func(ctx hive.HookContext) error { return nil },
+			OnStop: func(ctx cell.HookContext) error { return nil },
 		})
 
 		return nil
@@ -247,27 +248,28 @@ func BenchmarkLogNotifierWithNoListeners(b *testing.B) {
 		bench,
 	)
 
-	if err := h.Start(context.TODO()); err != nil {
+	tlog := hivetest.Logger(b)
+	if err := h.Start(tlog, context.TODO()); err != nil {
 		b.Fatalf("failed to start hive: %v", err)
 	}
-	if err := h.Stop(context.TODO()); err != nil {
+	if err := h.Stop(tlog, context.TODO()); err != nil {
 		b.Fatalf("failed to stop hive: %v", err)
 	}
 }
 
 func BenchmarkLogNotifierWithListeners(b *testing.B) {
-	bench := cell.Invoke(func(lc hive.Lifecycle, monitor agent.Agent, cfg agent.AgentConfig, em eventsmap.Map) error {
+	bench := cell.Invoke(func(lc cell.Lifecycle, monitor agent.Agent, cfg agent.AgentConfig, em eventsmap.Map) error {
 		listener := NewMockMonitorListener(cfg.MonitorQueueSize)
 		notifier := NewMockLogNotifier(monitor)
 		notifier.RegisterNewListener(listener)
 		SetNotifier(notifier)
 
-		lc.Append(hive.Hook{
-			OnStart: func(ctx hive.HookContext) error {
+		lc.Append(cell.Hook{
+			OnStart: func(ctx cell.HookContext) error {
 				benchWithListeners(listener, b)
 				return nil
 			},
-			OnStop: func(ctx hive.HookContext) error { return nil },
+			OnStop: func(ctx cell.HookContext) error { return nil },
 		})
 
 		return nil
@@ -279,10 +281,11 @@ func BenchmarkLogNotifierWithListeners(b *testing.B) {
 		bench,
 	)
 
-	if err := h.Start(context.TODO()); err != nil {
+	tlog := hivetest.Logger(b)
+	if err := h.Start(tlog, context.TODO()); err != nil {
 		b.Fatalf("failed to start hive: %v", err)
 	}
-	if err := h.Stop(context.TODO()); err != nil {
+	if err := h.Stop(tlog, context.TODO()); err != nil {
 		b.Fatalf("failed to stop hive: %v", err)
 	}
 }

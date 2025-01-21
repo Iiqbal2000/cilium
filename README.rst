@@ -28,6 +28,21 @@ and flexible. To learn more about eBPF, visit `eBPF.io`_.
 .. image:: Documentation/images/cilium-overview.png
    :alt: Overview of Cilium features for networking, observability, service mesh, and runtime security
 
+.. raw:: html
+
+   <a href="https://cncf.io/">
+      <picture>
+         <source media="(prefers-color-scheme: light)" srcset="https://github.com/cncf/artwork/blob/main/other/cncf-member/graduated/color/cncf-graduated-color.svg" />
+         <img src="https://github.com/cncf/artwork/blob/main/other/cncf-member/graduated/white/cncf-graduated-white.svg" alt="CNCF Graduated Project" height="80" />
+      </picture>
+   </a>
+   <a href="https://ebpf.io/">
+      <picture>
+         <source media="(prefers-color-scheme: light)" srcset=".github/assets/powered-by-ebpf.svg" />
+         <img src=".github/assets/powered-by-ebpf_white.svg" alt="Powered by eBPF" height="80" align="right" />
+      </picture>
+   </a>
+
 Stable Releases
 ===============
 
@@ -41,11 +56,11 @@ Listed below are the actively maintained release branches along with their lates
 patch release, corresponding image pull tags and their release notes:
 
 +---------------------------------------------------------+------------+------------------------------------+----------------------------------------------------------------------------+
-| `v1.14 <https://github.com/cilium/cilium/tree/v1.14>`__ | 2023-11-10 | ``quay.io/cilium/cilium:v1.14.4``  | `Release Notes <https://github.com/cilium/cilium/releases/tag/v1.14.4>`__  |
+| `v1.16 <https://github.com/cilium/cilium/tree/v1.16>`__ | 2024-12-12 | ``quay.io/cilium/cilium:v1.16.5``  | `Release Notes <https://github.com/cilium/cilium/releases/tag/v1.16.5>`__  |
 +---------------------------------------------------------+------------+------------------------------------+----------------------------------------------------------------------------+
-| `v1.13 <https://github.com/cilium/cilium/tree/v1.13>`__ | 2023-11-13 | ``quay.io/cilium/cilium:v1.13.9``  | `Release Notes <https://github.com/cilium/cilium/releases/tag/v1.13.9>`__  |
+| `v1.15 <https://github.com/cilium/cilium/tree/v1.15>`__ | 2024-12-13 | ``quay.io/cilium/cilium:v1.15.12`` | `Release Notes <https://github.com/cilium/cilium/releases/tag/v1.15.12>`__ |
 +---------------------------------------------------------+------------+------------------------------------+----------------------------------------------------------------------------+
-| `v1.12 <https://github.com/cilium/cilium/tree/v1.12>`__ | 2023-11-13 | ``quay.io/cilium/cilium:v1.12.16`` | `Release Notes <https://github.com/cilium/cilium/releases/tag/v1.12.16>`__ |
+| `v1.14 <https://github.com/cilium/cilium/tree/v1.14>`__ | 2024-12-12 | ``quay.io/cilium/cilium:v1.14.18`` | `Release Notes <https://github.com/cilium/cilium/releases/tag/v1.14.18>`__ |
 +---------------------------------------------------------+------------+------------------------------------+----------------------------------------------------------------------------+
 
 Architectures
@@ -77,11 +92,11 @@ development build of the `Cilium Upgrade Guide`_.
 Listed below are branches for testing along with their snapshots or RC releases,
 corresponding image pull tags and their release notes where applicable:
 
-+--------------------------------------------------------------------------------------+------------+----------------------------------------------+-------------------------------------------------------------------------------------------+
-| `main <https://github.com/cilium/cilium/commits/main>`__                             | daily      | ``quay.io/cilium/cilium-ci:latest``          | N/A                                                                                       |
-+--------------------------------------------------------------------------------------+------------+----------------------------------------------+-------------------------------------------------------------------------------------------+
-| `v1.15.0-pre.2 <https://github.com/cilium/cilium/commits/v1.15.0-pre.2>`__           | 2023-10-31 | ``quay.io/cilium/cilium:v1.15.0-pre.2``      | `Release Candidate Notes <https://github.com/cilium/cilium/releases/tag/v1.15.0-pre.2>`__ |
-+--------------------------------------------------------------------------------------+------------+----------------------------------------------+-------------------------------------------------------------------------------------------+
++----------------------------------------------------------------------------+------------+-----------------------------------------+------------------------------------------------------------------------------------------------+
+| `main <https://github.com/cilium/cilium/commits/main>`__                   | daily      | ``quay.io/cilium/cilium-ci:latest``     | N/A                                                                                            |
++----------------------------------------------------------------------------+------------+-----------------------------------------+------------------------------------------------------------------------------------------------+
+| `v1.17.0-rc.1 <https://github.com/cilium/cilium/commits/v1.17.0-rc.1>`__   | 2025-01-10 | ``quay.io/cilium/cilium:v1.17.0-rc.1``  | `Pre Release Candidate Notes <https://github.com/cilium/cilium/releases/tag/v1.17.0-rc.1>`__   |
++----------------------------------------------------------------------------+------------+-----------------------------------------+------------------------------------------------------------------------------------------------+
 
 Functionality Overview
 ======================
@@ -92,7 +107,7 @@ Protect and secure APIs transparently
 -------------------------------------
 
 Ability to secure modern application protocols such as REST/HTTP, gRPC and
-Kafka. Traditional firewalls operates at Layer 3 and 4. A protocol running on a
+Kafka. Traditional firewalls operate at Layer 3 and 4. A protocol running on a
 particular port is either completely trusted or blocked entirely. Cilium
 provides the ability to filter on individual application protocol requests such
 as:
@@ -111,7 +126,7 @@ Secure service to service communication based on identities
 
 Modern distributed applications rely on technologies such as application
 containers to facilitate agility in deployment and scale out on demand. This
-results in a large number of application containers to be started in a short
+results in a large number of application containers being started in a short
 period of time. Typical container firewalls secure workloads by filtering on
 source IP addresses and destination ports. This concept requires the firewalls
 on all servers to be manipulated whenever a container is started anywhere in
@@ -142,7 +157,7 @@ coordination between hosts.
 The following multi node networking models are supported:
 
 * **Overlay:** Encapsulation-based virtual network spanning all hosts.
-  Currently VXLAN and Geneve are baked in but all encapsulation formats
+  Currently, VXLAN and Geneve are baked in but all encapsulation formats
   supported by Linux can be enabled.
 
   When to use this mode: This mode has minimal infrastructure and integration
@@ -192,7 +207,7 @@ plugin, for example.
 Monitoring and Troubleshooting
 ------------------------------
 
-The ability to gain visibility and to troubleshoot issues is fundamental to the
+The ability to gain visibility and troubleshoot issues is fundamental to the
 operation of any distributed system. While we learned to love tools like
 ``tcpdump`` and ``ping`` and while they will always find a special place in our
 hearts, we strive to provide better tooling for troubleshooting. This includes
@@ -230,13 +245,13 @@ What is eBPF and XDP?
 
 Berkeley Packet Filter (BPF) is a Linux kernel bytecode interpreter originally
 introduced to filter network packets, e.g. for tcpdump and socket filters. The
-BPF instruction set and surrounding architecture has recently been
+BPF instruction set and surrounding architecture have recently been
 significantly reworked with additional data structures such as hash tables and
 arrays for keeping state as well as additional actions to support packet
 mangling, forwarding, encapsulation, etc. Furthermore, a compiler back end for
 LLVM allows for programs to be written in C and compiled into BPF instructions.
 An in-kernel verifier ensures that BPF programs are safe to run and a JIT
-compiler converts the BPF bytecode to CPU architecture specific instructions
+compiler converts the BPF bytecode to CPU architecture-specific instructions
 for native execution efficiency. BPF programs can be run at various hooking
 points in the kernel such as for incoming packets, outgoing packets, system
 calls, kprobes, uprobes, tracepoints, etc.
@@ -259,7 +274,7 @@ section Prerequisites_.
 .. image:: https://cdn.jsdelivr.net/gh/cilium/cilium@main/Documentation/images/bpf-overview.png
     :align: center
 
-XDP is a further step in evolution and enables to run a specific flavor of BPF
+XDP is a further step in evolution and enables running a specific flavor of BPF
 programs from the network driver with direct access to the packet's DMA buffer.
 This is, by definition, the earliest possible point in the software stack,
 where programs can be attached to in order to allow for a programmable, high
@@ -268,7 +283,7 @@ performance packet processor in the Linux kernel networking data path.
 Further information about BPF and XDP targeted for developers can be found in
 the `BPF and XDP Reference Guide`_.
 
-To know more about Cilium, it's extensions and use cases around Cilium and BPF
+To know more about Cilium, its extensions and use cases around Cilium and BPF
 take a look at `Further Readings <FURTHER_READINGS.rst>`_ section.
 
 Community
@@ -277,7 +292,7 @@ Community
 Slack
 -----
 
-Join the Cilium `Slack channel <https://cilium.herokuapp.com/>`_ to chat with
+Join the Cilium `Slack channel <https://slack.cilium.io>`_ to chat with
 Cilium developers and other Cilium users. This is a good place to learn about
 Cilium, ask questions, and share your experiences.
 
@@ -293,8 +308,8 @@ The Cilium developer community hangs out on Zoom to chat. Everybody is welcome.
 
 * Weekly, Wednesday,
   5:00 pm `Europe/Zurich time <https://time.is/Canton_of_Zurich>`__ (CET/CEST),
-  usually equivalent to 8:00 am PT, or 11:00 am ET. `Join Zoom`_
-* Third Wednesday of each month, 9:00 am `Japan time <https://time.is/Tokyo>`__ (JST). `Join Zoom`_
+  usually equivalent to 8:00 am PT, or 11:00 am ET. `Meeting Notes and Zoom Info`_
+* Third Wednesday of each month, 9:00 am `Japan time <https://time.is/Tokyo>`__ (JST). `APAC Meeting Notes and Zoom Info`_
 
 eBPF & Cilium Office Hours livestream
 -------------------------------------
@@ -303,16 +318,16 @@ We host a weekly community `YouTube livestream called eCHO <https://www.youtube.
 Governance
 ----------
 The Cilium project is governed by a group of `Maintainers and Committers <https://raw.githubusercontent.com/cilium/cilium/main/MAINTAINERS.md>`__.
-How they are selected and govern is outlined in our `governance document <https://docs.cilium.io/en/latest/community/governance/commit_access/>`__.
+How they are selected and govern is outlined in our `governance document <https://github.com/cilium/community/blob/main/GOVERNANCE.md>`__.
 
 Adopters
 --------
 A list of adopters of the Cilium project who are deploying it in production, and of their use cases,
-can be found in file `USERS.md <https://raw.githubusercontent.com/cilium/cilium/main/USERS.md>`__.
+can be found in file `USERS.md <https://github.com/cilium/cilium/blob/main/USERS.md>`__.
 
 Roadmap
 -------
-Cilium maintains a `public roadmap <https://docs.cilium.io/en/latest/community/roadmap/>`__. It gives a a high-level view of the main priorities for the project, the maturity of different features and projects, and how to influence the project direction.
+Cilium maintains a `public roadmap <https://docs.cilium.io/en/latest/community/roadmap/>`__. It gives a high-level view of the main priorities for the project, the maturity of different features and projects, and how to influence the project direction.
 
 License
 =======
@@ -339,7 +354,8 @@ and the `2-Clause BSD License <bsd-license_>`__
 .. _`BPF and XDP Reference Guide`: https://docs.cilium.io/en/stable/bpf/
 .. _`eBPF`: https://ebpf.io
 .. _`eBPF.io`: https://ebpf.io
-.. _`Join Zoom`: https://zoom.us/j/596609673
+.. _`Meeting Notes and Zoom Info`: https://docs.google.com/document/d/1Y_4chDk4rznD6UgXPlPvn3Dc7l-ZutGajUv1eF0VDwQ/edit#
+.. _`APAC Meeting Notes and Zoom Info`: https://docs.google.com/document/d/1egv4qLydr0geP-GjQexYKm4tz3_tHy-LCBjVQcXcT5M/edit#
 
 .. |go-report| image:: https://goreportcard.com/badge/github.com/cilium/cilium
     :alt: Go Report Card
@@ -367,7 +383,7 @@ and the `2-Clause BSD License <bsd-license_>`__
 
 .. |slack| image:: https://img.shields.io/badge/slack-cilium-brightgreen.svg?logo=slack
     :alt: Join the Cilium slack channel
-    :target: https://cilium.herokuapp.com/
+    :target: https://slack.cilium.io
 
 .. |cii| image:: https://bestpractices.coreinfrastructure.org/projects/1269/badge
     :alt: CII Best Practices
@@ -385,9 +401,9 @@ and the `2-Clause BSD License <bsd-license_>`__
     :alt: FOSSA Status
     :target: https://app.fossa.com/projects/custom%2B162%2Fgit%40github.com%3Acilium%2Fcilium.git?ref=badge_shield
 
-.. |gateway-api| image:: https://img.shields.io/badge/Gateway%20API%20Conformance%20v0.7.1-Cilium-green
+.. |gateway-api| image:: https://img.shields.io/badge/Gateway%20API%20Conformance%20v1.2.0-Cilium-green
     :alt: Gateway API Status
-    :target: https://github.com/kubernetes-sigs/gateway-api/blob/main/conformance/reports/v0.7.1/cilium-cilium.yaml
+    :target: https://github.com/kubernetes-sigs/gateway-api/tree/main/conformance/reports/v1.2.0/cilium-cilium
 
 .. |codespaces| image:: https://img.shields.io/badge/Open_in_GitHub_Codespaces-gray?logo=github
     :alt: Github Codespaces

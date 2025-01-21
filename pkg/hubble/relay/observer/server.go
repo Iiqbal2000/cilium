@@ -20,6 +20,7 @@ import (
 	"github.com/cilium/cilium/pkg/hubble/observer"
 	poolTypes "github.com/cilium/cilium/pkg/hubble/relay/pool/types"
 	"github.com/cilium/cilium/pkg/lock"
+	"github.com/cilium/cilium/pkg/time"
 )
 
 // numUnavailableNodesReportMax represents the maximum number of unavailable
@@ -47,7 +48,7 @@ func NewServer(peers PeerLister, options ...Option) (*Server, error) {
 	opts := defaultOptions
 	for _, opt := range options {
 		if err := opt(&opts); err != nil {
-			return nil, fmt.Errorf("failed to apply option: %v", err)
+			return nil, fmt.Errorf("failed to apply option: %w", err)
 		}
 	}
 	return &Server{
@@ -65,7 +66,6 @@ func (s *Server) GetFlows(req *observerpb.GetFlowsRequest, stream observerpb.Obs
 		ctx = metadata.NewOutgoingContext(ctx, md)
 	}
 	ctx, cancel := context.WithCancel(ctx)
-
 	defer cancel()
 
 	peers := s.peers.List()
@@ -78,35 +78,22 @@ func (s *Server) GetFlows(req *observerpb.GetFlowsRequest, stream observerpb.Obs
 
 	g, gctx := errgroup.WithContext(ctx)
 	flows := make(chan *observerpb.GetFlowsResponse, qlen)
-	var connectedNodes, unavailableNodes []string
 
-	for _, p := range peers {
-		if !isAvailable(p.Conn) {
-			s.opts.log.WithField("address", p.Address).Infof(
-				"No connection to peer %s, skipping", p.Name,
-			)
-			unavailableNodes = append(unavailableNodes, p.Name)
-			continue
-		}
-		connectedNodes = append(connectedNodes, p.Name)
-		p := p
-		g.Go(func() error {
-			// retrieveFlowsFromPeer returns blocks until the peer finishes
-			// the request by closing the connection, an error occurs,
-			// or gctx expires.
-			err := retrieveFlowsFromPeer(gctx, s.opts.ocb.observerClient(&p), req, flows)
-			if err != nil {
-				s.opts.log.WithFields(logrus.Fields{
-					"error": err,
-					"peer":  p,
-				}).Warning("Failed to retrieve flows from peer")
+	fc := newFlowCollector(req, s.opts)
+	connectedNodes, unavailableNodes := fc.collect(gctx, g, peers, flows)
+
+	if req.GetFollow() {
+		go func() {
+			for {
 				select {
-				case flows <- nodeStatusError(err, p.Name):
+				case <-time.After(s.opts.peerUpdateInterval):
+					peers := s.peers.List()
+					_, _ = fc.collect(gctx, g, peers, flows)
 				case <-gctx.Done():
+					return
 				}
 			}
-			return nil
-		})
+		}()
 	}
 	go func() {
 		g.Wait()
@@ -130,19 +117,9 @@ func (s *Server) GetFlows(req *observerpb.GetFlowsRequest, stream observerpb.Obs
 		}
 	}
 
-sortedFlowsLoop:
-	for {
-		select {
-		case flow, ok := <-sortedFlows:
-			if !ok {
-				break sortedFlowsLoop
-			}
-			if err := stream.Send(flow); err != nil {
-				return err
-			}
-		case <-ctx.Done():
-			break sortedFlowsLoop
-		}
+	err := sendFlowsResponse(ctx, stream, sortedFlows)
+	if err != nil {
+		return err
 	}
 	return g.Wait()
 }
@@ -190,7 +167,6 @@ func (s *Server) GetNodes(ctx context.Context, req *observerpb.GetNodesRequest) 
 			continue
 		}
 		n.State = relaypb.NodeState_NODE_CONNECTED
-		p := p
 		g.Go(func() error {
 			n := n
 			client := s.opts.ocb.observerClient(&p)
@@ -236,7 +212,6 @@ func (s *Server) GetNamespaces(ctx context.Context, req *observerpb.GetNamespace
 			continue
 		}
 
-		p := p
 		g.Go(func() error {
 			client := s.opts.ocb.observerClient(&p)
 			nsResp, err := client.GetNamespaces(ctx, req)
@@ -294,7 +269,7 @@ func (s *Server) ServerStatus(ctx context.Context, req *observerpb.ServerStatusR
 			mu.Unlock()
 			continue
 		}
-		p := p
+
 		g.Go(func() error {
 			client := s.opts.ocb.observerClient(&p)
 			status, err := client.ServerStatus(ctx, req)

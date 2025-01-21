@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/hivetest"
 	"go.uber.org/goleak"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -15,13 +17,12 @@ import (
 
 	"github.com/cilium/cilium/operator/k8s"
 	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	cilium_v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
-	v1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
 	slim_metav1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
+	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/testutils"
 )
 
@@ -39,7 +40,7 @@ func TestRegisterController(t *testing.T) {
 				DisableCiliumEndpointCRD: false,
 			}
 		}),
-		cell.Metric(NewMetrics),
+		metrics.Metric(NewMetrics),
 		cell.Invoke(func(c *k8sClient.FakeClientset, cep resource.Resource[*cilium_v2.CiliumEndpoint]) {
 			prepareCiliumEndpoints(*c)
 			ciliumEndpoint = cep
@@ -49,14 +50,16 @@ func TestRegisterController(t *testing.T) {
 			return nil
 		}),
 	)
-	if err := hive.Start(context.Background()); err != nil {
+
+	tlog := hivetest.Logger(t)
+	if err := hive.Start(tlog, context.Background()); err != nil {
 		t.Fatalf("failed to start: %s", err)
 	}
 	cepStore, _ := ciliumEndpoint.Store(context.Background())
 	// wait for all CEPs to be deleted except for those with running pods or
 	// cilium node owner reference
 	waitForCEPs(t, cepStore, 3)
-	if err := hive.Stop(context.Background()); err != nil {
+	if err := hive.Stop(tlog, context.Background()); err != nil {
 		t.Fatalf("failed to stop: %s", err)
 	}
 }
@@ -75,7 +78,7 @@ func TestRegisterControllerOnce(t *testing.T) {
 				DisableCiliumEndpointCRD: false,
 			}
 		}),
-		cell.Metric(NewMetrics),
+		metrics.Metric(NewMetrics),
 		cell.Invoke(prepareCiliumEndpointCRD),
 		cell.Invoke(func(c *k8sClient.FakeClientset, cep resource.Resource[*cilium_v2.CiliumEndpoint]) {
 			prepareCiliumEndpoints(*c)
@@ -86,13 +89,15 @@ func TestRegisterControllerOnce(t *testing.T) {
 			return nil
 		}),
 	)
-	if err := hive.Start(context.Background()); err != nil {
+
+	tlog := hivetest.Logger(t)
+	if err := hive.Start(tlog, context.Background()); err != nil {
 		t.Fatalf("failed to start: %s", err)
 	}
 	cepStore, _ := ciliumEndpoint.Store(context.Background())
 	// wait for all CEPs to be deleted
 	waitForCEPs(t, cepStore, 0)
-	if err := hive.Stop(context.Background()); err != nil {
+	if err := hive.Stop(tlog, context.Background()); err != nil {
 		t.Fatalf("failed to stop: %s", err)
 	}
 }
@@ -105,7 +110,7 @@ func TestRegisterControllerWithCRDDisabled(t *testing.T) {
 	hive := hive.New(
 		k8sClient.FakeClientCell,
 		k8s.ResourcesCell,
-		cell.Metric(NewMetrics),
+		metrics.Metric(NewMetrics),
 		cell.Provide(func() SharedConfig {
 			return SharedConfig{
 				Interval:                 100 * time.Millisecond,
@@ -121,7 +126,8 @@ func TestRegisterControllerWithCRDDisabled(t *testing.T) {
 			return nil
 		}),
 	)
-	if err := hive.Start(context.Background()); err != nil {
+	tlog := hivetest.Logger(t)
+	if err := hive.Start(tlog, context.Background()); err != nil {
 		t.Fatalf("failed to start: %s", err)
 	}
 	cepStore, _ := ciliumEndpoint.Store(context.Background())
@@ -129,7 +135,7 @@ func TestRegisterControllerWithCRDDisabled(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	// gc is disabled so no CEPs should be deleted
 	waitForCEPs(t, cepStore, 8)
-	if err := hive.Stop(context.Background()); err != nil {
+	if err := hive.Stop(tlog, context.Background()); err != nil {
 		t.Fatalf("failed to stop: %s", err)
 	}
 }
@@ -212,19 +218,19 @@ func createOwnerReference(kind, name string) meta_v1.OwnerReference {
 	}
 }
 
-func createPod(name, namespace string, isRunning bool) *v1.Pod {
+func createPod(name, namespace string, isRunning bool) *slim_corev1.Pod {
 	var phase slim_corev1.PodPhase
 	if isRunning {
 		phase = slim_corev1.PodRunning
 	} else {
 		phase = slim_corev1.PodSucceeded
 	}
-	return &v1.Pod{
+	return &slim_corev1.Pod{
 		ObjectMeta: slim_metav1.ObjectMeta{
 			Name:      name,
 			Namespace: namespace,
 		},
-		Status: v1.PodStatus{
+		Status: slim_corev1.PodStatus{
 			Phase: phase,
 		},
 	}

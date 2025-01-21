@@ -6,11 +6,7 @@ package cache
 import (
 	"fmt"
 
-	"github.com/cilium/cilium/pkg/allocator"
 	"github.com/cilium/cilium/pkg/identity"
-	"github.com/cilium/cilium/pkg/identity/key"
-	"github.com/cilium/cilium/pkg/idpool"
-	"github.com/cilium/cilium/pkg/kvstore"
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
@@ -24,7 +20,6 @@ type localIdentityCache struct {
 	scope               identity.NumericIdentity
 	minID               identity.NumericIdentity
 	maxID               identity.NumericIdentity
-	events              allocator.AllocatorEventSendChan
 
 	// withheldIdentities is a set of identities that should be considered unavailable for allocation,
 	// but not yet allocated.
@@ -36,7 +31,7 @@ type localIdentityCache struct {
 	withheldIdentities map[identity.NumericIdentity]struct{}
 }
 
-func newLocalIdentityCache(scope, minID, maxID identity.NumericIdentity, events allocator.AllocatorEventSendChan) *localIdentityCache {
+func newLocalIdentityCache(scope, minID, maxID identity.NumericIdentity) *localIdentityCache {
 	return &localIdentityCache{
 		identitiesByID:      map[identity.NumericIdentity]*identity.Identity{},
 		identitiesByLabels:  map[string]*identity.Identity{},
@@ -44,7 +39,6 @@ func newLocalIdentityCache(scope, minID, maxID identity.NumericIdentity, events 
 		scope:               scope,
 		minID:               minID,
 		maxID:               maxID,
-		events:              events,
 		withheldIdentities:  map[identity.NumericIdentity]struct{}{},
 	}
 }
@@ -136,14 +130,6 @@ func (l *localIdentityCache) lookupOrCreate(lbls labels.Labels, oldNID identity.
 	l.identitiesByLabels[string(repr)] = id
 	l.identitiesByID[numericIdentity] = id
 
-	if l.events != nil {
-		l.events <- allocator.AllocatorEvent{
-			Typ: kvstore.EventTypeCreate,
-			ID:  idpool.ID(id.ID),
-			Key: &key.GlobalIdentity{LabelArray: id.LabelArray},
-		}
-	}
-
 	return id, true, nil
 }
 
@@ -165,13 +151,6 @@ func (l *localIdentityCache) release(id *identity.Identity) bool {
 			// hitting the last use
 			delete(l.identitiesByLabels, string(id.Labels.SortedList()))
 			delete(l.identitiesByID, id.ID)
-
-			if l.events != nil {
-				l.events <- allocator.AllocatorEvent{
-					Typ: kvstore.EventTypeDelete,
-					ID:  idpool.ID(id.ID),
-				}
-			}
 
 			return true
 		}
@@ -256,10 +235,17 @@ func (l *localIdentityCache) GetIdentities() map[identity.NumericIdentity]*ident
 	return cache
 }
 
-// close removes the events channel.
-func (l *localIdentityCache) close() {
-	l.mutex.Lock()
-	defer l.mutex.Unlock()
+func (l *localIdentityCache) checkpoint(dst []*identity.Identity) []*identity.Identity {
+	l.mutex.RLock()
+	defer l.mutex.RUnlock()
+	for _, id := range l.identitiesByID {
+		dst = append(dst, id)
+	}
+	return dst
+}
 
-	l.events = nil
+func (l *localIdentityCache) size() int {
+	l.mutex.RLock()
+	defer l.mutex.RUnlock()
+	return len(l.identitiesByID)
 }

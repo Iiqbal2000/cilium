@@ -29,9 +29,6 @@
 /* Set the LXC source address to be the address of pod one */
 #define LXC_IPV4 BACKEND_IP
 
-/* We need this for ipcache */
-#define HAVE_LPM_TRIE_MAP_TYPE
-
 /* Overlapping PodCIDR is only supported for IPv4 for now */
 #define ENABLE_IPV4
 
@@ -45,7 +42,6 @@
 #define ENABLE_CLUSTER_AWARE_ADDRESSING
 
 /* Import some default values */
-#include "config_replacement.h"
 
 /* Import map definitions and some default values */
 #include "node_config.h"
@@ -159,12 +155,12 @@ int overlay_to_lxc_syn_setup(struct __ctx_buff *ctx)
 
 	/* Emulate metadata filled by ipv4_local_delivery on bpf_overlay */
 	ctx_store_meta(ctx, CB_SRC_LABEL, CLIENT_IDENTITY);
-	ctx_store_meta(ctx, CB_IFINDEX, 1);
+	ctx_store_meta(ctx, CB_DELIVERY_REDIRECT, 1);
 	ctx_store_meta(ctx, CB_CLUSTER_ID_INGRESS, 0);
 	ctx_store_meta(ctx, CB_FROM_HOST, 0);
 	ctx_store_meta(ctx, CB_FROM_TUNNEL, 1);
 
-	tail_call_static(ctx, &entry_call_map, HANDLE_POLICY);
+	tail_call_static(ctx, entry_call_map, HANDLE_POLICY);
 
 	return TEST_ERROR;
 }
@@ -217,11 +213,17 @@ int overlay_to_lxc_syn_check(struct __ctx_buff *ctx)
 	if (l3->daddr != BACKEND_IP)
 		test_fatal("dst IP has changed");
 
+	if (l3->check != bpf_htons(0x4111))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
+
 	if (l4->source != CLIENT_INTER_CLUSTER_SNAT_PORT)
 		test_fatal("src port has changed");
 
 	if (l4->dest != BACKEND_PORT)
 		test_fatal("dst port has changed");
+
+	if (l4->check != bpf_htons(0x1df4))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
 
 	/* Check ingress conntrack state is in the default CT */
 	tuple.daddr   = CLIENT_NODE_IP;
@@ -255,7 +257,7 @@ int lxc_to_overlay_synack_setup(struct __ctx_buff *ctx)
 {
 	ipcache_v4_add_entry(CLIENT_NODE_IP, 0, REMOTE_NODE_ID, 0, 0);
 
-	tail_call_static(ctx, &entry_call_map, FROM_CONTAINER);
+	tail_call_static(ctx, entry_call_map, FROM_CONTAINER);
 
 	return TEST_ERROR;
 }
@@ -308,11 +310,17 @@ int lxc_to_overlay_ack_check(struct __ctx_buff *ctx)
 	if (l3->daddr != CLIENT_NODE_IP)
 		test_fatal("dst IP has changed");
 
+	if (l3->check != bpf_htons(0x4111))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
+
 	if (l4->source != BACKEND_PORT)
 		test_fatal("src port has changed");
 
 	if (l4->dest != CLIENT_INTER_CLUSTER_SNAT_PORT)
 		test_fatal("dst port has changed");
+
+	if (l4->check != bpf_htons(0x1de4))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
 
 	/* Make sure we hit the conntrack entry */
 	tuple.saddr   = BACKEND_IP;
@@ -326,7 +334,7 @@ int lxc_to_overlay_ack_check(struct __ctx_buff *ctx)
 	if (!entry)
 		test_fatal("couldn't find egress conntrack entry");
 
-	if (entry->tx_packets != 1)
+	if (entry->packets != 2)
 		test_fatal("tx packet didn't hit conntrack entry");
 
 	test_finish();
@@ -343,12 +351,12 @@ int overlay_to_lxc_ack_setup(struct __ctx_buff *ctx)
 {
 	/* Emulate metadata filled by ipv4_local_delivery on bpf_overlay */
 	ctx_store_meta(ctx, CB_SRC_LABEL, CLIENT_IDENTITY);
-	ctx_store_meta(ctx, CB_IFINDEX, 1);
+	ctx_store_meta(ctx, CB_DELIVERY_REDIRECT, 1);
 	ctx_store_meta(ctx, CB_CLUSTER_ID_INGRESS, 0);
 	ctx_store_meta(ctx, CB_FROM_HOST, 0);
 	ctx_store_meta(ctx, CB_FROM_TUNNEL, 1);
 
-	tail_call_static(ctx, &entry_call_map, HANDLE_POLICY);
+	tail_call_static(ctx, entry_call_map, HANDLE_POLICY);
 
 	return TEST_ERROR;
 }
@@ -401,11 +409,17 @@ int overlay_to_lxc_ack_check(struct __ctx_buff *ctx)
 	if (l3->daddr != BACKEND_IP)
 		test_fatal("dst IP has changed");
 
+	if (l3->check != bpf_htons(0x4111))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
+
 	if (l4->source != CLIENT_INTER_CLUSTER_SNAT_PORT)
 		test_fatal("src port has changed");
 
 	if (l4->dest != BACKEND_PORT)
 		test_fatal("dst port has changed");
+
+	if (l4->check != bpf_htons(0x1de6))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
 
 	/* Make sure we hit the conntrack entry */
 	tuple.daddr   = CLIENT_NODE_IP;
@@ -419,7 +433,7 @@ int overlay_to_lxc_ack_check(struct __ctx_buff *ctx)
 	if (!entry)
 		test_fatal("couldn't find ingress conntrack entry");
 
-	if (entry->rx_packets != 2)
+	if (entry->packets != 3)
 		test_fatal("rx packet didn't hit conntrack entry");
 
 	test_finish();

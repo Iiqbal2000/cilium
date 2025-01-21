@@ -5,6 +5,7 @@ package link
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	"github.com/vishvananda/netlink"
 
 	"github.com/cilium/cilium/pkg/controller"
+	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/mac"
 	"github.com/cilium/cilium/pkg/time"
@@ -28,14 +30,20 @@ var (
 )
 
 // DeleteByName deletes the interface with the name ifName.
+//
+// Returns nil if the interface does not exist.
 func DeleteByName(ifName string) error {
-	iface, err := netlink.LinkByName(ifName)
+	iface, err := safenetlink.LinkByName(ifName)
+	if errors.As(err, &netlink.LinkNotFoundError{}) {
+		return nil
+	}
+
 	if err != nil {
-		return fmt.Errorf("failed to lookup %q: %v", ifName, err)
+		return fmt.Errorf("failed to lookup %q: %w", ifName, err)
 	}
 
 	if err = netlink.LinkDel(iface); err != nil {
-		return fmt.Errorf("failed to delete %q: %v", ifName, err)
+		return fmt.Errorf("failed to delete %q: %w", ifName, err)
 	}
 
 	return nil
@@ -43,7 +51,7 @@ func DeleteByName(ifName string) error {
 
 // Rename renames a network link
 func Rename(curName, newName string) error {
-	link, err := netlink.LinkByName(curName)
+	link, err := safenetlink.LinkByName(curName)
 	if err != nil {
 		return err
 	}
@@ -52,7 +60,7 @@ func Rename(curName, newName string) error {
 }
 
 func GetHardwareAddr(ifName string) (mac.MAC, error) {
-	iface, err := netlink.LinkByName(ifName)
+	iface, err := safenetlink.LinkByName(ifName)
 	if err != nil {
 		return nil, err
 	}
@@ -60,7 +68,7 @@ func GetHardwareAddr(ifName string) (mac.MAC, error) {
 }
 
 func GetIfIndex(ifName string) (uint32, error) {
-	iface, err := netlink.LinkByName(ifName)
+	iface, err := safenetlink.LinkByName(ifName)
 	if err != nil {
 		return 0, err
 	}
@@ -92,7 +100,7 @@ func NewLinkCache() *LinkCache {
 }
 
 func (c *LinkCache) syncCache() error {
-	links, err := netlink.LinkList()
+	links, err := safenetlink.LinkList()
 	if err != nil {
 		return err
 	}

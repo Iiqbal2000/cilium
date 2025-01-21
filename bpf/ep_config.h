@@ -1,14 +1,13 @@
 /* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
 /* Copyright Authors of Cilium */
 
+#pragma once
+
 /*
  * This is just a dummy header with dummy values to allow for test
  * compilation without the full code generation engine backend.
  */
 #include "lib/utils.h"
-
-#ifndef ___EP_CONFIG____
-#define ___EP_CONFIG____
 
 DEFINE_IPV6(LXC_IP, 0xbe, 0xef, 0, 0, 0, 0, 0, 0x1, 0, 0, 0, 0x1, 0x01, 0x65, 0x82, 0xbc);
 
@@ -23,21 +22,26 @@ DEFINE_U32(LXC_IPV4, 0x10203040);
  */
 DEFINE_U16(LXC_ID, 0x2A);
 #define LXC_ID fetch_u16(LXC_ID)
+#ifndef SECLABEL
 DEFINE_U32(SECLABEL, 0xfffff);
 #define SECLABEL fetch_u32(SECLABEL)
+#endif
 DEFINE_U32(SECLABEL_IPV4, 0xfffff);
 #define SECLABEL_IPV4 fetch_u32(SECLABEL_IPV4)
 DEFINE_U32(SECLABEL_IPV6, 0xfffff);
 #define SECLABEL_IPV6 fetch_u32(SECLABEL_IPV6)
-DEFINE_U32(SECLABEL_NB, 0xfffff);
-#define SECLABEL_NB fetch_u32(SECLABEL_NB)
 
 DEFINE_U32(POLICY_VERDICT_LOG_FILTER, 0xffff);
 #define POLICY_VERDICT_LOG_FILTER fetch_u32(POLICY_VERDICT_LOG_FILTER)
 
+#ifndef ENDPOINT_NETNS_COOKIE
+DEFINE_U64(ENDPOINT_NETNS_COOKIE, 0xFFFFFFFFFFFFFFFF);
+#define ENDPOINT_NETNS_COOKIE fetch_u64(ENDPOINT_NETNS_COOKIE)
+#endif /*ENDPOINT_NETNS_COOKIE*/
+
 #define HOST_EP_ID 0x1092
 
-#define POLICY_MAP test_cilium_policy_65535
+#define POLICY_MAP test_cilium_policy_v2_65535
 
 #ifndef SKIP_DEBUG
 #define DEBUG
@@ -54,6 +58,5 @@ DEFINE_U32(POLICY_VERDICT_LOG_FILTER, 0xffff);
 #define CUSTOM_CALLS_MAP test_cilium_calls_custom_65535
 #define LOCAL_DELIVERY_METRICS
 #define CONNTRACK_ACCOUNTING
+#define POLICY_ACCOUNTING
 #define DIRECT_ROUTING_DEV_IFINDEX 0
-
-#endif

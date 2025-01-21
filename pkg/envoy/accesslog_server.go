@@ -20,7 +20,6 @@ import (
 
 	"github.com/cilium/cilium/pkg/flowdebug"
 	"github.com/cilium/cilium/pkg/identity"
-	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/proxy/accesslog"
 	"github.com/cilium/cilium/pkg/proxy/logger"
 	"github.com/cilium/cilium/pkg/time"
@@ -28,14 +27,18 @@ import (
 
 type AccessLogServer struct {
 	socketPath         string
+	proxyGID           uint
 	localEndpointStore *LocalEndpointStore
 	stopCh             chan struct{}
+	bufferSize         uint
 }
 
-func newAccessLogServer(envoySocketDir string, localEndpointStore *LocalEndpointStore) *AccessLogServer {
+func newAccessLogServer(envoySocketDir string, proxyGID uint, localEndpointStore *LocalEndpointStore, bufferSize uint) *AccessLogServer {
 	return &AccessLogServer{
 		socketPath:         getAccessLogSocketPath(envoySocketDir),
+		proxyGID:           proxyGID,
 		localEndpointStore: localEndpointStore,
+		bufferSize:         bufferSize,
 	}
 }
 
@@ -92,14 +95,13 @@ func (s *AccessLogServer) newSocketListener() (*net.UnixListener, error) {
 	}
 	accessLogListener.SetUnlinkOnClose(true)
 
-	// Make the socket accessible by owner and group only. Group access is needed for Istio
-	// sidecar proxies.
+	// Make the socket accessible by owner and group only.
 	if err = os.Chmod(s.socketPath, 0660); err != nil {
 		return nil, fmt.Errorf("failed to change mode of access log listen socket at %s: %w", s.socketPath, err)
 	}
 	// Change the group to ProxyGID allowing access from any process from that group.
-	if err = os.Chown(s.socketPath, -1, option.Config.ProxyGID); err != nil {
-		log.WithError(err).Warningf("Envoy: Failed to change the group of access log listen socket at %s, sidecar proxies may not work", s.socketPath)
+	if err = os.Chown(s.socketPath, -1, int(s.proxyGID)); err != nil {
+		log.WithError(err).Warningf("Envoy: Failed to change the group of access log listen socket at %s", s.socketPath)
 	}
 	return accessLogListener, nil
 }
@@ -127,7 +129,7 @@ func (s *AccessLogServer) handleConn(ctx context.Context, conn *net.UnixConn) {
 		stopCh <- struct{}{}
 	}()
 
-	buf := make([]byte, 4096)
+	buf := make([]byte, s.bufferSize)
 	for {
 		n, _, flags, _, err := conn.ReadMsgUnix(buf, nil)
 		if err != nil {
@@ -137,7 +139,9 @@ func (s *AccessLogServer) handleConn(ctx context.Context, conn *net.UnixConn) {
 			break
 		}
 		if flags&unix.MSG_TRUNC != 0 {
-			log.Warning("Envoy: Discarded truncated access log message")
+			log.WithFields(logrus.Fields{
+				"access_log_buffer_size": s.bufferSize,
+			}).Warning("Envoy: Discarded truncated access log message - increase buffer size via --envoy-access-log-buffer-size")
 			continue
 		}
 		pblog := cilium.LogEntry{}
@@ -147,10 +151,11 @@ func (s *AccessLogServer) handleConn(ctx context.Context, conn *net.UnixConn) {
 			continue
 		}
 
-		flowdebug.Log(log.WithFields(logrus.Fields{}),
-			fmt.Sprintf("%s: Access log message: %s", pblog.PolicyName, pblog.String()))
+		flowdebug.Log(func() (*logrus.Entry, string) {
+			return log, fmt.Sprintf("%s: Access log message: %s", pblog.PolicyName, pblog.String())
+		})
 
-		r := logRecord(&pblog)
+		r := logRecord(ctx, &pblog)
 
 		// Update proxy stats for the endpoint if it still exists
 		localEndpoint := s.localEndpointStore.getLocalEndpoint(pblog.PolicyName)
@@ -162,12 +167,12 @@ func (s *AccessLogServer) handleConn(ctx context.Context, conn *net.UnixConn) {
 			if !request {
 				port = r.SourceEndpoint.Port
 			}
-			localEndpoint.UpdateProxyStatistics("envoy", "TCP", port, ingress, request, r.Verdict)
+			localEndpoint.UpdateProxyStatistics("envoy", "TCP", port, uint16(pblog.ProxyId), ingress, request, r.Verdict)
 		}
 	}
 }
 
-func logRecord(pblog *cilium.LogEntry) *logger.LogRecord {
+func logRecord(ctx context.Context, pblog *cilium.LogEntry) *logger.LogRecord {
 	var kafkaRecord *accesslog.LogRecordKafka
 	var kafkaTopics []string
 
@@ -224,7 +229,7 @@ func logRecord(pblog *cilium.LogEntry) *logger.LogRecord {
 	r := logger.NewLogRecord(flowType, pblog.IsIngress,
 		logger.LogTags.Timestamp(time.Unix(int64(pblog.Timestamp/1000000000), int64(pblog.Timestamp%1000000000))),
 		logger.LogTags.Verdict(GetVerdict(pblog), pblog.CiliumRuleRef),
-		logger.LogTags.Addressing(addrInfo),
+		logger.LogTags.Addressing(ctx, addrInfo),
 		l7tags,
 	)
 	r.Log()

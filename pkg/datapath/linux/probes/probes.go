@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -19,14 +20,16 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
 	"github.com/cilium/ebpf/features"
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
+	"github.com/cilium/ebpf/link"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
 	"golang.org/x/sys/unix"
 
 	"github.com/cilium/cilium/pkg/command/exec"
 	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/netns"
 )
 
 var (
@@ -92,8 +95,7 @@ type ProgramHelper struct {
 }
 
 type miscFeatures struct {
-	HaveLargeInsnLimit bool
-	HaveFibIfindex     bool
+	HaveFibIfindex bool
 }
 
 type FeatureProbes struct {
@@ -391,6 +393,13 @@ func HaveFibIfindex() error {
 	return features.HaveProgramHelper(ebpf.SchedCLS, asm.FnRedirectPeer)
 }
 
+// HaveWriteableQueueMapping checks if kernel has 74e31ca850c1 ("bpf: add
+// skb->queue_mapping write access from tc clsact") which is 5.1+. This got merged
+// in the same kernel as the bpf_skb_ecn_set_ce() helper.
+func HaveWriteableQueueMapping() error {
+	return features.HaveProgramHelper(ebpf.SchedCLS, asm.FnSkbEcnSetCe)
+}
+
 // HaveV2ISA is a wrapper around features.HaveV2ISA() to check if the kernel
 // supports the V2 ISA.
 // On unexpected probe results this function will terminate with log.Fatal().
@@ -418,6 +427,93 @@ func HaveV3ISA() error {
 	}
 	return nil
 }
+
+// HaveTCX returns nil if the running kernel supports attaching bpf programs to
+// tcx hooks.
+var HaveTCX = sync.OnceValue(func() error {
+	prog, err := ebpf.NewProgram(&ebpf.ProgramSpec{
+		Type: ebpf.SchedCLS,
+		Instructions: asm.Instructions{
+			asm.Mov.Imm(asm.R0, 0),
+			asm.Return(),
+		},
+		License: "Apache-2.0",
+	})
+	if err != nil {
+		return err
+	}
+	defer prog.Close()
+
+	ns, err := netns.New()
+	if err != nil {
+		return fmt.Errorf("create netns: %w", err)
+	}
+	defer ns.Close()
+
+	// link.AttachTCX already performs its own feature detection and returns
+	// ebpf.ErrNotSupported if the host kernel doesn't have tcx.
+	return ns.Do(func() error {
+		l, err := link.AttachTCX(link.TCXOptions{
+			Program:   prog,
+			Attach:    ebpf.AttachTCXIngress,
+			Interface: 1, // lo
+			Anchor:    link.Tail(),
+		})
+		if err != nil {
+			return fmt.Errorf("creating link: %w", err)
+		}
+		if err := l.Close(); err != nil {
+			return fmt.Errorf("closing link: %w", err)
+		}
+
+		return nil
+	})
+})
+
+// HaveNetkit returns nil if the running kernel supports attaching bpf programs
+// to netkit devices.
+var HaveNetkit = sync.OnceValue(func() error {
+	prog, err := ebpf.NewProgram(&ebpf.ProgramSpec{
+		Type: ebpf.SchedCLS,
+		Instructions: asm.Instructions{
+			asm.Mov.Imm(asm.R0, 0),
+			asm.Return(),
+		},
+		License: "Apache-2.0",
+	})
+	if err != nil {
+		return err
+	}
+	defer prog.Close()
+
+	ns, err := netns.New()
+	if err != nil {
+		return fmt.Errorf("create netns: %w", err)
+	}
+	defer ns.Close()
+
+	return ns.Do(func() error {
+		l, err := link.AttachNetkit(link.NetkitOptions{
+			Program:   prog,
+			Attach:    ebpf.AttachNetkitPrimary,
+			Interface: math.MaxInt,
+		})
+		// We rely on this being checked during the syscall. With
+		// an otherwise correct payload we expect ENODEV here as
+		// an indication that the feature is present.
+		if errors.Is(err, unix.ENODEV) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("creating link: %w", err)
+		}
+		if err := l.Close(); err != nil {
+			return fmt.Errorf("closing link: %w", err)
+		}
+
+		return fmt.Errorf("unexpected success: %w", err)
+	})
+})
 
 // HaveOuterSourceIPSupport tests whether the kernel support setting the outer
 // source IP address via the bpf_skb_set_tunnel_key BPF helper. We can't rely
@@ -550,6 +646,44 @@ func HaveSKBAdjustRoomL2RoomMACSupport() (err error) {
 	return nil
 }
 
+// HaveDeadCodeElim tests whether the kernel supports dead code elimination.
+func HaveDeadCodeElim() error {
+	spec := ebpf.ProgramSpec{
+		Name: "test",
+		Type: ebpf.XDP,
+		Instructions: asm.Instructions{
+			asm.Mov.Imm(asm.R1, 0),
+			asm.JEq.Imm(asm.R1, 1, "else"),
+			asm.Mov.Imm(asm.R0, 2),
+			asm.Ja.Label("end"),
+			asm.Mov.Imm(asm.R0, 3).WithSymbol("else"),
+			asm.Return().WithSymbol("end"),
+		},
+	}
+
+	prog, err := ebpf.NewProgram(&spec)
+	if err != nil {
+		return fmt.Errorf("loading program: %w", err)
+	}
+
+	info, err := prog.Info()
+	if err != nil {
+		return fmt.Errorf("get prog info: %w", err)
+	}
+	infoInst, err := info.Instructions()
+	if err != nil {
+		return fmt.Errorf("get instructions: %w", err)
+	}
+
+	for _, inst := range infoInst {
+		if inst.OpCode.Class().IsJump() && inst.OpCode.JumpOp() != asm.Exit {
+			return fmt.Errorf("Jump instruction found in the final program, no dead code elimination performed")
+		}
+	}
+
+	return nil
+}
+
 // HaveIPv6Support tests whether kernel can open an IPv6 socket. This will
 // also implicitly auto-load IPv6 kernel module if available and not yet
 // loaded.
@@ -611,13 +745,10 @@ func ExecuteHeaderProbes() *FeatureProbes {
 		// common probes
 		{ebpf.CGroupSock, asm.FnGetNetnsCookie},
 		{ebpf.CGroupSockAddr, asm.FnGetNetnsCookie},
-		{ebpf.CGroupSockAddr, asm.FnGetSocketCookie},
 		{ebpf.CGroupSock, asm.FnJiffies64},
 		{ebpf.CGroupSockAddr, asm.FnJiffies64},
 		{ebpf.SchedCLS, asm.FnJiffies64},
 		{ebpf.XDP, asm.FnJiffies64},
-		{ebpf.CGroupSockAddr, asm.FnSkLookupTcp},
-		{ebpf.CGroupSockAddr, asm.FnSkLookupUdp},
 		{ebpf.CGroupSockAddr, asm.FnGetCurrentCgroupId},
 		{ebpf.CGroupSock, asm.FnSetRetval},
 		{ebpf.SchedCLS, asm.FnRedirectNeigh},
@@ -625,17 +756,17 @@ func ExecuteHeaderProbes() *FeatureProbes {
 
 		// skb related probes
 		{ebpf.SchedCLS, asm.FnSkbChangeTail},
-		{ebpf.SchedCLS, asm.FnFibLookup},
 		{ebpf.SchedCLS, asm.FnCsumLevel},
 
 		// xdp related probes
-		{ebpf.XDP, asm.FnFibLookup},
+		{ebpf.XDP, asm.FnXdpGetBuffLen},
+		{ebpf.XDP, asm.FnXdpLoadBytes},
+		{ebpf.XDP, asm.FnXdpStoreBytes},
 	}
 	for _, ph := range progHelpers {
 		probes.ProgramHelpers[ph] = (HaveProgramHelper(ph.Program, ph.Helper) == nil)
 	}
 
-	probes.Misc.HaveLargeInsnLimit = (HaveLargeInstructionLimit() == nil)
 	probes.Misc.HaveFibIfindex = (HaveFibIfindex() == nil)
 
 	return &probes
@@ -646,18 +777,14 @@ func writeCommonHeader(writer io.Writer, probes *FeatureProbes) error {
 	features := map[string]bool{
 		"HAVE_NETNS_COOKIE": probes.ProgramHelpers[ProgramHelper{ebpf.CGroupSock, asm.FnGetNetnsCookie}] &&
 			probes.ProgramHelpers[ProgramHelper{ebpf.CGroupSockAddr, asm.FnGetNetnsCookie}],
-		"HAVE_SOCKET_COOKIE": probes.ProgramHelpers[ProgramHelper{ebpf.CGroupSockAddr, asm.FnGetSocketCookie}],
 		"HAVE_JIFFIES": probes.ProgramHelpers[ProgramHelper{ebpf.CGroupSock, asm.FnJiffies64}] &&
 			probes.ProgramHelpers[ProgramHelper{ebpf.CGroupSockAddr, asm.FnJiffies64}] &&
 			probes.ProgramHelpers[ProgramHelper{ebpf.SchedCLS, asm.FnJiffies64}] &&
 			probes.ProgramHelpers[ProgramHelper{ebpf.XDP, asm.FnJiffies64}],
-		"HAVE_SOCKET_LOOKUP": probes.ProgramHelpers[ProgramHelper{ebpf.CGroupSockAddr, asm.FnSkLookupTcp}] &&
-			probes.ProgramHelpers[ProgramHelper{ebpf.CGroupSockAddr, asm.FnSkLookupUdp}],
-		"HAVE_CGROUP_ID":        probes.ProgramHelpers[ProgramHelper{ebpf.CGroupSockAddr, asm.FnGetCurrentCgroupId}],
-		"HAVE_LARGE_INSN_LIMIT": probes.Misc.HaveLargeInsnLimit,
-		"HAVE_SET_RETVAL":       probes.ProgramHelpers[ProgramHelper{ebpf.CGroupSock, asm.FnSetRetval}],
-		"HAVE_FIB_NEIGH":        probes.ProgramHelpers[ProgramHelper{ebpf.SchedCLS, asm.FnRedirectNeigh}],
-		"HAVE_FIB_IFINDEX":      probes.Misc.HaveFibIfindex,
+		"HAVE_CGROUP_ID":   probes.ProgramHelpers[ProgramHelper{ebpf.CGroupSockAddr, asm.FnGetCurrentCgroupId}],
+		"HAVE_SET_RETVAL":  probes.ProgramHelpers[ProgramHelper{ebpf.CGroupSock, asm.FnSetRetval}],
+		"HAVE_FIB_NEIGH":   probes.ProgramHelpers[ProgramHelper{ebpf.SchedCLS, asm.FnRedirectNeigh}],
+		"HAVE_FIB_IFINDEX": probes.Misc.HaveFibIfindex,
 	}
 
 	return writeFeatureHeader(writer, features, true)
@@ -666,9 +793,7 @@ func writeCommonHeader(writer io.Writer, probes *FeatureProbes) error {
 // writeSkbHeader defines macros for bpf/include/bpf/features_skb.h
 func writeSkbHeader(writer io.Writer, probes *FeatureProbes) error {
 	featuresSkb := map[string]bool{
-		"HAVE_CHANGE_TAIL": probes.ProgramHelpers[ProgramHelper{ebpf.SchedCLS, asm.FnSkbChangeTail}],
-		"HAVE_FIB_LOOKUP":  probes.ProgramHelpers[ProgramHelper{ebpf.SchedCLS, asm.FnFibLookup}],
-		"HAVE_CSUM_LEVEL":  probes.ProgramHelpers[ProgramHelper{ebpf.SchedCLS, asm.FnCsumLevel}],
+		"HAVE_CSUM_LEVEL": probes.ProgramHelpers[ProgramHelper{ebpf.SchedCLS, asm.FnCsumLevel}],
 	}
 
 	return writeFeatureHeader(writer, featuresSkb, false)
@@ -677,7 +802,9 @@ func writeSkbHeader(writer io.Writer, probes *FeatureProbes) error {
 // writeXdpHeader defines macros for bpf/include/bpf/features_xdp.h
 func writeXdpHeader(writer io.Writer, probes *FeatureProbes) error {
 	featuresXdp := map[string]bool{
-		"HAVE_FIB_LOOKUP": probes.ProgramHelpers[ProgramHelper{ebpf.XDP, asm.FnFibLookup}],
+		"HAVE_XDP_GET_BUFF_LEN": probes.ProgramHelpers[ProgramHelper{ebpf.XDP, asm.FnXdpGetBuffLen}],
+		"HAVE_XDP_LOAD_BYTES":   probes.ProgramHelpers[ProgramHelper{ebpf.XDP, asm.FnXdpLoadBytes}],
+		"HAVE_XDP_STORE_BYTES":  probes.ProgramHelpers[ProgramHelper{ebpf.XDP, asm.FnXdpStoreBytes}],
 	}
 
 	return writeFeatureHeader(writer, featuresXdp, false)
@@ -696,5 +823,29 @@ func writeFeatureHeader(writer io.Writer, features map[string]bool, common bool)
 		return fmt.Errorf("could not write template: %w", err)
 	}
 
+	return nil
+}
+
+// HaveBatchAPI checks if kernel supports batched bpf map lookup API.
+func HaveBatchAPI() error {
+	spec := ebpf.MapSpec{
+		Type:       ebpf.LRUHash,
+		KeySize:    1,
+		ValueSize:  1,
+		MaxEntries: 2,
+	}
+	m, err := ebpf.NewMapWithOptions(&spec, ebpf.MapOptions{})
+	if err != nil {
+		return ErrNotSupported
+	}
+	defer m.Close()
+	var cursor ebpf.MapBatchCursor
+	_, err = m.BatchLookup(&cursor, []byte{0}, []byte{0}, nil) // only do one batched lookup
+	if err != nil {
+		if errors.Is(err, ebpf.ErrNotSupported) {
+			return ErrNotSupported
+		}
+		return nil
+	}
 	return nil
 }

@@ -28,9 +28,11 @@ Major Feature Status
 ++-------------------------------------------------+----------------------------------------------------------+
 || :ref:`egress-gateway`                           | Stable                                                   |
 ++-------------------------------------------------+----------------------------------------------------------+
-|| :ref:`gsg_encryption` (IPSec and WireGuard)     | Stable                                                   |
+|| :ref:`gsg_encryption` (IPsec and WireGuard)     | Stable                                                   |
 ++-------------------------------------------------+----------------------------------------------------------+
 || :ref:`bandwidth-manager`                        | Stable                                                   |
+++-------------------------------------------------+----------------------------------------------------------+
+|| :ref:`local-redirect-policy`                    | Stable                                                   |
 ++-------------------------------------------------+----------------------------------------------------------+
 | Cilium Mesh                                      | Stable (:ref:`Roadmap Details<rm-clustermesh>`)          |
 ++-------------------------------------------------+----------------------------------------------------------+
@@ -50,7 +52,7 @@ Major Feature Status
 ++-------------------------------------------------+----------------------------------------------------------+
 || :ref:`gs_ingress`                               | Stable                                                   |
 ++-------------------------------------------------+----------------------------------------------------------+
-|| :ref:`gs_gateway_api`                           | Beta                                                     |
+|| :ref:`gs_gateway_api`                           | Stable                                                   |
 ++-------------------------------------------------+----------------------------------------------------------+
 || :ref:`gs_l7_traffic_management`                 | Beta                                                     |
 ++-------------------------------------------------+----------------------------------------------------------+
@@ -58,7 +60,7 @@ Major Feature Status
 ++-------------------------------------------------+----------------------------------------------------------+
 || :ref:`SPIFFE integration<identity_management>`  | Beta                                                     |
 ++-------------------------------------------------+----------------------------------------------------------+
-| `Tetragon`_ Security                             | Beta (:ref:`Roadmap Details<rm-tetragon>`)               |
+| `Tetragon`_ Security                             | Stable (:ref:`Roadmap Details<rm-tetragon>`)             |
 +--------------------------------------------------+----------------------------------------------------------+
 
 "Stable" means that the feature is in use in production (though advanced
@@ -68,7 +70,7 @@ Release Cadence
 ~~~~~~~~~~~~~~~
 
 We aim to make 2 to 3 `point releases`_ per year of Cilium and its core components
-(Hubble, Cilium CLI, Tetragon, etc). We also make patch releases available as
+(Hubble, Cilium CLI, Tetragon, etc.). We also make patch releases available as
 necessary for security or urgent fixes. 
 
 Focus Areas
@@ -86,11 +88,6 @@ documentation, blog posts, example configurations, presentations, training
 courses, testing and more. Check the :ref:`dev_guide` documentation to understand how to get
 involved with code contributions, and the `Get Involved`_ guide for guidance on
 contributing blog posts, training and other resources. 
-
-CNCF Graduation
-~~~~~~~~~~~~~~~
-
-Cilium has applied for `CNCF Graduation`_, please add your support on the PR!
 
 .. _rm-cilium-service-mesh:
 
@@ -130,9 +127,8 @@ There are several advanced networking features currently in beta, several of
 these are already in production use with a set of adopters. We expect the
 following features to graduate to stable:
 
-* :ref:`BGP<bgp>`
-* :ref:`Local Redirect Policy<local-redirect-policy>`
-* :ref:`CiliumEndpointSlice<gsg_ces>`
+* :ref:`BGP<bgp_control_plane>`
+* :ref:`CiliumEndpointSlice<CiliumEndpointSlice>`
 * :ref:`Multi-Pool IPAM<ipam_crd_multi_pool>`
 * :ref:`Node-to-node WireGuard encryption<node-node-wg>`
 
@@ -145,7 +141,6 @@ Hubble provides visibility into network flows through the :ref:`Hubble CLI<hubbl
 and :ref:`UI<hubble_ui>` (beta), with support for Prometheus and OpenTelemetry metrics. Areas of
 focus currently include:
 
-* Graduating the `Hubble OpenTelemetry collector`_ to stable
 * Hubble UI additional features
 
 CI Test Improvements
@@ -164,9 +159,6 @@ Tetragon Security
 `Tetragon`_ is a sub-project within the Cilium family. It provides security observability and runtime enforcement through the JSON events and the Tetragon
 CLI for things like process execution, file access, network observability, and
 privileged execution.
-
-Although Tetragon is still in Beta stage, a set of adopters already use it in
-production.
 
 Codebase modularization
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -190,7 +182,7 @@ Influencing the Roadmap
 -----------------------
 
 You are welcome to raise feature requests by creating them as `GitHub issues`_.
-Please search the existing issues to avoid raising duplicates; if you find that
+Please search the existing issues to avoid raising duplicates, if you find that
 someone else is making the same or similar request we encourage the use of
 GitHub emojis to express your support for an idea! 
 
@@ -203,7 +195,7 @@ for setting up your development environment.
 
 We encourage you to discuss your ideas for significant enhancements and feature
 requests on the ``#development`` channel on `Cilium Slack`_, bring them to the
-:ref:`weekly-community-meeting`, and/or create a `CFP design doc`_.
+:ref:`community-meeting`, and/or create a `CFP design doc`_.
 
 This roadmap does not give date commitments since the work is dependent on the
 community. If you're looking for commitments to apply engineering resources to
@@ -226,7 +218,6 @@ anything other than trivial fixes.
 .. _point releases: https://cilium.io/blog/categories/release/
 .. _Get Involved: https://cilium.io/get-involved
 .. _CNCF Graduation: https://github.com/cncf/toc/pull/952
-.. _Hubble OpenTelemetry collector: https://github.com/cilium/hubble-otel
 .. _CI improvements: https://github.com/cilium/cilium/issues?q=is%3Aopen+is%3Aissue+label%3Aarea%2FCI-improvement
 .. _good-first-issue: https://github.com/cilium/cilium/labels/good-first-issue
 .. _enterprise: https://cilium.io/enterprise

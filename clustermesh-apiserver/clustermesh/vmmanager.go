@@ -9,8 +9,9 @@ import (
 	"fmt"
 	"net"
 	"path"
-	"sort"
+	"slices"
 
+	"github.com/cilium/hive/cell"
 	"github.com/spf13/pflag"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -20,8 +21,6 @@ import (
 	"github.com/cilium/cilium/pkg/cidr"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/defaults"
-	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	"github.com/cilium/cilium/pkg/identity"
 	identityCache "github.com/cilium/cilium/pkg/identity/cache"
 	identitymodel "github.com/cilium/cilium/pkg/identity/model"
@@ -64,12 +63,13 @@ func (def ExternalWorkloadsConfig) Flags(flags *pflag.FlagSet) {
 }
 
 func externalWorkloadsProvider(
-	lc hive.Lifecycle,
+	lc cell.Lifecycle,
 
 	cfg ExternalWorkloadsConfig,
 	clusterInfo cmtypes.ClusterInfo,
 
 	clientset k8sClient.Clientset,
+	crdSyncPromise promise.Promise[synced.CRDSync],
 	ciliumExternalWorkloads resource.Resource[*ciliumv2.CiliumExternalWorkload],
 	backendPromise promise.Promise[kvstore.BackendOperations],
 ) *VMManager {
@@ -86,9 +86,12 @@ func externalWorkloadsProvider(
 		ciliumClient: clientset,
 	}
 
-	lc.Append(hive.Hook{
-		OnStart: func(ctx hive.HookContext) error {
-			synced.SyncCRDs(ctx, clientset, synced.ClusterMeshAPIServerResourceNames(), &synced.Resources{}, &synced.APIGroups{})
+	lc.Append(cell.Hook{
+		OnStart: func(ctx cell.HookContext) error {
+			_, err := crdSyncPromise.Await(ctx)
+			if err != nil {
+				return fmt.Errorf("Wait for CRD resources failed: %w", err)
+			}
 
 			ewstore, err := ciliumExternalWorkloads.Store(ctx)
 			if err != nil {
@@ -102,7 +105,7 @@ func externalWorkloadsProvider(
 
 			mgr.ciliumExternalWorkloadStore = ewstore
 			mgr.backend = backend
-			mgr.identityAllocator = identityCache.NewCachingIdentityAllocator(mgr)
+			mgr.identityAllocator = identityCache.NewCachingIdentityAllocator(mgr, identityCache.AllocatorConfig{})
 			mgr.identityAllocator.InitIdentityAllocator(clientset)
 
 			if _, err = store.JoinSharedStore(store.Configuration{
@@ -138,7 +141,7 @@ type VMManager struct {
 //
 
 // UpdateIdentities will be called when identities have changed
-func (m *VMManager) UpdateIdentities(added, deleted identityCache.IdentityCache) {}
+func (m *VMManager) UpdateIdentities(added, deleted identity.IdentityMap) {}
 
 // GetNodeSuffix must return the node specific suffix to use
 func (m *VMManager) GetNodeSuffix() string {
@@ -271,7 +274,7 @@ func (m *VMManager) OnDelete(k store.NamedKey) {
 }
 
 func (m *VMManager) AllocateNodeIdentity(n *nodeTypes.RegisterNode) *identity.Identity {
-	vmLabels := labels.Map2Labels(n.Labels, "k8s")
+	vmLabels := labels.Map2Labels(n.Labels, labels.LabelSourceK8s)
 
 	log.Debug("Resolving identity for VM labels")
 	ctx, cancel := context.WithTimeout(context.TODO(), option.Config.KVstoreConnectivityTimeout)
@@ -296,7 +299,7 @@ func (m *VMManager) AllocateNodeIdentity(n *nodeTypes.RegisterNode) *identity.Id
 }
 
 func (m *VMManager) LookupNodeIdentity(n *nodeTypes.RegisterNode) *identity.Identity {
-	vmLabels := labels.Map2Labels(n.Labels, "k8s")
+	vmLabels := labels.Map2Labels(n.Labels, labels.LabelSourceK8s)
 
 	log.Debug("Looking up identity for VM labels")
 	ctx, cancel := context.WithTimeout(context.TODO(), option.Config.KVstoreConnectivityTimeout)
@@ -470,7 +473,7 @@ func getEndpointIdentity(mdlIdentity *models.Identity) (identity *ciliumv2.Endpo
 
 	identity.Labels = make([]string, len(mdlIdentity.Labels))
 	copy(identity.Labels, mdlIdentity.Labels)
-	sort.Strings(identity.Labels)
+	slices.Sort(identity.Labels)
 	log.Infof("Got Endpoint Identity: %v", *identity)
 	return
 }

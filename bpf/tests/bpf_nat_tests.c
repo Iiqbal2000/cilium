@@ -138,7 +138,7 @@ __always_inline int mk_icmp4_error_pkt(void *dst, __u8 error_hdr, bool egress)
 	}
 		break;
 	}
-	return dst - orig;
+	return (int)(dst - orig);
 }
 
 CHECK("tc", "nat4_icmp_error_tcp")
@@ -184,7 +184,7 @@ int test_nat4_icmp_error_tcp(__maybe_unused struct __ctx_buff *ctx)
 	struct ipv4_nat_target target = {
 		.addr = bpf_htonl(IP_HOST),
 		.min_port = NODEPORT_PORT_MIN_NAT,
-		.max_port = NODEPORT_PORT_MIN_NAT + 1,
+		.max_port = NODEPORT_PORT_MIN_NAT,
 	};
 	struct ipv4_nat_entry state;
 	struct trace_ctx trace;
@@ -298,7 +298,7 @@ int test_nat4_icmp_error_udp(__maybe_unused struct __ctx_buff *ctx)
 	struct ipv4_nat_target target = {
 		.addr = bpf_htonl(IP_HOST),
 		.min_port = NODEPORT_PORT_MIN_NAT,
-		.max_port = NODEPORT_PORT_MIN_NAT + 1,
+		.max_port = NODEPORT_PORT_MIN_NAT,
 	};
 	struct ipv4_nat_entry state;
 	struct trace_ctx trace;
@@ -411,7 +411,7 @@ int test_nat4_icmp_error_icmp(__maybe_unused struct __ctx_buff *ctx)
 	struct ipv4_nat_target target = {
 		.addr = bpf_htonl(IP_HOST),
 		.min_port = NODEPORT_PORT_MIN_NAT,
-		.max_port = NODEPORT_PORT_MIN_NAT + 1,
+		.max_port = NODEPORT_PORT_MIN_NAT,
 	};
 	struct ipv4_nat_entry state;
 	struct trace_ctx trace;
@@ -513,7 +513,7 @@ int test_nat4_icmp_error_sctp(__maybe_unused struct __ctx_buff *ctx)
 	struct ipv4_nat_target target = {
 		.addr = bpf_htonl(IP_HOST),
 		.min_port = NODEPORT_PORT_MIN_NAT,
-		.max_port = NODEPORT_PORT_MIN_NAT + 1,
+		.max_port = NODEPORT_PORT_MIN_NAT,
 	};
 	struct ipv4_nat_entry state;
 	struct trace_ctx trace;
@@ -579,7 +579,7 @@ int test_nat4_icmp_error_tcp_egress(__maybe_unused struct __ctx_buff *ctx)
 	struct ipv4_nat_target target = {
 		.addr = bpf_htonl(IP_HOST),
 		.min_port = NODEPORT_PORT_MIN_NAT - 1,
-		.max_port = NODEPORT_PORT_MIN_NAT,
+		.max_port = NODEPORT_PORT_MIN_NAT - 1,
 	};
 	struct ipv4_nat_entry state;
 	void *map;
@@ -698,7 +698,7 @@ int test_nat4_icmp_error_udp_egress(__maybe_unused struct __ctx_buff *ctx)
 	struct ipv4_nat_target target = {
 	    .addr = bpf_htonl(IP_HOST),
 	    .min_port = NODEPORT_PORT_MIN_NAT - 1,
-	    .max_port = NODEPORT_PORT_MIN_NAT,
+	    .max_port = NODEPORT_PORT_MIN_NAT - 1,
 	};
 	struct ipv4_nat_entry state;
 	void *map;
@@ -816,7 +816,7 @@ int test_nat4_icmp_error_icmp_egress(__maybe_unused struct __ctx_buff *ctx)
 	struct ipv4_nat_target target = {
 	    .addr = bpf_htonl(IP_HOST),
 	    .min_port = NODEPORT_PORT_MIN_NAT - 1,
-	    .max_port = NODEPORT_PORT_MIN_NAT,
+	    .max_port = NODEPORT_PORT_MIN_NAT - 1,
 	};
 	struct ipv4_nat_entry state;
 	void *map;

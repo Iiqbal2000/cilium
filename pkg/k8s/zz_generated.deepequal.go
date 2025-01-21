@@ -25,6 +25,9 @@ func (in *Backend) DeepEqual(other *Backend) bool {
 	if in.NodeName != other.NodeName {
 		return false
 	}
+	if in.Hostname != other.Hostname {
+		return false
+	}
 	if in.Terminating != other.Terminating {
 		return false
 	}
@@ -46,6 +49,9 @@ func (in *Backend) DeepEqual(other *Backend) bool {
 	}
 
 	if in.Preferred != other.Preferred {
+		return false
+	}
+	if in.Zone != other.Zone {
 		return false
 	}
 
@@ -175,6 +181,12 @@ func (in *Service) deepEqual(other *Service) bool {
 	if in.IntTrafficPolicy != other.IntTrafficPolicy {
 		return false
 	}
+	if in.ForwardingMode != other.ForwardingMode {
+		return false
+	}
+	if in.SourceRangesPolicy != other.SourceRangesPolicy {
+		return false
+	}
 	if in.HealthCheckNodePort != other.HealthCheckNodePort {
 		return false
 	}
@@ -220,6 +232,9 @@ func (in *Service) deepEqual(other *Service) bool {
 		}
 	}
 
+	if in.LoadBalancerAlgorithm != other.LoadBalancerAlgorithm {
+		return false
+	}
 	if ((in.LoadBalancerSourceRanges != nil) && (other.LoadBalancerSourceRanges != nil)) || ((in.LoadBalancerSourceRanges == nil) != (other.LoadBalancerSourceRanges == nil)) {
 		in, other := &in.LoadBalancerSourceRanges, &other.LoadBalancerSourceRanges
 		if other == nil {
@@ -234,6 +249,27 @@ func (in *Service) deepEqual(other *Service) bool {
 					return false
 				} else {
 					if !inValue.DeepEqual(otherValue) {
+						return false
+					}
+				}
+			}
+		}
+	}
+
+	if ((in.Annotations != nil) && (other.Annotations != nil)) || ((in.Annotations == nil) != (other.Annotations == nil)) {
+		in, other := &in.Annotations, &other.Annotations
+		if other == nil {
+			return false
+		}
+
+		if len(*in) != len(*other) {
+			return false
+		} else {
+			for key, inValue := range *in {
+				if otherValue, present := (*other)[key]; !present {
+					return false
+				} else {
+					if inValue != otherValue {
 						return false
 					}
 				}

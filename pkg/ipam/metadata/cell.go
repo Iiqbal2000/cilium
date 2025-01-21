@@ -4,9 +4,10 @@
 package metadata
 
 import (
+	"github.com/cilium/hive/cell"
+
 	"github.com/cilium/cilium/daemon/k8s"
-	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
+	"github.com/cilium/cilium/pkg/ipam"
 	ipamOption "github.com/cilium/cilium/pkg/ipam/option"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	slim_core_v1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
@@ -23,23 +24,31 @@ var Cell = cell.Module(
 type managerParams struct {
 	cell.In
 
-	Lifecycle    hive.Lifecycle
+	Lifecycle    cell.Lifecycle
 	DaemonConfig *option.DaemonConfig
 
 	NamespaceResource resource.Resource[*slim_core_v1.Namespace]
 	PodResource       k8s.LocalPodResource
 }
 
-func newIPAMMetadataManager(params managerParams) *Manager {
+func newIPAMMetadataManager(params managerParams) Manager {
 	if params.DaemonConfig.IPAM != ipamOption.IPAMMultiPool {
-		return nil
+		return &defaultIPPoolManager{}
 	}
 
-	manager := &Manager{
+	manager := &manager{
 		namespaceResource: params.NamespaceResource,
 		podResource:       params.PodResource,
 	}
 	params.Lifecycle.Append(manager)
 
 	return manager
+}
+
+type defaultIPPoolManager struct{}
+
+var _ Manager = &defaultIPPoolManager{}
+
+func (n *defaultIPPoolManager) GetIPPoolForPod(owner string, family ipam.Family) (pool string, err error) {
+	return option.Config.IPAMDefaultIPPool, nil
 }

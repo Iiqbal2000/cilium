@@ -4,24 +4,25 @@
 package egressgateway
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"net/netip"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 
+	"github.com/cilium/hive/cell"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
 	"k8s.io/client-go/util/workqueue"
 
 	"github.com/cilium/cilium/pkg/datapath/linux/config/defines"
-	"github.com/cilium/cilium/pkg/datapath/linux/probes"
+	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
+	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/datapath/tunnel"
-	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	"github.com/cilium/cilium/pkg/identity"
 	identityCache "github.com/cilium/cilium/pkg/identity/cache"
 	cilium_api_v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
@@ -46,6 +47,9 @@ var (
 	// ExcludedCIDRIPv4 is a special IP value used as gatewayIP in the BPF policy map
 	// to indicate the entry is for an excluded CIDR and should skip egress gateway
 	ExcludedCIDRIPv4 = netip.MustParseAddr("0.0.0.1")
+	// EgressIPNotFoundIPv4 is a special IP value used as egressIP in the BPF policy map
+	// to indicate no egressIP was found for the given policy
+	EgressIPNotFoundIPv4 = netip.IPv4Unspecified()
 )
 
 // Cell provides a [Manager] for consumption with hive.
@@ -64,30 +68,23 @@ const (
 	eventK8sSyncDone
 	eventAddPolicy
 	eventDeletePolicy
-	eventUpdateNode
-	eventDeleteNode
 	eventUpdateEndpoint
 	eventDeleteEndpoint
+	eventUpdateNode
+	eventDeleteNode
 )
 
 type Config struct {
-	// Install egress gateway IP rules and routes in order to properly steer
-	// egress gateway traffic to the correct ENI interface
-	InstallEgressGatewayRoutes bool
-
 	// Default amount of time between triggers of egress gateway state
 	// reconciliations are invoked
 	EgressGatewayReconciliationTriggerInterval time.Duration
 }
 
 var defaultConfig = Config{
-	InstallEgressGatewayRoutes:                 false,
 	EgressGatewayReconciliationTriggerInterval: 1 * time.Second,
 }
 
 func (def Config) Flags(flags *pflag.FlagSet) {
-	flags.Bool("install-egress-gateway-routes", def.InstallEgressGatewayRoutes, "Install egress gateway IP rules and routes in order to properly steer egress gateway traffic to the correct ENI interface")
-	flags.MarkDeprecated("install-egress-gateway-routes", "This option is deprecated, has no effect, and will be removed in v1.16")
 	flags.Duration("egress-gateway-reconciliation-trigger-interval", def.EgressGatewayReconciliationTriggerInterval, "Time between triggers of egress gateway state reconciliations")
 }
 
@@ -101,12 +98,12 @@ type Manager struct {
 	// their initial state synced.
 	allCachesSynced bool
 
-	// nodeDataStore stores node name to node mapping
-	nodeDataStore map[string]nodeTypes.Node
-
-	// nodes stores nodes sorted by their name
+	// nodes stores nodes sorted by their name. The entries are sorted
+	// to ensure consistent gateway selection across all agents.
 	nodes []nodeTypes.Node
-
+	// nodesAddresses2Labels store the labels of each node so that the endpoint can match the node labels
+	// key is the IP address of the node, and value is the labels of the node.
+	nodesAddresses2Labels map[string]map[string]string
 	// policies allows reading policy CRD from k8s.
 	policies resource.Resource[*Policy]
 
@@ -129,7 +126,7 @@ type Manager struct {
 	// identityAllocator is used to fetch identity labels for endpoint updates
 	identityAllocator identityCache.IdentityAllocator
 
-	// policyMap communicates the active policies to the dapath.
+	// policyMap communicates the active policies to the datapath.
 	policyMap egressmap.PolicyMap
 
 	// reconciliationTriggerInterval is the amount of time between triggers
@@ -149,6 +146,8 @@ type Manager struct {
 	// reconciliationEventsCount keeps track of how many reconciliation
 	// events have occoured
 	reconciliationEventsCount atomic.Uint64
+
+	sysctl sysctl.Sysctl
 }
 
 type Params struct {
@@ -161,8 +160,9 @@ type Params struct {
 	Policies          resource.Resource[*Policy]
 	Nodes             resource.Resource[*cilium_api_v2.CiliumNode]
 	Endpoints         resource.Resource[*k8sTypes.CiliumEndpoint]
+	Sysctl            sysctl.Sysctl
 
-	Lifecycle hive.Lifecycle
+	Lifecycle cell.Lifecycle
 }
 
 func NewEgressGatewayManager(p Params) (out struct {
@@ -178,37 +178,16 @@ func NewEgressGatewayManager(p Params) (out struct {
 		return out, nil
 	}
 
-	if dcfg.IdentityAllocationMode == option.IdentityAllocationModeKVstore {
-		return out, errors.New("egress gateway is not supported in KV store identity allocation mode")
-	}
-
-	if dcfg.EnableHighScaleIPcache {
-		return out, errors.New("egress gateway is not supported in high scale IPcache mode")
+	if dcfg.IdentityAllocationMode != option.IdentityAllocationModeCRD {
+		return out, fmt.Errorf("egress gateway is not supported in %s identity allocation mode", dcfg.IdentityAllocationMode)
 	}
 
 	if dcfg.EnableCiliumEndpointSlice {
 		return out, errors.New("egress gateway is not supported in combination with the CiliumEndpointSlice feature")
 	}
 
-	if !dcfg.MasqueradingEnabled() || !dcfg.EnableBPFMasquerade {
+	if !dcfg.EnableIPv4Masquerade || !dcfg.EnableBPFMasquerade {
 		return out, fmt.Errorf("egress gateway requires --%s=\"true\" and --%s=\"true\"", option.EnableIPv4Masquerade, option.EnableBPFMasquerade)
-	}
-
-	if !dcfg.EnableRemoteNodeIdentity {
-		// datapath code depends on remote node identities to distinguish between
-		// cluster-local and cluster-egress traffic.
-		return out, fmt.Errorf("egress gateway requires remote node identities (--%s=\"true\")", option.EnableRemoteNodeIdentity)
-	}
-
-	if dcfg.EnableL7Proxy {
-		log.WithField(logfields.URL, "https://github.com/cilium/cilium/issues/19642").
-			Warningf("both egress gateway and L7 proxy (--%s) are enabled. This is currently not fully supported: "+
-				"if the same endpoint is selected both by an egress gateway and a L7 policy, endpoint traffic will not go through egress gateway.", option.EnableL7Proxy)
-	}
-
-	if err := deleteStaleIPRulesAndRoutes(); err != nil {
-		err = fmt.Errorf("cannot delete stale IP rules and routes: %w", err)
-		return out, err
 	}
 
 	out.Manager, err = newEgressGatewayManager(p)
@@ -227,7 +206,6 @@ func NewEgressGatewayManager(p Params) (out struct {
 
 func newEgressGatewayManager(p Params) (*Manager, error) {
 	manager := &Manager{
-		nodeDataStore:                 make(map[string]nodeTypes.Node),
 		policyConfigs:                 make(map[policyID]*PolicyConfig),
 		policyConfigsBySourceIP:       make(map[string][]*PolicyConfig),
 		epDataStore:                   make(map[endpointID]*endpointMetadata),
@@ -237,6 +215,8 @@ func newEgressGatewayManager(p Params) (*Manager, error) {
 		policies:                      p.Policies,
 		ciliumNodes:                   p.Nodes,
 		endpoints:                     p.Endpoints,
+		sysctl:                        p.Sysctl,
+		nodesAddresses2Labels:         make(map[string]map[string]string),
 	}
 
 	t, err := trigger.NewTrigger(trigger.Parameters{
@@ -261,17 +241,17 @@ func newEgressGatewayManager(p Params) (*Manager, error) {
 	var wg sync.WaitGroup
 
 	ctx, cancel := context.WithCancel(context.Background())
-	p.Lifecycle.Append(hive.Hook{
-		OnStart: func(hc hive.HookContext) error {
-			if probes.HaveLargeInstructionLimit() != nil {
-				return fmt.Errorf("egress gateway needs kernel 5.2 or newer")
-			}
-
-			go manager.processEvents(ctx)
+	p.Lifecycle.Append(cell.Hook{
+		OnStart: func(hc cell.HookContext) error {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				manager.processEvents(ctx)
+			}()
 
 			return nil
 		},
-		OnStop: func(hc hive.HookContext) error {
+		OnStop: func(hc cell.HookContext) error {
 			cancel()
 
 			wg.Wait()
@@ -304,7 +284,7 @@ func (manager *Manager) getIdentityLabels(securityIdentity uint32) (labels.Label
 	identityCtx, cancel := context.WithTimeout(context.Background(), option.Config.KVstoreConnectivityTimeout)
 	defer cancel()
 	if err := manager.identityAllocator.WaitForInitialGlobalIdentities(identityCtx); err != nil {
-		return nil, fmt.Errorf("failed to wait for initial global identities: %v", err)
+		return nil, fmt.Errorf("failed to wait for initial global identities: %w", err)
 	}
 
 	identity := manager.identityAllocator.LookupIdentityByID(identityCtx, identity.NumericIdentity(securityIdentity))
@@ -413,7 +393,7 @@ func (manager *Manager) onAddEgressPolicy(policy *Policy) error {
 		logger.Debug("Updated CiliumEgressGatewayPolicy")
 	}
 
-	config.updateMatchedEndpointIDs(manager.epDataStore)
+	config.updateMatchedEndpointIDs(manager.epDataStore, manager.nodesAddresses2Labels)
 
 	manager.policyConfigs[config.id] = config
 
@@ -457,6 +437,11 @@ func (manager *Manager) addEndpoint(endpoint *k8sTypes.CiliumEndpoint) error {
 		logfields.K8sNamespace:    endpoint.Namespace,
 		logfields.K8sUID:          endpoint.UID,
 	})
+
+	if endpoint.Identity == nil {
+		logger.Warning("Endpoint is missing identity metadata, skipping update to egress policy.")
+		return nil
+	}
 
 	if identityLabels, err = manager.getIdentityLabels(uint32(endpoint.Identity.ID)); err != nil {
 		logger.WithError(err).
@@ -521,38 +506,41 @@ func (manager *Manager) handleNodeEvent(event resource.Event[*cilium_api_v2.Cili
 	manager.Lock()
 	defer manager.Unlock()
 
-	if event.Kind == resource.Upsert {
-		manager.nodeDataStore[node.Name] = node
-		manager.onChangeNodeLocked(eventUpdateNode)
-	} else {
-		delete(manager.nodeDataStore, node.Name)
-		manager.onChangeNodeLocked(eventDeleteNode)
-	}
-}
-
-func (manager *Manager) onChangeNodeLocked(e eventType) {
-	manager.nodes = []nodeTypes.Node{}
-	for _, n := range manager.nodeDataStore {
-		manager.nodes = append(manager.nodes, n)
-	}
-	sort.Slice(manager.nodes, func(i, j int) bool {
-		return manager.nodes[i].Name < manager.nodes[j].Name
+	// Find the node if we already have it.
+	nidx, found := slices.BinarySearchFunc(manager.nodes, node, func(a nodeTypes.Node, b nodeTypes.Node) int {
+		return cmp.Compare(a.Name, b.Name)
 	})
 
-	reason := ""
-	if e == eventUpdateNode {
-		reason = "node updated"
-	} else if e == eventDeleteNode {
-		reason = "node deleted"
+	if event.Kind == resource.Delete {
+		// Delete the node if we're aware of it.
+		if found {
+			delete(manager.nodesAddresses2Labels, node.GetNodeIP(false).String()) // for ipv4
+			delete(manager.nodesAddresses2Labels, node.GetNodeIP(true).String())  // for ipv6
+			manager.nodes = slices.Delete(manager.nodes, nidx, nidx+1)
+		}
+
+		manager.setEventBitmap(eventDeleteNode)
+		manager.reconciliationTrigger.TriggerWithReason("node deleted")
+		return
 	}
 
-	manager.setEventBitmap(e)
-	manager.reconciliationTrigger.TriggerWithReason(reason)
+	// Update the node if we have it, otherwise insert in the correct
+	// position.
+	if found {
+		manager.nodes[nidx] = node
+	} else {
+		manager.nodes = slices.Insert(manager.nodes, nidx, node)
+	}
+	// We need to store the labels of each node so that the endpoint can match the node labels
+	manager.nodesAddresses2Labels[node.GetNodeIP(false).String()] = node.Labels // for ipv4
+	manager.nodesAddresses2Labels[node.GetNodeIP(true).String()] = node.Labels  // for ipv6
+	manager.setEventBitmap(eventUpdateNode)
+	manager.reconciliationTrigger.TriggerWithReason("node updated")
 }
 
 func (manager *Manager) updatePoliciesMatchedEndpointIDs() {
 	for _, policy := range manager.policyConfigs {
-		policy.updateMatchedEndpointIDs(manager.epDataStore)
+		policy.updateMatchedEndpointIDs(manager.epDataStore, manager.nodesAddresses2Labels)
 	}
 }
 
@@ -620,6 +608,33 @@ func (manager *Manager) regenerateGatewayConfigs() {
 	}
 }
 
+func (manager *Manager) relaxRPFilter() error {
+	var sysSettings []tables.Sysctl
+	ifSet := make(map[string]struct{})
+
+	for _, pc := range manager.policyConfigs {
+		if !pc.gatewayConfig.localNodeConfiguredAsGateway {
+			continue
+		}
+
+		ifaceName := pc.gatewayConfig.ifaceName
+		if _, ok := ifSet[ifaceName]; !ok {
+			ifSet[ifaceName] = struct{}{}
+			sysSettings = append(sysSettings, tables.Sysctl{
+				Name:      []string{"net", "ipv4", "conf", ifaceName, "rp_filter"},
+				Val:       "2",
+				IgnoreErr: false,
+			})
+		}
+	}
+
+	if len(sysSettings) == 0 {
+		return nil
+	}
+
+	return manager.sysctl.ApplySettings(sysSettings)
+}
+
 func (manager *Manager) addMissingEgressRules() {
 	egressPolicies := map[egressmap.EgressPolicyKey4]egressmap.EgressPolicyVal4{}
 	manager.policyMap.IterateWithCallback(
@@ -668,7 +683,6 @@ func (manager *Manager) removeUnusedEgressRules() {
 			egressPolicies[*key] = *val
 		})
 
-nextPolicyKey:
 	for policyKey, policyVal := range egressPolicies {
 		matchPolicy := func(endpointIP netip.Addr, dstCIDR netip.Prefix, excludedCIDR bool, gwc *gatewayConfig) bool {
 			gatewayIP := gwc.gatewayIP
@@ -680,7 +694,7 @@ nextPolicyKey:
 		}
 
 		if manager.policyMatches(policyKey.GetSourceIP(), matchPolicy) {
-			continue nextPolicyKey
+			continue
 		}
 
 		logger := log.WithFields(logrus.Fields{
@@ -712,14 +726,30 @@ func (manager *Manager) reconcileLocked() {
 	// on eventK8sSyncDone we need to update all caches unconditionally as
 	// we don't know which k8s events/resources were received during the
 	// initial k8s sync
-	case manager.eventBitmapIsSet(eventUpdateEndpoint, eventDeleteEndpoint, eventK8sSyncDone):
+	case manager.eventBitmapIsSet(eventUpdateEndpoint, eventDeleteEndpoint, eventUpdateNode, eventDeleteNode, eventK8sSyncDone):
 		manager.updatePoliciesMatchedEndpointIDs()
 		fallthrough
 	case manager.eventBitmapIsSet(eventAddPolicy, eventDeletePolicy):
 		manager.updatePoliciesBySourceIP()
 	}
 
-	manager.regenerateGatewayConfigs()
+	if manager.eventBitmapIsSet(eventK8sSyncDone, eventAddPolicy, eventDeletePolicy, eventUpdateNode, eventDeleteNode) {
+		manager.regenerateGatewayConfigs()
+
+		// Sysctl updates are handled by a reconciler, with the initial update attempting to wait some time
+		// for a synchronous reconciliation. Thus these updates are already resilient so in case of failure
+		// our best course of action is to log the error and continue with the reconciliation.
+		//
+		// The rp_filter setting is only important for traffic originating from endpoints on the same host (i.e.
+		// egw traffic being forwarded from a local Pod endpoint to the gateway on the same node).
+		// Therefore, for the sake of resiliency, it is acceptable for EGW to continue reconciling gatewayConfigs
+		// even if the rp_filter setting are failing.
+		if err := manager.relaxRPFilter(); err != nil {
+			log.WithError(err).Error("Error relaxing rp_filter for gateway interfaces. "+
+				"Selected egress gateway interfaces require rp_filter settings to use loose mode (rp_filter=2) for gateway forwarding to work correctly. ",
+				"This may cause connectivity issues for egress gateway traffic being forwarded through this node for Pods running on the same host. ")
+		}
+	}
 
 	// The order of the next 2 function calls matters, as by first adding missing policies and
 	// only then removing obsolete ones we make sure there will be no connectivity disruption
