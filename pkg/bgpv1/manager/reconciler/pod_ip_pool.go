@@ -6,16 +6,16 @@ package reconciler
 import (
 	"context"
 	"fmt"
+	"maps"
 	"net/netip"
 	"slices"
 
+	"github.com/cilium/hive/cell"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/exp/maps"
 
 	"github.com/cilium/cilium/pkg/bgpv1/manager/instance"
 	"github.com/cilium/cilium/pkg/bgpv1/manager/store"
 	"github.com/cilium/cilium/pkg/bgpv1/types"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	v2api "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	v2alpha1api "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	"github.com/cilium/cilium/pkg/k8s/resource"
@@ -60,6 +60,12 @@ func (r *PodIPPoolReconciler) Name() string {
 func (r *PodIPPoolReconciler) Priority() int {
 	return 50
 }
+
+func (r *PodIPPoolReconciler) Init(_ *instance.ServerWithConfig) error {
+	return nil
+}
+
+func (r *PodIPPoolReconciler) Cleanup(_ *instance.ServerWithConfig) {}
 
 func (r *PodIPPoolReconciler) Reconcile(ctx context.Context, p ReconcileParams) error {
 	lp := r.populateLocalPools(p.CiliumNode)
@@ -131,7 +137,10 @@ func (r *PodIPPoolReconciler) fullReconciliation(ctx context.Context,
 	}
 
 	// Loop over all pod ip pools, reconcile any updates to the pool.
-	pools := r.poolStore.List()
+	pools, err := r.poolStore.List()
+	if err != nil {
+		return fmt.Errorf("failed to list ip pools from store: %w", err)
+	}
 	for _, pool := range pools {
 		if err := r.reconcilePodIPPool(ctx, sc, newc, pool, localPools); err != nil {
 			return fmt.Errorf("failed to reconcile pod ip pool: %w", err)

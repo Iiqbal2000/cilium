@@ -44,9 +44,6 @@ const (
 	// CNCRDName is the full name of the CN CRD.
 	CNCRDName = k8sconstv2.CNKindDefinition + "/" + k8sconstv2.CustomResourceDefinitionVersion
 
-	// CEWCRDName is the full name of the CEW CRD.
-	CEWCRDName = k8sconstv2.CEWKindDefinition + "/" + k8sconstv2.CustomResourceDefinitionVersion
-
 	// CLRPCRDName is the full name of the CLRP CRD.
 	CLRPCRDName = k8sconstv2.CLRPKindDefinition + "/" + k8sconstv2.CustomResourceDefinitionVersion
 
@@ -61,6 +58,9 @@ const (
 
 	// CECCRDName is the full name of the CEC CRD.
 	CECCRDName = k8sconstv2.CECKindDefinition + "/" + k8sconstv2.CustomResourceDefinitionVersion
+
+	// CNCCRDName is the full name of the CiliumNodeConfig CRD.
+	CNCCRDName = k8sconstv2.CNCKindDefinition + "/" + k8sconstv2.CustomResourceDefinitionVersion
 
 	// BGPPCRDName is the full name of the BGPP CRD.
 	BGPPCRDName = k8sconstv2alpha1.BGPPKindDefinition + "/" + k8sconstv2alpha1.CustomResourceDefinitionVersion
@@ -83,8 +83,9 @@ const (
 	// LBIPPoolCRDName is the full name of the BGPPool CRD.
 	LBIPPoolCRDName = k8sconstv2alpha1.PoolKindDefinition + "/" + k8sconstv2alpha1.CustomResourceDefinitionVersion
 
-	// CNCCRDName is the full name of the CiliumNodeConfig CRD.
-	CNCCRDName = k8sconstv2alpha1.CNCKindDefinition + "/" + k8sconstv2alpha1.CustomResourceDefinitionVersion
+	// CNCCRDNameAlpha is the full name of the CiliumNodeConfig CRD.
+	// TODO remove me when CNC CRD v2alpha1 will be deprecated.
+	CNCCRDNameAlpha = k8sconstv2alpha1.CNCKindDefinition + "/" + k8sconstv2alpha1.CustomResourceDefinitionVersion
 
 	// CCGCRDName is the full name of the CiliumCIDRGroup CRD.
 	CCGCRDName = k8sconstv2alpha1.CCGKindDefinition + "/" + k8sconstv2alpha1.CustomResourceDefinitionVersion
@@ -94,6 +95,8 @@ const (
 
 	// CPIPCRDName is the full name of the CiliumPodIPPool CRD.
 	CPIPCRDName = k8sconstv2alpha1.CPIPKindDefinition + "/" + k8sconstv2alpha1.CustomResourceDefinitionVersion
+	// CGCCCRDName is the full name of the CiliumGatewayClassConfig CRD.
+	CGCCCRDName = k8sconstv2alpha1.CGCCKindDefinition + "/" + k8sconstv2alpha1.CustomResourceDefinitionVersion
 )
 
 // log is the k8s package logger object.
@@ -104,7 +107,7 @@ type CRDList struct {
 	FullName string
 }
 
-// Returns a map of CRDs
+// CustomResourceDefinitionList returns a map of CRDs
 func CustomResourceDefinitionList() map[string]*CRDList {
 	return map[string]*CRDList{
 		synced.CRDResourceName(k8sconstv2.CNPName): {
@@ -127,10 +130,6 @@ func CustomResourceDefinitionList() map[string]*CRDList {
 			Name:     CEPCRDName,
 			FullName: k8sconstv2.CEPName,
 		},
-		synced.CRDResourceName(k8sconstv2.CEWName): {
-			Name:     CEWCRDName,
-			FullName: k8sconstv2.CEWName,
-		},
 		synced.CRDResourceName(k8sconstv2.CLRPName): {
 			Name:     CLRPCRDName,
 			FullName: k8sconstv2.CLRPName,
@@ -138,6 +137,10 @@ func CustomResourceDefinitionList() map[string]*CRDList {
 		synced.CRDResourceName(k8sconstv2.CEGPName): {
 			Name:     CEGPCRDName,
 			FullName: k8sconstv2.CEGPName,
+		},
+		synced.CRDResourceName(k8sconstv2.CNCName): {
+			Name:     CNCCRDName,
+			FullName: k8sconstv2.CNCName,
 		},
 		synced.CRDResourceName(k8sconstv2alpha1.CESName): {
 			Name:     CESCRDName,
@@ -179,8 +182,9 @@ func CustomResourceDefinitionList() map[string]*CRDList {
 			Name:     LBIPPoolCRDName,
 			FullName: k8sconstv2alpha1.LBIPPoolName,
 		},
+		// TODO remove me when CNC v2alpha 1 will be deprecated
 		synced.CRDResourceName(k8sconstv2alpha1.CNCName): {
-			Name:     CNCCRDName,
+			Name:     CNCCRDNameAlpha,
 			FullName: k8sconstv2alpha1.CNCName,
 		},
 		synced.CRDResourceName(k8sconstv2alpha1.CCGName): {
@@ -194,6 +198,10 @@ func CustomResourceDefinitionList() map[string]*CRDList {
 		synced.CRDResourceName(k8sconstv2alpha1.CPIPName): {
 			Name:     CPIPCRDName,
 			FullName: k8sconstv2alpha1.CPIPName,
+		},
+		synced.CRDResourceName(k8sconstv2alpha1.CGCCName): {
+			Name:     CGCCCRDName,
+			FullName: k8sconstv2alpha1.CGCCName,
 		},
 	}
 }
@@ -234,14 +242,14 @@ var (
 	//go:embed crds/v2/ciliumnodes.yaml
 	crdsCiliumnodes []byte
 
-	//go:embed crds/v2/ciliumexternalworkloads.yaml
-	crdsCiliumexternalworkloads []byte
-
 	//go:embed crds/v2/ciliumlocalredirectpolicies.yaml
 	crdsCiliumlocalredirectpolicies []byte
 
 	//go:embed crds/v2/ciliumegressgatewaypolicies.yaml
 	crdsv2Ciliumegressgatewaypolicies []byte
+
+	//go:embed crds/v2/ciliumnodeconfigs.yaml
+	crdsv2CiliumNodeConfigs []byte
 
 	//go:embed crds/v2alpha1/ciliumendpointslices.yaml
 	crdsv2Alpha1Ciliumendpointslices []byte
@@ -273,9 +281,6 @@ var (
 	//go:embed crds/v2alpha1/ciliumloadbalancerippools.yaml
 	crdsv2Alpha1Ciliumloadbalancerippools []byte
 
-	//go:embed crds/v2alpha1/ciliumnodeconfigs.yaml
-	crdsv2Alpha1CiliumNodeConfigs []byte
-
 	//go:embed crds/v2alpha1/ciliumcidrgroups.yaml
 	crdsv2Alpha1CiliumCIDRGroups []byte
 
@@ -284,6 +289,9 @@ var (
 
 	//go:embed crds/v2alpha1/ciliumpodippools.yaml
 	crdsv2Alpha1CiliumPodIPPools []byte
+
+	//go:embed crds/v2alpha1/ciliumgatewayclassconfigs.yaml
+	crdsv2Alpha1CiliumGatewayClassConfigs []byte
 )
 
 // GetPregeneratedCRD returns the pregenerated CRD based on the requested CRD
@@ -309,8 +317,6 @@ func GetPregeneratedCRD(crdName string) apiextensionsv1.CustomResourceDefinition
 		crdBytes = crdsCiliumidentities
 	case CNCRDName:
 		crdBytes = crdsCiliumnodes
-	case CEWCRDName:
-		crdBytes = crdsCiliumexternalworkloads
 	case CLRPCRDName:
 		crdBytes = crdsCiliumlocalredirectpolicies
 	case CEGPCRDName:
@@ -335,14 +341,18 @@ func GetPregeneratedCRD(crdName string) apiextensionsv1.CustomResourceDefinition
 		crdBytes = crdsv2Alpha1Ciliumbgpnodeconfigoverrides
 	case LBIPPoolCRDName:
 		crdBytes = crdsv2Alpha1Ciliumloadbalancerippools
+	case CNCCRDNameAlpha:
+		crdBytes = crdsv2CiliumNodeConfigs
 	case CNCCRDName:
-		crdBytes = crdsv2Alpha1CiliumNodeConfigs
+		crdBytes = crdsv2CiliumNodeConfigs
 	case CCGCRDName:
 		crdBytes = crdsv2Alpha1CiliumCIDRGroups
 	case L2AnnouncementCRDName:
 		crdBytes = crdsv2Alpha1CiliumL2AnnouncementPolicies
 	case CPIPCRDName:
 		crdBytes = crdsv2Alpha1CiliumPodIPPools
+	case CGCCCRDName:
+		crdBytes = crdsv2Alpha1CiliumGatewayClassConfigs
 	default:
 		scopedLog.Fatal("Pregenerated CRD does not exist")
 	}
@@ -390,9 +400,11 @@ func constructV1CRD(
 				Plural:     template.Spec.Names.Plural,
 				ShortNames: template.Spec.Names.ShortNames,
 				Singular:   template.Spec.Names.Singular,
+				Categories: template.Spec.Names.Categories,
 			},
-			Scope:    template.Spec.Scope,
-			Versions: template.Spec.Versions,
+			Scope:      template.Spec.Scope,
+			Versions:   template.Spec.Versions,
+			Conversion: template.Spec.Conversion, // conversion strategy is needed to support several versions of a same CRD
 		},
 	}
 }
@@ -400,7 +412,7 @@ func constructV1CRD(
 // RegisterCRDs registers all CRDs with the K8s apiserver.
 func RegisterCRDs(clientset client.Clientset) error {
 	if err := CreateCustomResourceDefinitions(clientset); err != nil {
-		return fmt.Errorf("Unable to create custom resource definition: %s", err)
+		return fmt.Errorf("Unable to create custom resource definition: %w", err)
 	}
 
 	return nil

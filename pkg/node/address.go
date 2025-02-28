@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -21,7 +22,7 @@ import (
 	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
-	"github.com/cilium/cilium/pkg/mac"
+	"github.com/cilium/cilium/pkg/node/addressing"
 	"github.com/cilium/cilium/pkg/option"
 	wgTypes "github.com/cilium/cilium/pkg/wireguard/types"
 )
@@ -29,11 +30,7 @@ import (
 const preferPublicIP bool = true
 
 var (
-	// addrsMu protects addrs. Outside the addresses struct
-	// so that we can Uninitialize() without linter complaining
-	// about lock copying.
-	addrsMu lock.RWMutex
-	addrs   addresses
+	addrs addresses
 
 	// localNode holds the current state of the local "types.Node".
 	// This is defined here until all uses of the getters and
@@ -56,18 +53,12 @@ func getLocalNode() LocalNode {
 }
 
 type addresses struct {
-	ipv4Loopback      net.IP
-	ipv4NodePortAddrs map[string]net.IP // iface name => ip addr
-	ipv4MasqAddrs     map[string]net.IP // iface name => ip addr
-	ipv6NodePortAddrs map[string]net.IP // iface name => ip addr
-	ipv6MasqAddrs     map[string]net.IP // iface name => ip addr
-	routerInfo        RouterInfo
+	mu         lock.RWMutex
+	routerInfo RouterInfo
 }
 
 type RouterInfo interface {
 	GetIPv4CIDRs() []net.IPNet
-	GetMac() mac.MAC
-	GetInterfaceNumber() int
 }
 
 func makeIPv6HostIP() net.IP {
@@ -80,17 +71,17 @@ func makeIPv6HostIP() net.IP {
 	return ip
 }
 
-// InitDefaultPrefix initializes the node address and allocation prefixes with
+// initDefaultPrefix initializes the node address and allocation prefixes with
 // default values derived from the system. device can be set to the primary
 // network device of the system in which case the first address with global
 // scope will be regarded as the system's node address.
-func InitDefaultPrefix(device string) {
+func initDefaultPrefix(device string) {
 	localNode.Update(func(n *LocalNode) {
-		SetDefaultPrefix(option.Config, device, n)
+		setDefaultPrefix(option.Config, device, n)
 	})
 }
 
-func SetDefaultPrefix(cfg *option.DaemonConfig, device string, node *LocalNode) {
+func setDefaultPrefix(cfg *option.DaemonConfig, device string, node *LocalNode) {
 	if cfg.EnableIPv4 {
 		isIPv6 := false
 
@@ -161,83 +152,6 @@ func SetDefaultPrefix(cfg *option.DaemonConfig, device string, node *LocalNode) 
 	}
 }
 
-// InitNodePortAddrs initializes NodePort IPv{4,6} addrs for the given devices.
-// If inheritIPAddrFromDevice is non-empty, then the IP addr for the devices
-// will be derived from it.
-func InitNodePortAddrs(devices []string, inheritIPAddrFromDevice string) error {
-	addrsMu.Lock()
-	defer addrsMu.Unlock()
-
-	var inheritedIP net.IP
-	var err error
-
-	if option.Config.EnableIPv4 {
-		if inheritIPAddrFromDevice != "" {
-			inheritedIP, err = firstGlobalV4Addr(inheritIPAddrFromDevice, GetK8sNodeIP(), !preferPublicIP)
-			if err != nil {
-				return fmt.Errorf("failed to determine IPv4 of %s for NodePort", inheritIPAddrFromDevice)
-			}
-		}
-		addrs.ipv4NodePortAddrs = make(map[string]net.IP, len(devices))
-		for _, device := range devices {
-			if inheritIPAddrFromDevice != "" {
-				addrs.ipv4NodePortAddrs[device] = inheritedIP
-			} else {
-				ip, err := firstGlobalV4Addr(device, GetK8sNodeIP(), !preferPublicIP)
-				if err != nil {
-					return fmt.Errorf("failed to determine IPv4 of %s for NodePort", device)
-				}
-				addrs.ipv4NodePortAddrs[device] = ip
-			}
-		}
-	}
-
-	if option.Config.EnableIPv6 {
-		if inheritIPAddrFromDevice != "" {
-			inheritedIP, err = firstGlobalV6Addr(inheritIPAddrFromDevice, GetK8sNodeIP(), !preferPublicIP)
-			if err != nil {
-				return fmt.Errorf("Failed to determine IPv6 of %s for NodePort", inheritIPAddrFromDevice)
-			}
-		}
-		addrs.ipv6NodePortAddrs = make(map[string]net.IP, len(devices))
-		for _, device := range devices {
-			if inheritIPAddrFromDevice != "" {
-				addrs.ipv6NodePortAddrs[device] = inheritedIP
-			} else {
-				ip, err := firstGlobalV6Addr(device, GetK8sNodeIP(), !preferPublicIP)
-				if err != nil {
-					return fmt.Errorf("Failed to determine IPv6 of %s for NodePort", device)
-				}
-				addrs.ipv6NodePortAddrs[device] = ip
-			}
-		}
-	}
-
-	return nil
-}
-
-// InitBPFMasqueradeAddrs initializes BPF masquerade addrs for the given devices.
-func InitBPFMasqueradeAddrs(devices []string) error {
-	addrsMu.Lock()
-	defer addrsMu.Unlock()
-
-	masqIPFromDevice := option.Config.DeriveMasqIPAddrFromDevice
-
-	if option.Config.EnableIPv4 {
-		addrs.ipv4MasqAddrs = make(map[string]net.IP, len(devices))
-		err := initMasqueradeV4Addrs(addrs.ipv4MasqAddrs, masqIPFromDevice, devices, logfields.IPv4)
-		if err != nil {
-			return err
-		}
-	}
-	if option.Config.EnableIPv6 {
-		addrs.ipv6MasqAddrs = make(map[string]net.IP, len(devices))
-		return initMasqueradeV6Addrs(addrs.ipv6MasqAddrs, masqIPFromDevice, devices, logfields.IPv6)
-	}
-
-	return nil
-}
-
 func clone(ip net.IP) net.IP {
 	if ip == nil {
 		return nil
@@ -249,16 +163,14 @@ func clone(ip net.IP) net.IP {
 
 // GetIPv4Loopback returns the loopback IPv4 address of this node.
 func GetIPv4Loopback() net.IP {
-	addrsMu.RLock()
-	defer addrsMu.RUnlock()
-	return clone(addrs.ipv4Loopback)
+	return getLocalNode().IPv4Loopback
 }
 
 // SetIPv4Loopback sets the loopback IPv4 address of this node.
 func SetIPv4Loopback(ip net.IP) {
-	addrsMu.Lock()
-	addrs.ipv4Loopback = clone(ip)
-	addrsMu.Unlock()
+	localNode.Update(func(n *LocalNode) {
+		n.IPv4Loopback = ip
+	})
 }
 
 // GetIPv4AllocRange returns the IPv4 allocation prefix of this node
@@ -269,6 +181,14 @@ func GetIPv4AllocRange() *cidr.CIDR {
 // GetIPv6AllocRange returns the IPv6 allocation prefix of this node
 func GetIPv6AllocRange() *cidr.CIDR {
 	return getLocalNode().IPv6AllocCIDR.DeepCopy()
+}
+
+// IsNodeIP determines if addr is one of the node's IP addresses,
+// and returns which type of address it is. "" is returned if addr
+// is not one of the node's IP addresses.
+func IsNodeIP(addr netip.Addr) addressing.AddressType {
+	n := getLocalNode()
+	return n.IsNodeIP(addr)
 }
 
 // GetIPv4 returns one of the IPv4 node address available with the following
@@ -330,22 +250,16 @@ func GetK8sExternalIPv4() net.IP {
 
 // GetRouterInfo returns additional information for the router, the cilium_host interface.
 func GetRouterInfo() RouterInfo {
-	addrsMu.RLock()
-	defer addrsMu.RUnlock()
+	addrs.mu.RLock()
+	defer addrs.mu.RUnlock()
 	return addrs.routerInfo
 }
 
 // SetRouterInfo sets additional information for the router, the cilium_host interface.
 func SetRouterInfo(info RouterInfo) {
-	addrsMu.Lock()
+	addrs.mu.Lock()
 	addrs.routerInfo = info
-	addrsMu.Unlock()
-}
-
-// GetHostMasqueradeIPv4 returns the IPv4 address to be used for masquerading
-// any traffic that is being forwarded from the host into the Cilium cluster.
-func GetHostMasqueradeIPv4() net.IP {
-	return GetInternalIPv4Router()
+	addrs.mu.Unlock()
 }
 
 // SetIPv4AllocRange sets the IPv4 address pool to use when allocating
@@ -356,56 +270,6 @@ func SetIPv4AllocRange(net *cidr.CIDR) {
 	})
 }
 
-// GetNodePortIPv4Addrs returns the node-port IPv4 address for NAT
-func GetNodePortIPv4Addrs() []net.IP {
-	addrsMu.RLock()
-	defer addrsMu.RUnlock()
-	addrs4 := make([]net.IP, 0, len(addrs.ipv4NodePortAddrs))
-	for _, addr := range addrs.ipv4NodePortAddrs {
-		addrs4 = append(addrs4, clone(addr))
-	}
-	return addrs4
-}
-
-// GetNodePortIPv4AddrsWithDevices returns the map iface => NodePort IPv4.
-func GetNodePortIPv4AddrsWithDevices() map[string]net.IP {
-	addrsMu.RLock()
-	defer addrsMu.RUnlock()
-	return copyStringToNetIPMap(addrs.ipv4NodePortAddrs)
-}
-
-// GetNodePortIPv6Addrs returns the node-port IPv6 address for NAT
-func GetNodePortIPv6Addrs() []net.IP {
-	addrsMu.RLock()
-	defer addrsMu.RUnlock()
-	addrs6 := make([]net.IP, 0, len(addrs.ipv6NodePortAddrs))
-	for _, addr := range addrs.ipv6NodePortAddrs {
-		addrs6 = append(addrs6, clone(addr))
-	}
-	return addrs6
-}
-
-// GetNodePortIPv6AddrsWithDevices returns the map iface => NodePort IPv6.
-func GetNodePortIPv6AddrsWithDevices() map[string]net.IP {
-	addrsMu.RLock()
-	defer addrsMu.RUnlock()
-	return copyStringToNetIPMap(addrs.ipv6NodePortAddrs)
-}
-
-// GetMasqIPv4AddrsWithDevices returns the map iface => BPF masquerade IPv4.
-func GetMasqIPv4AddrsWithDevices() map[string]net.IP {
-	addrsMu.RLock()
-	defer addrsMu.RUnlock()
-	return copyStringToNetIPMap(addrs.ipv4MasqAddrs)
-}
-
-// GetMasqIPv6AddrsWithDevices returns the map iface => BPF masquerade IPv6.
-func GetMasqIPv6AddrsWithDevices() map[string]net.IP {
-	addrsMu.RLock()
-	defer addrsMu.RUnlock()
-	return copyStringToNetIPMap(addrs.ipv6MasqAddrs)
-}
-
 // SetIPv6NodeRange sets the IPv6 address pool to be used on this node
 func SetIPv6NodeRange(net *cidr.CIDR) {
 	localNode.Update(func(n *LocalNode) {
@@ -414,8 +278,8 @@ func SetIPv6NodeRange(net *cidr.CIDR) {
 }
 
 // AutoComplete completes the parts of addressing that can be auto derived
-func AutoComplete() error {
-	InitDefaultPrefix(option.Config.DirectRoutingDevice)
+func AutoComplete(directRoutingDevice string) error {
+	initDefaultPrefix(directRoutingDevice)
 
 	if option.Config.EnableIPv6 && GetIPv6AllocRange() == nil {
 		return fmt.Errorf("IPv6 allocation CIDR is not configured. Please specify --%s", option.IPv6Range)
@@ -448,12 +312,6 @@ func ValidatePostInit() error {
 func GetIPv6() net.IP {
 	n := getLocalNode()
 	return clone(n.GetNodeIP(true))
-}
-
-// GetHostMasqueradeIPv6 returns the IPv6 address to be used for masquerading
-// any traffic that is being forwarded from the host into the Cilium cluster.
-func GetHostMasqueradeIPv6() net.IP {
-	return GetIPv6Router()
 }
 
 // GetIPv6Router returns the IPv6 address of the router, e.g. address
@@ -578,10 +436,6 @@ func getCiliumHostIPsFromFile(nodeConfig string) (ipv4GW, ipv6Router net.IP) {
 // the node_config.h file if is present; or by deriving it from
 // defaults.HostDevice interface, on which only the IPv4 is possible to derive.
 func ExtractCiliumHostIPFromFS() (ipv4GW, ipv6Router net.IP) {
-	if !option.Config.EnableHostIPRestore {
-		return nil, nil
-	}
-
 	nodeConfig := option.Config.GetNodeConfigPath()
 	ipv4GW, ipv6Router = getCiliumHostIPsFromFile(nodeConfig)
 	if ipv4GW != nil || ipv6Router != nil {
@@ -603,11 +457,6 @@ func SetIPsecKeyIdentity(id uint8) {
 	})
 }
 
-// GetIPsecKeyIdentity returns the IPsec key identity of the node
-func GetIPsecKeyIdentity() uint8 {
-	return getLocalNode().EncryptionKey
-}
-
 // GetK8sNodeIPs returns k8s Node IP addr.
 func GetK8sNodeIP() net.IP {
 	n := getLocalNode()
@@ -620,12 +469,6 @@ func GetWireguardPubKey() string {
 
 func GetOptOutNodeEncryption() bool {
 	return getLocalNode().OptOutNodeEncryption
-}
-
-func SetOptOutNodeEncryption(b bool) {
-	localNode.Update(func(node *LocalNode) {
-		node.OptOutNodeEncryption = b
-	})
 }
 
 // SetEndpointHealthIPv4 sets the IPv4 cilium-health endpoint address.
@@ -676,30 +519,22 @@ func GetIngressIPv6() net.IP {
 	return getLocalNode().IPv6IngressIP
 }
 
-// GetEncryptKeyIndex returns the encryption key value for the local node.
-// With IPSec encryption, this is equivalent to GetIPsecKeyIdentity().
-// With WireGuard encryption, this function returns a non-zero static value
-// if the local node has WireGuard enabled.
-func GetEncryptKeyIndex() uint8 {
+// GetEndpointEncryptKeyIndex returns the encryption key value for an endpoint
+// owned by the local node.
+// With IPSec encryption, this is the ID of the currently loaded key.
+// With WireGuard, this returns a non-zero static value.
+// Note that the key index returned by this function is only valid for _endpoints_
+// of the local node. If you want to obtain the key index of the local node itself,
+// access the `EncryptionKey` field via the LocalNodeStore.
+func GetEndpointEncryptKeyIndex() uint8 {
 	switch {
 	case option.Config.EnableIPSec:
-		return GetIPsecKeyIdentity()
+		return getLocalNode().EncryptionKey
 	case option.Config.EnableWireguard:
-		if len(GetWireguardPubKey()) > 0 {
-			return wgTypes.StaticEncryptKey
-		}
+		return wgTypes.StaticEncryptKey
+
 	}
 	return 0
-}
-
-func copyStringToNetIPMap(in map[string]net.IP) map[string]net.IP {
-	out := make(map[string]net.IP, len(in))
-	for iface, ip := range in {
-		dup := make(net.IP, len(ip))
-		copy(dup, ip)
-		out[iface] = dup
-	}
-	return out
 }
 
 // WithTestLocalNodeStore sets the 'localNode' to a temporary instance and

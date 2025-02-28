@@ -1,11 +1,40 @@
 /* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
 /* Copyright Authors of Cilium */
 
-#ifndef __LIB_PCAP_H_
-#define __LIB_PCAP_H_
+#pragma once
 
 #include <bpf/ctx/ctx.h>
 #include <bpf/api.h>
+
+struct capture_rule {
+	__u16 rule_id;
+	__u16 reserved;
+	__u32 cap_len;
+};
+
+/* 5-tuple wildcard key / mask. */
+struct capture4_wcard {
+	__be32 saddr;   /* masking: prefix */
+	__be32 daddr;   /* masking: prefix */
+	__be16 sport;   /* masking: 0 or 0xffff */
+	__be16 dport;   /* masking: 0 or 0xffff */
+	__u8   nexthdr; /* masking: 0 or 0xff */
+	__u8   smask;   /* prefix len: saddr */
+	__u8   dmask;   /* prefix len: daddr */
+	__u8   flags;   /* reserved: 0 */
+};
+
+/* 5-tuple wildcard key / mask. */
+struct capture6_wcard {
+	union v6addr saddr; /* masking: prefix */
+	union v6addr daddr; /* masking: prefix */
+	__be16 sport;       /* masking: 0 or 0xffff */
+	__be16 dport;       /* masking: 0 or 0xffff */
+	__u8   nexthdr;     /* masking: 0 or 0xff */
+	__u8   smask;       /* prefix len: saddr */
+	__u8   dmask;       /* prefix len: daddr */
+	__u8   flags;       /* reserved: 0 */
+};
 
 #ifdef ENABLE_CAPTURE
 #include "common.h"
@@ -65,8 +94,8 @@ static __always_inline void cilium_capture(struct __ctx_buff *ctx,
 			.to	= {
 				.tv_boot = tstamp,
 			},
-			.caplen	= cap_len,
-			.len	= ctx_len,
+			.caplen	= (__u32)cap_len,
+			.len	= (__u32)ctx_len,
 		},
 	};
 
@@ -114,36 +143,6 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 	__uint(max_entries, 1);
 } cilium_capture_cache __section_maps_btf;
-
-struct capture_rule {
-	__u16 rule_id;
-	__u16 reserved;
-	__u32 cap_len;
-};
-
-/* 5-tuple wildcard key / mask. */
-struct capture4_wcard {
-	__be32 saddr;   /* masking: prefix */
-	__be32 daddr;   /* masking: prefix */
-	__be16 sport;   /* masking: 0 or 0xffff */
-	__be16 dport;   /* masking: 0 or 0xffff */
-	__u8   nexthdr; /* masking: 0 or 0xff */
-	__u8   smask;   /* prefix len: saddr */
-	__u8   dmask;   /* prefix len: daddr */
-	__u8   flags;   /* reserved: 0 */
-};
-
-/* 5-tuple wildcard key / mask. */
-struct capture6_wcard {
-	union v6addr saddr; /* masking: prefix */
-	union v6addr daddr; /* masking: prefix */
-	__be16 sport;       /* masking: 0 or 0xffff */
-	__be16 dport;       /* masking: 0 or 0xffff */
-	__u8   nexthdr;     /* masking: 0 or 0xff */
-	__u8   smask;       /* prefix len: saddr */
-	__u8   dmask;       /* prefix len: daddr */
-	__u8   flags;       /* reserved: 0 */
-};
 
 #ifdef ENABLE_IPV4
 struct {
@@ -489,4 +488,3 @@ cilium_capture_out(struct __ctx_buff *ctx __maybe_unused)
 }
 
 #endif /* ENABLE_CAPTURE */
-#endif /* __LIB_PCAP_H_ */

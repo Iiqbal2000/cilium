@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"sync"
 
 	"github.com/cilium/lumberjack/v2"
 	"github.com/sirupsen/logrus"
@@ -20,8 +19,6 @@ import (
 var (
 	log       = logging.DefaultLogger.WithField(logfields.LogSubsys, subsystem)
 	policyLog = logrus.New()
-
-	policyLogOnce sync.Once
 )
 
 const (
@@ -95,21 +92,6 @@ func (e *Endpoint) UpdateLogger(fields map[string]interface{}) {
 		return
 	}
 
-	// default to a new default logger
-	baseLogger := logging.InitializeDefaultLogger()
-
-	// Set log format based on daemon config
-	baseLogger.SetFormatter(logging.GetFormatter(
-		logging.LogOptions(option.Config.LogOpt).GetLogFormat(),
-	))
-
-	// If this endpoint is set to debug ensure it will print debug by giving it
-	// an independent logger.
-	// If this endpoint is not set to debug, it will use the log level set by the user.
-	if e.Options != nil && e.Options.IsEnabled(option.Debug) {
-		baseLogger.SetLevel(logrus.DebugLevel)
-	}
-
 	// When adding new fields, make sure they are abstracted by a setter
 	// and update the logger when the value is set.
 	f := logrus.Fields{
@@ -129,7 +111,17 @@ func (e *Endpoint) UpdateLogger(fields map[string]interface{}) {
 		f[logfields.Identity] = e.SecurityIdentity.ID.StringID()
 	}
 
-	e.logger.Store(baseLogger.WithFields(f))
+	// Inherit properties from default logger.
+	baseLogger := logging.DefaultLogger.WithFields(f)
+
+	// If this endpoint is set to debug ensure it will print debug by giving it
+	// an independent logger.
+	// If this endpoint is not set to debug, it will use the log level set by the user.
+	if e.Options != nil && e.Options.IsEnabled(option.Debug) {
+		baseLogger.Logger.SetLevel(logrus.DebugLevel)
+	}
+
+	e.logger.Store(baseLogger)
 }
 
 // Only to be called from UpdateLogger() above
@@ -137,30 +129,30 @@ func (e *Endpoint) updatePolicyLogger(fields map[string]interface{}) {
 	policyLogger := e.policyLogger.Load()
 	// e.Options check needed for unit testing.
 	if policyLogger == nil && e.Options != nil && e.Options.IsEnabled(option.DebugPolicy) {
-		policyLogOnce.Do(func() {
-			maxSize := 10 // 10 MB
-			if ms := os.Getenv("CILIUM_DBG_POLICY_LOG_MAX_SIZE"); ms != "" {
-				if ms, err := strconv.Atoi(ms); err == nil {
-					maxSize = ms
-				}
+		maxSize := 10 // 10 MB
+		if ms := os.Getenv("CILIUM_DBG_POLICY_LOG_MAX_SIZE"); ms != "" {
+			if ms, err := strconv.Atoi(ms); err == nil {
+				maxSize = ms
 			}
-			maxBackups := 3
-			if mb := os.Getenv("CILIUM_DBG_POLICY_LOG_MAX_BACKUPS"); mb != "" {
-				if mb, err := strconv.Atoi(mb); err == nil {
-					maxBackups = mb
-				}
+		}
+		maxBackups := 3
+		if mb := os.Getenv("CILIUM_DBG_POLICY_LOG_MAX_BACKUPS"); mb != "" {
+			if mb, err := strconv.Atoi(mb); err == nil {
+				maxBackups = mb
 			}
-			lumberjackLogger := &lumberjack.Logger{
-				Filename:   filepath.Join(option.Config.StateDir, "endpoint-policy.log"),
-				MaxSize:    maxSize,
-				MaxBackups: maxBackups,
-				MaxAge:     28, // days
-				LocalTime:  true,
-				Compress:   true,
-			}
-			policyLog.SetOutput(lumberjackLogger)
-			policyLog.SetLevel(logrus.DebugLevel)
-		})
+		}
+		lumberjackLogger := &lumberjack.Logger{
+			Filename:   filepath.Join(option.Config.StateDir, "endpoint-policy.log"),
+			MaxSize:    maxSize,
+			MaxBackups: maxBackups,
+			MaxAge:     28, // days
+			LocalTime:  true,
+			Compress:   true,
+		}
+		policyLog.SetOutput(lumberjackLogger)
+		policyLog.SetLevel(logrus.DebugLevel)
+		policyLog.SetFormatter(logging.GetFormatter(logging.DefaultLogFormatTimestamp))
+
 		policyLogger = logrus.NewEntry(policyLog)
 	}
 	if policyLogger == nil || e.Options == nil {
@@ -184,7 +176,7 @@ func (e *Endpoint) updatePolicyLogger(fields map[string]interface{}) {
 		}
 
 		if e.SecurityIdentity != nil {
-			f[logfields.Identity] = e.SecurityIdentity.ID.StringID
+			f[logfields.Identity] = e.SecurityIdentity.ID
 		}
 
 		policyLogger = policyLogger.WithFields(f)

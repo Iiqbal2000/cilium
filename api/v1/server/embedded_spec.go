@@ -37,7 +37,7 @@ func init() {
   "paths": {
     "/bgp/peers": {
       "get": {
-        "description": "Retrieves current operational state of BGP peers created by \nCilium BGP virtual router. This includes session state, uptime,\ninformation per address family, etc.\n",
+        "description": "Retrieves current operational state of BGP peers created by\nCilium BGP virtual router. This includes session state, uptime,\ninformation per address family, etc.\n",
         "tags": [
           "bgp"
         ],
@@ -396,7 +396,10 @@ func init() {
         ],
         "responses": {
           "201": {
-            "description": "Created"
+            "description": "Created",
+            "schema": {
+              "$ref": "#/definitions/Endpoint"
+            }
           },
           "400": {
             "description": "Invalid endpoint in request",
@@ -844,31 +847,6 @@ func init() {
         }
       }
     },
-    "/health": {
-      "get": {
-        "description": "Returns modules health and status information of the Cilium daemon.\n",
-        "tags": [
-          "daemon"
-        ],
-        "summary": "Get modules health of Cilium daemon",
-        "parameters": [
-          {
-            "type": "boolean",
-            "description": "Brief is a brief representation of the Cilium status.\n",
-            "name": "brief",
-            "in": "header"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Success",
-            "schema": {
-              "$ref": "#/definitions/ModulesHealth"
-            }
-          }
-        }
-      }
-    },
     "/healthz": {
       "get": {
         "description": "Returns health and status information of the Cilium daemon and related\ncomponents such as the local container runtime, connected datastore,\nKubernetes integration and Hubble.\n",
@@ -881,6 +859,13 @@ func init() {
             "type": "boolean",
             "description": "Brief will return a brief representation of the Cilium status.\n",
             "name": "brief",
+            "in": "header"
+          },
+          {
+            "type": "boolean",
+            "default": true,
+            "description": "If set to true, failure of the agent to connect to the Kubernetes control plane will cause the agent's health status to also fail.\n",
+            "name": "require-k8s-connectivity",
             "in": "header"
           }
         ],
@@ -1009,6 +994,9 @@ func init() {
         "parameters": [
           {
             "$ref": "#/parameters/cidr"
+          },
+          {
+            "$ref": "#/parameters/labels"
           }
         ],
         "responses": {
@@ -1242,28 +1230,6 @@ func init() {
           },
           "404": {
             "description": "Map not found"
-          }
-        }
-      }
-    },
-    "/metrics/": {
-      "get": {
-        "tags": [
-          "metrics"
-        ],
-        "summary": "Retrieve cilium metrics",
-        "responses": {
-          "200": {
-            "description": "Success",
-            "schema": {
-              "type": "array",
-              "items": {
-                "$ref": "#/definitions/Metric"
-              }
-            }
-          },
-          "500": {
-            "description": "Metrics cannot be retrieved"
           }
         }
       }
@@ -1767,69 +1733,6 @@ func init() {
           }
         }
       }
-    },
-    "/statedb/dump": {
-      "get": {
-        "produces": [
-          "application/octet-stream"
-        ],
-        "tags": [
-          "statedb"
-        ],
-        "summary": "Dump StateDB contents",
-        "responses": {
-          "200": {
-            "description": "Success",
-            "schema": {
-              "type": "string",
-              "format": "binary"
-            }
-          }
-        }
-      }
-    },
-    "/statedb/query/{table}": {
-      "get": {
-        "produces": [
-          "application/octet-stream"
-        ],
-        "tags": [
-          "statedb"
-        ],
-        "summary": "Perform a query against a StateDB table",
-        "parameters": [
-          {
-            "$ref": "#/parameters/statedb-table"
-          },
-          {
-            "$ref": "#/parameters/statedb-index"
-          },
-          {
-            "$ref": "#/parameters/statedb-key"
-          },
-          {
-            "$ref": "#/parameters/statedb-lowerbound"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Success",
-            "schema": {
-              "type": "string",
-              "format": "binary"
-            }
-          },
-          "400": {
-            "description": "Invalid parameters",
-            "schema": {
-              "$ref": "#/definitions/Error"
-            }
-          },
-          "404": {
-            "description": "Table or Index not found"
-          }
-        }
-      }
     }
   },
   "definitions": {
@@ -1873,6 +1776,14 @@ func init() {
       "additionalProperties": {
         "type": "string"
       }
+    },
+    "AttachMode": {
+      "description": "Core datapath attachment mode",
+      "type": "string",
+      "enum": [
+        "tc",
+        "tcx"
+      ]
     },
     "BPFMap": {
       "description": "BPF map definition and content",
@@ -1986,6 +1897,10 @@ func init() {
           "description": "Indicator if this backend is preferred in the context of clustermesh service affinity. The value is set based\non related annotation of global service. Applicable for active state only.",
           "type": "boolean"
         },
+        "protocol": {
+          "description": "Layer 4 protocol (TCP, UDP, etc)",
+          "type": "string"
+        },
         "state": {
           "description": "State of the backend for load-balancing service traffic",
           "type": "string",
@@ -2001,6 +1916,10 @@ func init() {
           "type": "integer",
           "format": "uint16",
           "x-nullable": true
+        },
+        "zone": {
+          "description": "Optional name of the zone in which this backend runs",
+          "type": "string"
         }
       }
     },
@@ -2041,14 +1960,14 @@ func init() {
       }
     },
     "BgpGracefulRestart": {
-      "description": "BGP graceful restart parameters negotiated with the peer.\n\n+k8s:deepcopy-gen=true",
+      "description": "BGP graceful restart parameters negotiated with the peer.",
       "properties": {
         "enabled": {
-          "description": "When set, graceful restart capability is negotiated for all AFI/SAFIs of \nthis peer.",
+          "description": "When set, graceful restart capability is negotiated for all AFI/SAFIs of\nthis peer.",
           "type": "boolean"
         },
         "restart-time-seconds": {
-          "description": "This is the time advertised to peer for the BGP session to be re-established \nafter a restart. After this period, peer will remove stale routes. \n(RFC 4724 section 4.2)",
+          "description": "This is the time advertised to peer for the BGP session to be re-established\nafter a restart. After this period, peer will remove stale routes.\n(RFC 4724 section 4.2)",
           "type": "integer"
         }
       }
@@ -2174,7 +2093,7 @@ func init() {
       }
     },
     "BgpPeerFamilies": {
-      "description": "BGP AFI SAFI state of the peer\n\n+k8s:deepcopy-gen=true",
+      "description": "BGP AFI SAFI state of the peer",
       "properties": {
         "accepted": {
           "description": "Number of routes accepted from the peer of this address family",
@@ -2201,6 +2120,10 @@ func init() {
     "BgpRoute": {
       "description": "Single BGP route retrieved from the RIB of underlying router",
       "properties": {
+        "neighbor": {
+          "description": "IP address specifying a BGP neighbor if the source table type is adj-rib-in or adj-rib-out",
+          "type": "string"
+        },
         "paths": {
           "description": "List of routing paths leading towards the prefix",
           "type": "array",
@@ -2280,6 +2203,13 @@ func init() {
             "type": "string"
           }
         },
+        "match-families": {
+          "description": "Matches any of the provided address families. If empty matches all address families.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/BgpFamily"
+          }
+        },
         "match-neighbors": {
           "description": "Matches any of the provided BGP neighbor IP addresses. If empty matches all neighbors.",
           "type": "array",
@@ -2325,7 +2255,7 @@ func init() {
       }
     },
     "CIDRPolicy": {
-      "description": "CIDR endpoint policy\n\n+k8s:deepcopy-gen=true",
+      "description": "CIDR endpoint policy",
       "type": "object",
       "properties": {
         "egress": {
@@ -2345,7 +2275,7 @@ func init() {
       }
     },
     "CNIChainingStatus": {
-      "description": "Status of CNI chaining\n\n+k8s:deepcopy-gen=true",
+      "description": "Status of CNI chaining",
       "properties": {
         "mode": {
           "type": "string",
@@ -2409,7 +2339,7 @@ func init() {
       }
     },
     "ClockSource": {
-      "description": "Status of BPF clock source\n\n+k8s:deepcopy-gen=true",
+      "description": "Status of BPF clock source",
       "type": "object",
       "properties": {
         "hertz": {
@@ -2697,9 +2627,21 @@ func init() {
           "description": "Configured compatibility mode for --egress-multi-home-ip-rule-compat",
           "type": "boolean"
         },
+        "enableRouteMTUForCNIChaining": {
+          "description": "Enable route MTU for pod netns when CNI chaining is used",
+          "type": "boolean"
+        },
         "immutable": {
           "description": "Immutable configuration (read-only)",
           "$ref": "#/definitions/ConfigurationMap"
+        },
+        "installUplinkRoutesForDelegatedIPAM": {
+          "description": "Install ingress/egress routes through uplink on host for Pods when working with\ndelegated IPAM plugin.\n",
+          "type": "boolean"
+        },
+        "ipLocalReservedPorts": {
+          "description": "Comma-separated list of IP ports should be reserved in the workload network namespace",
+          "type": "string"
         },
         "ipam-mode": {
           "description": "Configured IPAM mode",
@@ -2749,7 +2691,9 @@ func init() {
       "description": "Datapath mode",
       "type": "string",
       "enum": [
-        "veth"
+        "veth",
+        "netkit",
+        "netkit-l2"
       ]
     },
     "DebugInfo": {
@@ -2812,6 +2756,10 @@ func init() {
     "EncryptionStatus": {
       "description": "Status of transparent encryption\n\n+k8s:deepcopy-gen=true",
       "properties": {
+        "ipsec": {
+          "description": "Status of the IPsec agent",
+          "$ref": "#/definitions/IPsecStatus"
+        },
         "mode": {
           "type": "string",
           "enum": [
@@ -2821,7 +2769,7 @@ func init() {
           ]
         },
         "msg": {
-          "description": "Human readable status/error/warning message",
+          "description": "Human readable error/warning message",
           "type": "string"
         },
         "wireguard": {
@@ -2923,6 +2871,10 @@ func init() {
           "description": "Kubernetes pod name",
           "type": "string"
         },
+        "k8s-uid": {
+          "description": "Kubernetes pod UID",
+          "type": "string"
+        },
         "labels": {
           "description": "Labels describing the identity",
           "$ref": "#/definitions/Labels"
@@ -2931,6 +2883,14 @@ func init() {
           "description": "MAC address",
           "type": "string"
         },
+        "netns-cookie": {
+          "description": "Network namespace cookie",
+          "type": "string"
+        },
+        "parent-interface-index": {
+          "description": "Index of network device from which an IP was used as endpoint IP. Only relevant for ENI environments.",
+          "type": "integer"
+        },
         "pid": {
           "description": "Process ID of the workload belonging to this endpoint",
           "type": "integer"
@@ -2938,6 +2898,12 @@ func init() {
         "policy-enabled": {
           "description": "Whether policy enforcement is enabled or not",
           "type": "boolean"
+        },
+        "properties": {
+          "description": "Properties is used to store information about the endpoint at creation. Useful for tests.",
+          "additionalProperties": {
+            "type": "object"
+          }
         },
         "state": {
           "description": "Current state of endpoint",
@@ -3118,7 +3084,7 @@ func init() {
       }
     },
     "EndpointPolicy": {
-      "description": "Policy information of an endpoint\n\n+k8s:deepcopy-gen=true",
+      "description": "Policy information of an endpoint",
       "type": "object",
       "properties": {
         "allowed-egress-identities": {
@@ -3381,20 +3347,6 @@ func init() {
         }
       }
     },
-    "HostRouting": {
-      "description": "Status of host routing\n\n+k8s:deepcopy-gen=true",
-      "type": "object",
-      "properties": {
-        "mode": {
-          "description": "Datapath routing mode",
-          "type": "string",
-          "enum": [
-            "BPF",
-            "Legacy"
-          ]
-        }
-      }
-    },
     "HubbleStatus": {
       "description": "Status of the Hubble server\n\n+k8s:deepcopy-gen=true",
       "type": "object",
@@ -3581,7 +3533,7 @@ func init() {
       }
     },
     "IPV4BigTCP": {
-      "description": "Status of IPv4 BIG TCP\n\n+k8s:deepcopy-gen=true",
+      "description": "Status of IPv4 BIG TCP",
       "type": "object",
       "properties": {
         "enabled": {
@@ -3599,7 +3551,7 @@ func init() {
       }
     },
     "IPV6BigTCP": {
-      "description": "Status of IPv6 BIG TCP\n\n+k8s:deepcopy-gen=true",
+      "description": "Status of IPv6 BIG TCP",
       "type": "object",
       "properties": {
         "enabled": {
@@ -3613,6 +3565,37 @@ func init() {
         "maxGSO": {
           "description": "Maximum IPv6 GSO size",
           "type": "integer"
+        }
+      }
+    },
+    "IPsecStatus": {
+      "description": "Status of the IPsec agent\n\n+k8s:deepcopy-gen=true",
+      "properties": {
+        "decrypt-interfaces": {
+          "description": "IPsec decryption interfaces",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "error-count": {
+          "description": "IPsec error count",
+          "type": "integer"
+        },
+        "keys-in-use": {
+          "description": "IPsec keys in use",
+          "type": "integer"
+        },
+        "max-seq-number": {
+          "description": "IPsec max sequence number",
+          "type": "string"
+        },
+        "xfrm-errors": {
+          "description": "IPsec XFRM errors",
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer"
+          }
         }
       }
     },
@@ -3649,7 +3632,7 @@ func init() {
       }
     },
     "IdentityRange": {
-      "description": "Status of identity range of the cluster\n\n+k8s:deepcopy-gen=true",
+      "description": "Status of identity range of the cluster",
       "properties": {
         "max-identity": {
           "description": "Maximum identity of the cluster",
@@ -3740,12 +3723,17 @@ func init() {
           "description": "\n\n+k8s:deepcopy-gen=true",
           "type": "object",
           "properties": {
+            "annotations": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
             "bpfSocketLBHostnsOnly": {
               "description": "flag bpf-lb-sock-hostns-only",
               "type": "boolean"
             },
             "externalIPs": {
-              "description": "\n\n+k8s:deepcopy-gen=true",
               "type": "object",
               "properties": {
                 "enabled": {
@@ -3754,7 +3742,6 @@ func init() {
               }
             },
             "gracefulTermination": {
-              "description": "\n\n+k8s:deepcopy-gen=true",
               "type": "object",
               "properties": {
                 "enabled": {
@@ -3763,7 +3750,6 @@ func init() {
               }
             },
             "hostPort": {
-              "description": "\n\n+k8s:deepcopy-gen=true",
               "type": "object",
               "properties": {
                 "enabled": {
@@ -3809,7 +3795,6 @@ func init() {
                   }
                 },
                 "service": {
-                  "description": "\n\n+k8s:deepcopy-gen=true",
                   "type": "object",
                   "properties": {
                     "enabled": {
@@ -3820,7 +3805,6 @@ func init() {
               }
             },
             "nodePort": {
-              "description": "\n\n+k8s:deepcopy-gen=true",
               "type": "object",
               "properties": {
                 "acceleration": {
@@ -3870,7 +3854,6 @@ func init() {
               }
             },
             "sessionAffinity": {
-              "description": "\n\n+k8s:deepcopy-gen=true",
               "type": "object",
               "properties": {
                 "enabled": {
@@ -3879,7 +3862,6 @@ func init() {
               }
             },
             "socketLB": {
-              "description": "\n\n+k8s:deepcopy-gen=true",
               "type": "object",
               "properties": {
                 "enabled": {
@@ -3888,7 +3870,6 @@ func init() {
               }
             },
             "socketLBTracing": {
-              "description": "\n\n+k8s:deepcopy-gen=true",
               "type": "object",
               "properties": {
                 "enabled": {
@@ -3901,10 +3882,6 @@ func init() {
         "mode": {
           "type": "string",
           "enum": [
-            "Disabled",
-            "Strict",
-            "Probe",
-            "Partial",
             "True",
             "False"
           ]
@@ -3912,7 +3889,7 @@ func init() {
       }
     },
     "L4Policy": {
-      "description": "L4 endpoint policy\n\n+k8s:deepcopy-gen=true",
+      "description": "L4 endpoint policy",
       "type": "object",
       "properties": {
         "egress": {
@@ -4186,43 +4163,6 @@ func init() {
         }
       }
     },
-    "ModuleHealth": {
-      "description": "Report module health status",
-      "properties": {
-        "last-ok": {
-          "description": "Time at which the last OK check occurred",
-          "type": "string"
-        },
-        "last-updated": {
-          "description": "Time of last health update",
-          "type": "string"
-        },
-        "level": {
-          "description": "Describes the health status level",
-          "type": "string"
-        },
-        "message": {
-          "description": "Reports the associated health message",
-          "type": "string"
-        },
-        "module-id": {
-          "description": "Describes the module identitier",
-          "type": "string"
-        }
-      }
-    },
-    "ModulesHealth": {
-      "description": "Reports health status of agent's modules",
-      "properties": {
-        "modules": {
-          "description": "List out modules health status",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/ModuleHealth"
-          }
-        }
-      }
-    },
     "MonitorStatus": {
       "description": "Status of the node monitor",
       "properties": {
@@ -4377,7 +4317,7 @@ func init() {
       }
     },
     "PolicyRule": {
-      "description": "A policy rule including the rule labels it derives from\n\n+k8s:deepcopy-gen=true",
+      "description": "A policy rule including the rule labels it derives from",
       "properties": {
         "derived-from-rules": {
           "description": "The policy rule labels identifying the policy rules this rule derives from",
@@ -4734,6 +4674,10 @@ func init() {
           "description": "Number of nodes in the cluster",
           "type": "integer"
         },
+        "num-service-exports": {
+          "description": "Number of MCS-API service exports in the cluster",
+          "type": "integer"
+        },
         "num-shared-services": {
           "description": "Number of services in the cluster",
           "type": "integer"
@@ -4771,6 +4715,11 @@ func init() {
           "description": "Whether the configuration has been correctly retrieved",
           "type": "boolean"
         },
+        "service-exports-enabled": {
+          "description": "Whether or not MCS-API ServiceExports is enabled by the cluster (null means unsupported).",
+          "type": "boolean",
+          "x-nullable": true
+        },
         "sync-canaries": {
           "description": "Whether the remote cluster supports per-prefix \"synced\" canaries",
           "type": "boolean"
@@ -4792,6 +4741,11 @@ func init() {
           "description": "Nodes synchronization status",
           "type": "boolean"
         },
+        "service-exports": {
+          "description": "MCS-API service exports synchronization status (null means that the component is not watching service exports)",
+          "type": "boolean",
+          "x-nullable": true
+        },
         "services": {
           "description": "Services synchronization status",
           "type": "boolean"
@@ -4807,6 +4761,32 @@ func init() {
         },
         "responses": {
           "$ref": "#/definitions/MessageForwardingStatistics"
+        }
+      }
+    },
+    "Routing": {
+      "description": "Status of routing",
+      "type": "object",
+      "properties": {
+        "inter-host-routing-mode": {
+          "description": "Datapath routing mode for cross-cluster connectivity",
+          "type": "string",
+          "enum": [
+            "Native",
+            "Tunnel"
+          ]
+        },
+        "intra-host-routing-mode": {
+          "description": "Datapath routing mode for connectivity within the host",
+          "type": "string",
+          "enum": [
+            "BPF",
+            "Legacy"
+          ]
+        },
+        "tunnel-protocol": {
+          "description": "Tunnel protocol in use for cross-cluster connectivity",
+          "type": "string"
         }
       }
     },
@@ -4974,7 +4954,7 @@ func init() {
       }
     },
     "Srv6": {
-      "description": "Status of the SRv6\n\n+k8s:deepcopy-gen=true",
+      "description": "Status of the SRv6",
       "type": "object",
       "properties": {
         "enabled": {
@@ -5035,6 +5015,10 @@ func init() {
       "description": "Health and status information of daemon\n\n+k8s:deepcopy-gen=true",
       "type": "object",
       "properties": {
+        "attach-mode": {
+          "description": "Status of core datapath attachment mode",
+          "$ref": "#/definitions/AttachMode"
+        },
         "auth-certificate-provider": {
           "description": "Status of Mutual Authentication certificate provider",
           "$ref": "#/definitions/Status"
@@ -5083,6 +5067,10 @@ func init() {
           "description": "Status of all endpoint controllers",
           "$ref": "#/definitions/ControllerStatuses"
         },
+        "datapath-mode": {
+          "description": "Status of datapath mode",
+          "$ref": "#/definitions/DatapathMode"
+        },
         "encryption": {
           "description": "Status of transparent encryption",
           "$ref": "#/definitions/EncryptionStatus"
@@ -5090,10 +5078,6 @@ func init() {
         "host-firewall": {
           "description": "Status of the host firewall",
           "$ref": "#/definitions/HostFirewall"
-        },
-        "host-routing": {
-          "description": "Status of host routing",
-          "$ref": "#/definitions/HostRouting"
         },
         "hubble": {
           "description": "Status of Hubble server",
@@ -5138,6 +5122,10 @@ func init() {
         "proxy": {
           "description": "Status of proxy",
           "$ref": "#/definitions/ProxyStatus"
+        },
+        "routing": {
+          "description": "Status of routing",
+          "$ref": "#/definitions/Routing"
         },
         "srv6": {
           "description": "Status of SRv6",
@@ -5490,34 +5478,6 @@ func init() {
       "name": "source",
       "in": "query"
     },
-    "statedb-index": {
-      "type": "string",
-      "description": "StateDB index name",
-      "name": "index",
-      "in": "query",
-      "required": true
-    },
-    "statedb-key": {
-      "type": "string",
-      "description": "Query key (base64 encoded)",
-      "name": "key",
-      "in": "query",
-      "required": true
-    },
-    "statedb-lowerbound": {
-      "type": "boolean",
-      "description": "If true perform a LowerBound search",
-      "name": "lowerbound",
-      "in": "query",
-      "required": true
-    },
-    "statedb-table": {
-      "type": "string",
-      "description": "StateDB table name",
-      "name": "table",
-      "in": "path",
-      "required": true
-    },
     "trace-selector": {
       "description": "Context to provide policy evaluation on",
       "name": "trace-selector",
@@ -5548,7 +5508,7 @@ func init() {
   "paths": {
     "/bgp/peers": {
       "get": {
-        "description": "Retrieves current operational state of BGP peers created by \nCilium BGP virtual router. This includes session state, uptime,\ninformation per address family, etc.\n",
+        "description": "Retrieves current operational state of BGP peers created by\nCilium BGP virtual router. This includes session state, uptime,\ninformation per address family, etc.\n",
         "tags": [
           "bgp"
         ],
@@ -5956,7 +5916,10 @@ func init() {
         ],
         "responses": {
           "201": {
-            "description": "Created"
+            "description": "Created",
+            "schema": {
+              "$ref": "#/definitions/Endpoint"
+            }
           },
           "400": {
             "description": "Invalid endpoint in request",
@@ -6466,31 +6429,6 @@ func init() {
         }
       }
     },
-    "/health": {
-      "get": {
-        "description": "Returns modules health and status information of the Cilium daemon.\n",
-        "tags": [
-          "daemon"
-        ],
-        "summary": "Get modules health of Cilium daemon",
-        "parameters": [
-          {
-            "type": "boolean",
-            "description": "Brief is a brief representation of the Cilium status.\n",
-            "name": "brief",
-            "in": "header"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Success",
-            "schema": {
-              "$ref": "#/definitions/ModulesHealth"
-            }
-          }
-        }
-      }
-    },
     "/healthz": {
       "get": {
         "description": "Returns health and status information of the Cilium daemon and related\ncomponents such as the local container runtime, connected datastore,\nKubernetes integration and Hubble.\n",
@@ -6503,6 +6441,13 @@ func init() {
             "type": "boolean",
             "description": "Brief will return a brief representation of the Cilium status.\n",
             "name": "brief",
+            "in": "header"
+          },
+          {
+            "type": "boolean",
+            "default": true,
+            "description": "If set to true, failure of the agent to connect to the Kubernetes control plane will cause the agent's health status to also fail.\n",
+            "name": "require-k8s-connectivity",
             "in": "header"
           }
         ],
@@ -6643,6 +6588,14 @@ func init() {
             "description": "A CIDR range of IPs",
             "name": "cidr",
             "in": "query"
+          },
+          {
+            "description": "List of labels\n",
+            "name": "labels",
+            "in": "body",
+            "schema": {
+              "$ref": "#/definitions/Labels"
+            }
           }
         ],
         "responses": {
@@ -6913,28 +6866,6 @@ func init() {
           },
           "404": {
             "description": "Map not found"
-          }
-        }
-      }
-    },
-    "/metrics/": {
-      "get": {
-        "tags": [
-          "metrics"
-        ],
-        "summary": "Retrieve cilium metrics",
-        "responses": {
-          "200": {
-            "description": "Success",
-            "schema": {
-              "type": "array",
-              "items": {
-                "$ref": "#/definitions/Metric"
-              }
-            }
-          },
-          "500": {
-            "description": "Metrics cannot be retrieved"
           }
         }
       }
@@ -7501,85 +7432,6 @@ func init() {
           }
         }
       }
-    },
-    "/statedb/dump": {
-      "get": {
-        "produces": [
-          "application/octet-stream"
-        ],
-        "tags": [
-          "statedb"
-        ],
-        "summary": "Dump StateDB contents",
-        "responses": {
-          "200": {
-            "description": "Success",
-            "schema": {
-              "type": "string",
-              "format": "binary"
-            }
-          }
-        }
-      }
-    },
-    "/statedb/query/{table}": {
-      "get": {
-        "produces": [
-          "application/octet-stream"
-        ],
-        "tags": [
-          "statedb"
-        ],
-        "summary": "Perform a query against a StateDB table",
-        "parameters": [
-          {
-            "type": "string",
-            "description": "StateDB table name",
-            "name": "table",
-            "in": "path",
-            "required": true
-          },
-          {
-            "type": "string",
-            "description": "StateDB index name",
-            "name": "index",
-            "in": "query",
-            "required": true
-          },
-          {
-            "type": "string",
-            "description": "Query key (base64 encoded)",
-            "name": "key",
-            "in": "query",
-            "required": true
-          },
-          {
-            "type": "boolean",
-            "description": "If true perform a LowerBound search",
-            "name": "lowerbound",
-            "in": "query",
-            "required": true
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Success",
-            "schema": {
-              "type": "string",
-              "format": "binary"
-            }
-          },
-          "400": {
-            "description": "Invalid parameters",
-            "schema": {
-              "$ref": "#/definitions/Error"
-            }
-          },
-          "404": {
-            "description": "Table or Index not found"
-          }
-        }
-      }
     }
   },
   "definitions": {
@@ -7623,6 +7475,14 @@ func init() {
       "additionalProperties": {
         "type": "string"
       }
+    },
+    "AttachMode": {
+      "description": "Core datapath attachment mode",
+      "type": "string",
+      "enum": [
+        "tc",
+        "tcx"
+      ]
     },
     "BPFMap": {
       "description": "BPF map definition and content",
@@ -7736,6 +7596,10 @@ func init() {
           "description": "Indicator if this backend is preferred in the context of clustermesh service affinity. The value is set based\non related annotation of global service. Applicable for active state only.",
           "type": "boolean"
         },
+        "protocol": {
+          "description": "Layer 4 protocol (TCP, UDP, etc)",
+          "type": "string"
+        },
         "state": {
           "description": "State of the backend for load-balancing service traffic",
           "type": "string",
@@ -7751,6 +7615,10 @@ func init() {
           "type": "integer",
           "format": "uint16",
           "x-nullable": true
+        },
+        "zone": {
+          "description": "Optional name of the zone in which this backend runs",
+          "type": "string"
         }
       }
     },
@@ -7791,14 +7659,14 @@ func init() {
       }
     },
     "BgpGracefulRestart": {
-      "description": "BGP graceful restart parameters negotiated with the peer.\n\n+k8s:deepcopy-gen=true",
+      "description": "BGP graceful restart parameters negotiated with the peer.",
       "properties": {
         "enabled": {
-          "description": "When set, graceful restart capability is negotiated for all AFI/SAFIs of \nthis peer.",
+          "description": "When set, graceful restart capability is negotiated for all AFI/SAFIs of\nthis peer.",
           "type": "boolean"
         },
         "restart-time-seconds": {
-          "description": "This is the time advertised to peer for the BGP session to be re-established \nafter a restart. After this period, peer will remove stale routes. \n(RFC 4724 section 4.2)",
+          "description": "This is the time advertised to peer for the BGP session to be re-established\nafter a restart. After this period, peer will remove stale routes.\n(RFC 4724 section 4.2)",
           "type": "integer"
         }
       }
@@ -7924,7 +7792,7 @@ func init() {
       }
     },
     "BgpPeerFamilies": {
-      "description": "BGP AFI SAFI state of the peer\n\n+k8s:deepcopy-gen=true",
+      "description": "BGP AFI SAFI state of the peer",
       "properties": {
         "accepted": {
           "description": "Number of routes accepted from the peer of this address family",
@@ -7951,6 +7819,10 @@ func init() {
     "BgpRoute": {
       "description": "Single BGP route retrieved from the RIB of underlying router",
       "properties": {
+        "neighbor": {
+          "description": "IP address specifying a BGP neighbor if the source table type is adj-rib-in or adj-rib-out",
+          "type": "string"
+        },
         "paths": {
           "description": "List of routing paths leading towards the prefix",
           "type": "array",
@@ -8030,6 +7902,13 @@ func init() {
             "type": "string"
           }
         },
+        "match-families": {
+          "description": "Matches any of the provided address families. If empty matches all address families.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/BgpFamily"
+          }
+        },
         "match-neighbors": {
           "description": "Matches any of the provided BGP neighbor IP addresses. If empty matches all neighbors.",
           "type": "array",
@@ -8075,7 +7954,7 @@ func init() {
       }
     },
     "CIDRPolicy": {
-      "description": "CIDR endpoint policy\n\n+k8s:deepcopy-gen=true",
+      "description": "CIDR endpoint policy",
       "type": "object",
       "properties": {
         "egress": {
@@ -8095,7 +7974,7 @@ func init() {
       }
     },
     "CNIChainingStatus": {
-      "description": "Status of CNI chaining\n\n+k8s:deepcopy-gen=true",
+      "description": "Status of CNI chaining",
       "properties": {
         "mode": {
           "type": "string",
@@ -8159,7 +8038,7 @@ func init() {
       }
     },
     "ClockSource": {
-      "description": "Status of BPF clock source\n\n+k8s:deepcopy-gen=true",
+      "description": "Status of BPF clock source",
       "type": "object",
       "properties": {
         "hertz": {
@@ -8499,9 +8378,21 @@ func init() {
           "description": "Configured compatibility mode for --egress-multi-home-ip-rule-compat",
           "type": "boolean"
         },
+        "enableRouteMTUForCNIChaining": {
+          "description": "Enable route MTU for pod netns when CNI chaining is used",
+          "type": "boolean"
+        },
         "immutable": {
           "description": "Immutable configuration (read-only)",
           "$ref": "#/definitions/ConfigurationMap"
+        },
+        "installUplinkRoutesForDelegatedIPAM": {
+          "description": "Install ingress/egress routes through uplink on host for Pods when working with\ndelegated IPAM plugin.\n",
+          "type": "boolean"
+        },
+        "ipLocalReservedPorts": {
+          "description": "Comma-separated list of IP ports should be reserved in the workload network namespace",
+          "type": "string"
         },
         "ipam-mode": {
           "description": "Configured IPAM mode",
@@ -8565,7 +8456,9 @@ func init() {
       "description": "Datapath mode",
       "type": "string",
       "enum": [
-        "veth"
+        "veth",
+        "netkit",
+        "netkit-l2"
       ]
     },
     "DebugInfo": {
@@ -8637,6 +8530,10 @@ func init() {
     "EncryptionStatus": {
       "description": "Status of transparent encryption\n\n+k8s:deepcopy-gen=true",
       "properties": {
+        "ipsec": {
+          "description": "Status of the IPsec agent",
+          "$ref": "#/definitions/IPsecStatus"
+        },
         "mode": {
           "type": "string",
           "enum": [
@@ -8646,7 +8543,7 @@ func init() {
           ]
         },
         "msg": {
-          "description": "Human readable status/error/warning message",
+          "description": "Human readable error/warning message",
           "type": "string"
         },
         "wireguard": {
@@ -8748,6 +8645,10 @@ func init() {
           "description": "Kubernetes pod name",
           "type": "string"
         },
+        "k8s-uid": {
+          "description": "Kubernetes pod UID",
+          "type": "string"
+        },
         "labels": {
           "description": "Labels describing the identity",
           "$ref": "#/definitions/Labels"
@@ -8756,6 +8657,14 @@ func init() {
           "description": "MAC address",
           "type": "string"
         },
+        "netns-cookie": {
+          "description": "Network namespace cookie",
+          "type": "string"
+        },
+        "parent-interface-index": {
+          "description": "Index of network device from which an IP was used as endpoint IP. Only relevant for ENI environments.",
+          "type": "integer"
+        },
         "pid": {
           "description": "Process ID of the workload belonging to this endpoint",
           "type": "integer"
@@ -8763,6 +8672,12 @@ func init() {
         "policy-enabled": {
           "description": "Whether policy enforcement is enabled or not",
           "type": "boolean"
+        },
+        "properties": {
+          "description": "Properties is used to store information about the endpoint at creation. Useful for tests.",
+          "additionalProperties": {
+            "type": "object"
+          }
         },
         "state": {
           "description": "Current state of endpoint",
@@ -8943,7 +8858,7 @@ func init() {
       }
     },
     "EndpointPolicy": {
-      "description": "Policy information of an endpoint\n\n+k8s:deepcopy-gen=true",
+      "description": "Policy information of an endpoint",
       "type": "object",
       "properties": {
         "allowed-egress-identities": {
@@ -9206,20 +9121,6 @@ func init() {
         }
       }
     },
-    "HostRouting": {
-      "description": "Status of host routing\n\n+k8s:deepcopy-gen=true",
-      "type": "object",
-      "properties": {
-        "mode": {
-          "description": "Datapath routing mode",
-          "type": "string",
-          "enum": [
-            "BPF",
-            "Legacy"
-          ]
-        }
-      }
-    },
     "HubbleStatus": {
       "description": "Status of the Hubble server\n\n+k8s:deepcopy-gen=true",
       "type": "object",
@@ -9445,7 +9346,7 @@ func init() {
       }
     },
     "IPV4BigTCP": {
-      "description": "Status of IPv4 BIG TCP\n\n+k8s:deepcopy-gen=true",
+      "description": "Status of IPv4 BIG TCP",
       "type": "object",
       "properties": {
         "enabled": {
@@ -9463,7 +9364,7 @@ func init() {
       }
     },
     "IPV6BigTCP": {
-      "description": "Status of IPv6 BIG TCP\n\n+k8s:deepcopy-gen=true",
+      "description": "Status of IPv6 BIG TCP",
       "type": "object",
       "properties": {
         "enabled": {
@@ -9477,6 +9378,37 @@ func init() {
         "maxGSO": {
           "description": "Maximum IPv6 GSO size",
           "type": "integer"
+        }
+      }
+    },
+    "IPsecStatus": {
+      "description": "Status of the IPsec agent\n\n+k8s:deepcopy-gen=true",
+      "properties": {
+        "decrypt-interfaces": {
+          "description": "IPsec decryption interfaces",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "error-count": {
+          "description": "IPsec error count",
+          "type": "integer"
+        },
+        "keys-in-use": {
+          "description": "IPsec keys in use",
+          "type": "integer"
+        },
+        "max-seq-number": {
+          "description": "IPsec max sequence number",
+          "type": "string"
+        },
+        "xfrm-errors": {
+          "description": "IPsec XFRM errors",
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer"
+          }
         }
       }
     },
@@ -9513,7 +9445,7 @@ func init() {
       }
     },
     "IdentityRange": {
-      "description": "Status of identity range of the cluster\n\n+k8s:deepcopy-gen=true",
+      "description": "Status of identity range of the cluster",
       "properties": {
         "max-identity": {
           "description": "Maximum identity of the cluster",
@@ -9591,12 +9523,17 @@ func init() {
           "description": "\n\n+k8s:deepcopy-gen=true",
           "type": "object",
           "properties": {
+            "annotations": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
             "bpfSocketLBHostnsOnly": {
               "description": "flag bpf-lb-sock-hostns-only",
               "type": "boolean"
             },
             "externalIPs": {
-              "description": "\n\n+k8s:deepcopy-gen=true",
               "type": "object",
               "properties": {
                 "enabled": {
@@ -9605,7 +9542,6 @@ func init() {
               }
             },
             "gracefulTermination": {
-              "description": "\n\n+k8s:deepcopy-gen=true",
               "type": "object",
               "properties": {
                 "enabled": {
@@ -9614,7 +9550,6 @@ func init() {
               }
             },
             "hostPort": {
-              "description": "\n\n+k8s:deepcopy-gen=true",
               "type": "object",
               "properties": {
                 "enabled": {
@@ -9660,7 +9595,6 @@ func init() {
                   }
                 },
                 "service": {
-                  "description": "\n\n+k8s:deepcopy-gen=true",
                   "type": "object",
                   "properties": {
                     "enabled": {
@@ -9671,7 +9605,6 @@ func init() {
               }
             },
             "nodePort": {
-              "description": "\n\n+k8s:deepcopy-gen=true",
               "type": "object",
               "properties": {
                 "acceleration": {
@@ -9721,7 +9654,6 @@ func init() {
               }
             },
             "sessionAffinity": {
-              "description": "\n\n+k8s:deepcopy-gen=true",
               "type": "object",
               "properties": {
                 "enabled": {
@@ -9730,7 +9662,6 @@ func init() {
               }
             },
             "socketLB": {
-              "description": "\n\n+k8s:deepcopy-gen=true",
               "type": "object",
               "properties": {
                 "enabled": {
@@ -9739,7 +9670,6 @@ func init() {
               }
             },
             "socketLBTracing": {
-              "description": "\n\n+k8s:deepcopy-gen=true",
               "type": "object",
               "properties": {
                 "enabled": {
@@ -9752,10 +9682,6 @@ func init() {
         "mode": {
           "type": "string",
           "enum": [
-            "Disabled",
-            "Strict",
-            "Probe",
-            "Partial",
             "True",
             "False"
           ]
@@ -9782,12 +9708,17 @@ func init() {
       "description": "\n\n+k8s:deepcopy-gen=true",
       "type": "object",
       "properties": {
+        "annotations": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "bpfSocketLBHostnsOnly": {
           "description": "flag bpf-lb-sock-hostns-only",
           "type": "boolean"
         },
         "externalIPs": {
-          "description": "\n\n+k8s:deepcopy-gen=true",
           "type": "object",
           "properties": {
             "enabled": {
@@ -9796,7 +9727,6 @@ func init() {
           }
         },
         "gracefulTermination": {
-          "description": "\n\n+k8s:deepcopy-gen=true",
           "type": "object",
           "properties": {
             "enabled": {
@@ -9805,7 +9735,6 @@ func init() {
           }
         },
         "hostPort": {
-          "description": "\n\n+k8s:deepcopy-gen=true",
           "type": "object",
           "properties": {
             "enabled": {
@@ -9851,7 +9780,6 @@ func init() {
               }
             },
             "service": {
-              "description": "\n\n+k8s:deepcopy-gen=true",
               "type": "object",
               "properties": {
                 "enabled": {
@@ -9862,7 +9790,6 @@ func init() {
           }
         },
         "nodePort": {
-          "description": "\n\n+k8s:deepcopy-gen=true",
           "type": "object",
           "properties": {
             "acceleration": {
@@ -9912,7 +9839,6 @@ func init() {
           }
         },
         "sessionAffinity": {
-          "description": "\n\n+k8s:deepcopy-gen=true",
           "type": "object",
           "properties": {
             "enabled": {
@@ -9921,7 +9847,6 @@ func init() {
           }
         },
         "socketLB": {
-          "description": "\n\n+k8s:deepcopy-gen=true",
           "type": "object",
           "properties": {
             "enabled": {
@@ -9930,7 +9855,6 @@ func init() {
           }
         },
         "socketLBTracing": {
-          "description": "\n\n+k8s:deepcopy-gen=true",
           "type": "object",
           "properties": {
             "enabled": {
@@ -9941,7 +9865,6 @@ func init() {
       }
     },
     "KubeProxyReplacementFeaturesExternalIPs": {
-      "description": "\n\n+k8s:deepcopy-gen=true",
       "type": "object",
       "properties": {
         "enabled": {
@@ -9950,7 +9873,6 @@ func init() {
       }
     },
     "KubeProxyReplacementFeaturesGracefulTermination": {
-      "description": "\n\n+k8s:deepcopy-gen=true",
       "type": "object",
       "properties": {
         "enabled": {
@@ -9959,7 +9881,6 @@ func init() {
       }
     },
     "KubeProxyReplacementFeaturesHostPort": {
-      "description": "\n\n+k8s:deepcopy-gen=true",
       "type": "object",
       "properties": {
         "enabled": {
@@ -10005,7 +9926,6 @@ func init() {
           }
         },
         "service": {
-          "description": "\n\n+k8s:deepcopy-gen=true",
           "type": "object",
           "properties": {
             "enabled": {
@@ -10031,7 +9951,6 @@ func init() {
       }
     },
     "KubeProxyReplacementFeaturesNat46X64Service": {
-      "description": "\n\n+k8s:deepcopy-gen=true",
       "type": "object",
       "properties": {
         "enabled": {
@@ -10040,7 +9959,6 @@ func init() {
       }
     },
     "KubeProxyReplacementFeaturesNodePort": {
-      "description": "\n\n+k8s:deepcopy-gen=true",
       "type": "object",
       "properties": {
         "acceleration": {
@@ -10090,7 +10008,6 @@ func init() {
       }
     },
     "KubeProxyReplacementFeaturesSessionAffinity": {
-      "description": "\n\n+k8s:deepcopy-gen=true",
       "type": "object",
       "properties": {
         "enabled": {
@@ -10099,7 +10016,6 @@ func init() {
       }
     },
     "KubeProxyReplacementFeaturesSocketLB": {
-      "description": "\n\n+k8s:deepcopy-gen=true",
       "type": "object",
       "properties": {
         "enabled": {
@@ -10108,7 +10024,6 @@ func init() {
       }
     },
     "KubeProxyReplacementFeaturesSocketLBTracing": {
-      "description": "\n\n+k8s:deepcopy-gen=true",
       "type": "object",
       "properties": {
         "enabled": {
@@ -10117,7 +10032,7 @@ func init() {
       }
     },
     "L4Policy": {
-      "description": "L4 endpoint policy\n\n+k8s:deepcopy-gen=true",
+      "description": "L4 endpoint policy",
       "type": "object",
       "properties": {
         "egress": {
@@ -10405,43 +10320,6 @@ func init() {
         }
       }
     },
-    "ModuleHealth": {
-      "description": "Report module health status",
-      "properties": {
-        "last-ok": {
-          "description": "Time at which the last OK check occurred",
-          "type": "string"
-        },
-        "last-updated": {
-          "description": "Time of last health update",
-          "type": "string"
-        },
-        "level": {
-          "description": "Describes the health status level",
-          "type": "string"
-        },
-        "message": {
-          "description": "Reports the associated health message",
-          "type": "string"
-        },
-        "module-id": {
-          "description": "Describes the module identitier",
-          "type": "string"
-        }
-      }
-    },
-    "ModulesHealth": {
-      "description": "Reports health status of agent's modules",
-      "properties": {
-        "modules": {
-          "description": "List out modules health status",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/ModuleHealth"
-          }
-        }
-      }
-    },
     "MonitorStatus": {
       "description": "Status of the node monitor",
       "properties": {
@@ -10596,7 +10474,7 @@ func init() {
       }
     },
     "PolicyRule": {
-      "description": "A policy rule including the rule labels it derives from\n\n+k8s:deepcopy-gen=true",
+      "description": "A policy rule including the rule labels it derives from",
       "properties": {
         "derived-from-rules": {
           "description": "The policy rule labels identifying the policy rules this rule derives from",
@@ -10953,6 +10831,10 @@ func init() {
           "description": "Number of nodes in the cluster",
           "type": "integer"
         },
+        "num-service-exports": {
+          "description": "Number of MCS-API service exports in the cluster",
+          "type": "integer"
+        },
         "num-shared-services": {
           "description": "Number of services in the cluster",
           "type": "integer"
@@ -10990,6 +10872,11 @@ func init() {
           "description": "Whether the configuration has been correctly retrieved",
           "type": "boolean"
         },
+        "service-exports-enabled": {
+          "description": "Whether or not MCS-API ServiceExports is enabled by the cluster (null means unsupported).",
+          "type": "boolean",
+          "x-nullable": true
+        },
         "sync-canaries": {
           "description": "Whether the remote cluster supports per-prefix \"synced\" canaries",
           "type": "boolean"
@@ -11011,6 +10898,11 @@ func init() {
           "description": "Nodes synchronization status",
           "type": "boolean"
         },
+        "service-exports": {
+          "description": "MCS-API service exports synchronization status (null means that the component is not watching service exports)",
+          "type": "boolean",
+          "x-nullable": true
+        },
         "services": {
           "description": "Services synchronization status",
           "type": "boolean"
@@ -11026,6 +10918,32 @@ func init() {
         },
         "responses": {
           "$ref": "#/definitions/MessageForwardingStatistics"
+        }
+      }
+    },
+    "Routing": {
+      "description": "Status of routing",
+      "type": "object",
+      "properties": {
+        "inter-host-routing-mode": {
+          "description": "Datapath routing mode for cross-cluster connectivity",
+          "type": "string",
+          "enum": [
+            "Native",
+            "Tunnel"
+          ]
+        },
+        "intra-host-routing-mode": {
+          "description": "Datapath routing mode for connectivity within the host",
+          "type": "string",
+          "enum": [
+            "BPF",
+            "Legacy"
+          ]
+        },
+        "tunnel-protocol": {
+          "description": "Tunnel protocol in use for cross-cluster connectivity",
+          "type": "string"
         }
       }
     },
@@ -11261,7 +11179,7 @@ func init() {
       }
     },
     "Srv6": {
-      "description": "Status of the SRv6\n\n+k8s:deepcopy-gen=true",
+      "description": "Status of the SRv6",
       "type": "object",
       "properties": {
         "enabled": {
@@ -11322,6 +11240,10 @@ func init() {
       "description": "Health and status information of daemon\n\n+k8s:deepcopy-gen=true",
       "type": "object",
       "properties": {
+        "attach-mode": {
+          "description": "Status of core datapath attachment mode",
+          "$ref": "#/definitions/AttachMode"
+        },
         "auth-certificate-provider": {
           "description": "Status of Mutual Authentication certificate provider",
           "$ref": "#/definitions/Status"
@@ -11370,6 +11292,10 @@ func init() {
           "description": "Status of all endpoint controllers",
           "$ref": "#/definitions/ControllerStatuses"
         },
+        "datapath-mode": {
+          "description": "Status of datapath mode",
+          "$ref": "#/definitions/DatapathMode"
+        },
         "encryption": {
           "description": "Status of transparent encryption",
           "$ref": "#/definitions/EncryptionStatus"
@@ -11377,10 +11303,6 @@ func init() {
         "host-firewall": {
           "description": "Status of the host firewall",
           "$ref": "#/definitions/HostFirewall"
-        },
-        "host-routing": {
-          "description": "Status of host routing",
-          "$ref": "#/definitions/HostRouting"
         },
         "hubble": {
           "description": "Status of Hubble server",
@@ -11425,6 +11347,10 @@ func init() {
         "proxy": {
           "description": "Status of proxy",
           "$ref": "#/definitions/ProxyStatus"
+        },
+        "routing": {
+          "description": "Status of routing",
+          "$ref": "#/definitions/Routing"
         },
         "srv6": {
           "description": "Status of SRv6",
@@ -11776,34 +11702,6 @@ func init() {
       "description": "Source from which FQDN entries come from",
       "name": "source",
       "in": "query"
-    },
-    "statedb-index": {
-      "type": "string",
-      "description": "StateDB index name",
-      "name": "index",
-      "in": "query",
-      "required": true
-    },
-    "statedb-key": {
-      "type": "string",
-      "description": "Query key (base64 encoded)",
-      "name": "key",
-      "in": "query",
-      "required": true
-    },
-    "statedb-lowerbound": {
-      "type": "boolean",
-      "description": "If true perform a LowerBound search",
-      "name": "lowerbound",
-      "in": "query",
-      "required": true
-    },
-    "statedb-table": {
-      "type": "string",
-      "description": "StateDB table name",
-      "name": "table",
-      "in": "path",
-      "required": true
     },
     "trace-selector": {
       "description": "Context to provide policy evaluation on",

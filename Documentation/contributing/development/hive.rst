@@ -70,7 +70,7 @@ would leverage hive:
         RegisterHandler(path string, fn http.HandlerFunc)
     }
 
-    func New(lc hive.Lifecycle, cfg ServerConfig) Server { 
+    func New(lc cell.Lifecycle, cfg ServerConfig) Server { 
       // Initialize http.Server, register Start and Stop hooks to Lifecycle 
       // for starting and stopping the server and return an implementation of
       // 'Server' for other cells for registering handlers.
@@ -236,7 +236,7 @@ hive to unpack them:
     
         A A
         B B
-        Lifecycle hive.Lifecycle
+        Lifecycle cell.Lifecycle
     }
     
     type out struct {
@@ -439,6 +439,13 @@ returns a cell that "provides" the parsed configuration to the application:
         cell.Provide(New),
     )
 
+Every field in the default configuration structure must be explicitly populated.
+When selecting defaults for the option, consider which option will introduce
+the minimal disruption to existing users during upgrade. For instance, if the
+flag retains existing behavior from a previous release, then the default flag
+value should retain that behavior. If you are introducing a new optional
+feature, consider disabling the option by default.
+
 In tests the configuration can be populated in various ways:
 
 .. code-block:: go
@@ -588,7 +595,7 @@ or using the Hook struct. Lifecycle is accessible from any cell:
     func (e *Example) Start(ctx HookContext) error { /* ... */ }
     func (e *Example) Stop(ctx HookContext) error { /* ... */ }
     
-    func New(lc hive.Lifecycle) *Example {
+    func New(lc cell.Lifecycle) *Example {
         e := &Example{}
         lc.Append(e)
         return e
@@ -702,7 +709,7 @@ been registered with cobra:
              }
  
              🚧 client.newClientset (cell.go:109):
-                 ⇨ client.Config, hive.Lifecycle, logrus.FieldLogger 
+                 ⇨ client.Config, cell.Lifecycle, logrus.FieldLogger 
                  ⇦ client.Clientset 
     ...
 
@@ -911,7 +918,7 @@ See also the runnable example in `pkg/k8s/resource/example <https://github.com/c
     import "github.com/cilium/cilium/pkg/k8s/resource"
 
     var nodesCell = cell.Provide(
-        func(lc hive.Lifecycle, cs client.Clientset) resource.Resource[v1.Node] {
+        func(lc cell.Lifecycle, cs client.Clientset) resource.Resource[v1.Node] {
             lw := utils.ListerWatcherFromTyped[*v1.NodeList](cs.CoreV1().Nodes())
             return resource.New[*v1.Node](lc, lw) 
         },
@@ -963,7 +970,7 @@ See also the runnable example in `pkg/k8s/resource/example <https://github.com/c
 Job groups
 ^^^^^^^^^^
 
-The `job package <https://pkg.go.dev/github.com/cilium/cilium/pkg/hive/job>`_ contains logic that 
+The `job package <https://pkg.go.dev/github.com/cilium/hive/job>`_ contains logic that
 makes it easy to manage units of work that the package refers to as "jobs". These jobs are 
 scheduled as part of a job group.
 

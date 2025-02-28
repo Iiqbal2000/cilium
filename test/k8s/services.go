@@ -55,6 +55,7 @@ var _ = SkipDescribeIf(helpers.RunsOn54Kernel, "K8sDatapathServicesTest", func()
 
 	JustAfterEach(func() {
 		kubectl.ValidateNoErrorsInLogs(CurrentGinkgoTestDescription().Duration)
+		kubectl.CollectFeatures()
 	})
 
 	AfterAll(func() {
@@ -158,7 +159,7 @@ var _ = SkipDescribeIf(helpers.RunsOn54Kernel, "K8sDatapathServicesTest", func()
 		SkipContextIf(func() bool {
 			return helpers.RunsWithKubeProxyReplacement()
 		}, "Tests NodePort inside cluster (kube-proxy)", func() {
-			SkipItIf(helpers.DoesNotRunOn419OrLaterKernel, "with IPSec and externalTrafficPolicy=Local", func() {
+			It("with IPSec and externalTrafficPolicy=Local", func() {
 				deploymentManager.SetKubectl(kubectl)
 				deploymentManager.Deploy(helpers.CiliumNamespace, IPSecSecret)
 				DeployCiliumOptionsAndDNS(kubectl, ciliumFilename, map[string]string{
@@ -181,7 +182,7 @@ var _ = SkipDescribeIf(helpers.RunsOn54Kernel, "K8sDatapathServicesTest", func()
 				testExternalTrafficPolicyLocal(kubectl, ni)
 			})
 
-			It("", func() {
+			It("vanilla", func() {
 				testNodePort(kubectl, ni, false, false, 0)
 			})
 		})
@@ -619,9 +620,7 @@ Secondary Interface %s :: IPv4: (%s, %s), IPv6: (%s, %s)`,
 			testNodePortExternal(kubectl, ni, false, true, false)
 		})
 
-		// Run on net-next and 4.19 but not on old versions, because of
-		// LRU requirement.
-		SkipItIf(helpers.DoesNotRunOn419OrLaterKernel, "Supports IPv4 fragments", func() {
+		It("Supports IPv4 fragments", func() {
 			options := map[string]string{}
 			// On GKE we need to disable endpoint routes as fragment tracking
 			// isn't compatible with that options. See #15958.
@@ -629,7 +628,12 @@ Secondary Interface %s :: IPv4: (%s, %s), IPv6: (%s, %s)`,
 				options["gke.enabled"] = "false"
 				options["routingMode"] = "native"
 			}
+
 			DeployCiliumOptionsAndDNS(kubectl, ciliumFilename, options)
+
+			cmd := fmt.Sprintf("cilium-dbg config %s=%s", helpers.OptionConntrackAccounting, helpers.OptionEnabled)
+			kubectl.CiliumExecMustSucceedOnAll(context.TODO(), cmd, "Unable to enable ConntrackAccounting option")
+			kubectl.CiliumPreFlightCheck()
 			testIPv4FragmentSupport(kubectl, ni)
 		})
 
@@ -638,14 +642,9 @@ Secondary Interface %s :: IPv4: (%s, %s), IPv6: (%s, %s)`,
 			var ccnpHostPolicy string
 
 			BeforeAll(func() {
-				options := map[string]string{
+				DeployCiliumOptionsAndDNS(kubectl, ciliumFilename, map[string]string{
 					"hostFirewall.enabled": "true",
-				}
-				if helpers.RunsWithKubeProxyReplacement() {
-					// BPF IPv6 masquerade not currently supported with host firewall - GH-26074
-					options["enableIPv6Masquerade"] = "false"
-				}
-				DeployCiliumOptionsAndDNS(kubectl, ciliumFilename, options)
+				})
 
 				originalCCNPHostPolicy := helpers.ManifestGet(kubectl.BasePath(), hostPolicyFilename)
 				res := kubectl.ExecMiddle("mktemp")
@@ -733,8 +732,7 @@ Secondary Interface %s :: IPv4: (%s, %s), IPv6: (%s, %s)`,
 				demoYAML = helpers.ManifestGet(kubectl.BasePath(), "demo_ds.yaml")
 
 				DeployCiliumOptionsAndDNS(kubectl, ciliumFilename, map[string]string{
-					"enableRuntimeDeviceDetection": "true",
-					"devices":                      "",
+					"devices": "",
 				})
 
 				res := kubectl.ApplyDefault(demoYAML)

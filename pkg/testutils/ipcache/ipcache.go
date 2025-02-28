@@ -4,6 +4,7 @@
 package testipcache
 
 import (
+	"context"
 	"net"
 	"net/netip"
 
@@ -49,6 +50,25 @@ func (m *MockIPCache) RemoveLabelsExcluded(lbls labels.Labels, toExclude map[net
 
 func (m *MockIPCache) DeleteOnMetadataMatch(IP string, source source.Source, namespace, name string) (namedPortsChanged bool) {
 	return false
+}
+
+func (m *MockIPCache) UpsertPrefixes(prefixes []netip.Prefix, src source.Source, resource ipcacheTypes.ResourceID) uint64 {
+	return 0
+}
+
+func (m *MockIPCache) RemovePrefixes(prefixes []netip.Prefix, src source.Source, resource ipcacheTypes.ResourceID) {
+}
+
+func (m *MockIPCache) UpsertMetadataBatch(updates ...ipcache.MU) (revision uint64) {
+	return 0
+}
+
+func (m *MockIPCache) RemoveMetadataBatch(updates ...ipcache.MU) (revision uint64) {
+	return 0
+}
+
+func (m *MockIPCache) WaitForRevision(ctx context.Context, rev uint64) error {
+	return nil
 }
 
 func NewMockIPCache() *MockIPCache {

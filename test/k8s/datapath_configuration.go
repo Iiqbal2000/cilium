@@ -15,17 +15,12 @@ import (
 
 	. "github.com/onsi/gomega"
 
-	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/test/config"
 	. "github.com/cilium/cilium/test/ginkgo-ext"
 	"github.com/cilium/cilium/test/helpers"
 )
 
 var _ = Describe("K8sDatapathConfig", func() {
-	const (
-		bpffsDir string = defaults.BPFFSRoot + "/" + defaults.TCGlobalsPath + "/"
-	)
-
 	var (
 		kubectl    *helpers.Kubectl
 		monitorLog = "monitor-aggregation.log"
@@ -55,6 +50,7 @@ var _ = Describe("K8sDatapathConfig", func() {
 
 	JustAfterEach(func() {
 		kubectl.ValidateNoErrorsInLogs(CurrentGinkgoTestDescription().Duration)
+		kubectl.CollectFeatures()
 	})
 
 	Context("MonitorAggregation", func() {
@@ -63,9 +59,6 @@ var _ = Describe("K8sDatapathConfig", func() {
 				"bpf.monitorAggregation": "medium",
 				"bpf.monitorInterval":    "60s",
 				"bpf.monitorFlags":       "syn",
-				// Need to disable the host firewall for now due to complexity issue.
-				// See #14552 for details.
-				"hostFirewall.enabled": "false",
 			}, DeployCiliumOptionsAndDNS)
 
 			monitorRes, monitorCancel, targetIP := monitorConnectivityAcrossNodes(kubectl)
@@ -299,7 +292,7 @@ var _ = Describe("K8sDatapathConfig", func() {
 	})
 
 	SkipContextIf(func() bool {
-		return helpers.DoesNotExistNodeWithoutCilium() || helpers.DoesNotRunOn419OrLaterKernel()
+		return helpers.DoesNotExistNodeWithoutCilium()
 	}, "Check BPF masquerading with ip-masq-agent", func() {
 		var (
 			tmpEchoPodPath string
@@ -505,7 +498,7 @@ var _ = Describe("K8sDatapathConfig", func() {
 			// IPs to be present on both nodes before performing the test
 			waitForAllowedIP := func(ciliumPod, ip string) {
 				jsonpath := fmt.Sprintf(`{.encryption.wireguard.interfaces[*].peers[*].allowed-ips[?(@=='%s')]}`, ip)
-				ciliumCmd := fmt.Sprintf(`cilium debuginfo --output jsonpath="%s"`, jsonpath)
+				ciliumCmd := fmt.Sprintf(`cilium-dbg debuginfo --output jsonpath="%s"`, jsonpath)
 				expected := fmt.Sprintf("jsonpath=%s", ip)
 				err := kubectl.CiliumExecUntilMatch(ciliumPod, ciliumCmd, expected)
 				Expect(err).To(BeNil(), "ip %q not in allowedIPs of pod %q", ip, ciliumPod)
@@ -561,37 +554,6 @@ var _ = Describe("K8sDatapathConfig", func() {
 		})
 	})
 
-	SkipContextIf(func() bool {
-		return helpers.RunsOnGKE() || helpers.RunsWithoutKubeProxy() || helpers.RunsOnAKS()
-	}, "Transparent encryption DirectRouting", func() {
-		var privateIface string
-		BeforeAll(func() {
-			Eventually(func() (string, error) {
-				iface, err := kubectl.GetPrivateIface(helpers.K8s1)
-				privateIface = iface
-				return iface, err
-			}, helpers.MidCommandTimeout, time.Second).ShouldNot(BeEmpty(),
-				"Unable to determine private iface")
-		})
-		SkipItIf(helpers.RunsWithoutKubeProxy, "Check connectivity with transparent encryption and direct routing with bpf_host", func() {
-			defaultIface, err := kubectl.GetDefaultIface(false)
-			Expect(err).Should(BeNil(), "Unable to determine the default interface")
-			devices := fmt.Sprintf(`'{%s,%s}'`, privateIface, defaultIface)
-
-			deploymentManager.Deploy(helpers.CiliumNamespace, IPSecSecret)
-			deploymentManager.DeployCilium(map[string]string{
-				"routingMode":                "native",
-				"autoDirectNodeRoutes":       "true",
-				"encryption.enabled":         "true",
-				"encryption.ipsec.interface": privateIface,
-				"devices":                    devices,
-				"hostFirewall.enabled":       "false",
-				"kubeProxyReplacement":       "disabled",
-			}, DeployCiliumOptionsAndDNS)
-			Expect(testPodConnectivityAcrossNodes(kubectl)).Should(BeTrue(), "Connectivity test between nodes failed")
-		})
-	})
-
 	Context("IPv4Only", func() {
 		It("Check connectivity with IPv6 disabled", func() {
 			deploymentManager.DeployCilium(map[string]string{
@@ -602,42 +564,15 @@ var _ = Describe("K8sDatapathConfig", func() {
 		})
 	})
 
-	Context("Etcd", func() {
-		It("Check connectivity", func() {
-			deploymentManager.Deploy(helpers.CiliumNamespace, StatelessEtcd)
-			deploymentManager.WaitUntilReady()
-
-			host, port, err := kubectl.GetServiceHostPort(helpers.CiliumNamespace, "stateless-etcd")
-			Expect(err).Should(BeNil(), "Unable to retrieve ClusterIP and port for stateless-etcd service")
-
-			etcdService := fmt.Sprintf("http://%s:%d", host, port)
-			opts := map[string]string{
-				"etcd.enabled":           "true",
-				"etcd.endpoints[0]":      etcdService,
-				"identityAllocationMode": "kvstore",
-			}
-			if helpers.ExistNodeWithoutCilium() {
-				opts["synchronizeK8sNodes"] = "false"
-			}
-			deploymentManager.DeployCilium(opts, DeployCiliumOptionsAndDNS)
-			Expect(testPodConnectivityAcrossNodes(kubectl)).Should(BeTrue(), "Connectivity test between nodes failed")
-		})
-	})
-
 	Context("Host firewall", func() {
 		BeforeAll(func() {
 			kubectl.Exec("kubectl label nodes --all status=lockdown")
 
 			// Need to install Cilium w/ host fw prior to the host policy preparation
 			// step.
-			options := map[string]string{
+			deploymentManager.DeployCilium(map[string]string{
 				"hostFirewall.enabled": "true",
-			}
-			if helpers.RunsWithKubeProxyReplacement() {
-				// BPF IPv6 masquerade not currently supported with host firewall - GH-26074
-				options["enableIPv6Masquerade"] = "false"
-			}
-			deploymentManager.DeployCilium(options, DeployCiliumOptionsAndDNS)
+			}, DeployCiliumOptionsAndDNS)
 
 			hostPolicy := helpers.ManifestGet(kubectl.BasePath(), "host-policies.yaml")
 			prepareHostPolicyEnforcement(kubectl, hostPolicy)
@@ -666,11 +601,6 @@ var _ = Describe("K8sDatapathConfig", func() {
 				options["gke.enabled"] = "false"
 				options["tunnelProtocol"] = "vxlan"
 			}
-			if helpers.RunsWithKubeProxyReplacement() {
-				// BPF IPv6 masquerade not currently supported with host firewall - GH-26074
-				options["enableIPv6Masquerade"] = "false"
-			}
-			deploymentManager.DeployCilium(options, DeployCiliumOptionsAndDNS)
 			deploymentManager.DeployCilium(options, DeployCiliumOptionsAndDNS)
 			testHostFirewall(kubectl)
 		})
@@ -686,11 +616,6 @@ var _ = Describe("K8sDatapathConfig", func() {
 				options["gke.enabled"] = "false"
 				options["tunnelProtocol"] = "vxlan"
 			}
-			if helpers.RunsWithKubeProxyReplacement() {
-				// BPF IPv6 masquerade not currently supported with host firewall - GH-26074
-				options["enableIPv6Masquerade"] = "false"
-			}
-			deploymentManager.DeployCilium(options, DeployCiliumOptionsAndDNS)
 			deploymentManager.DeployCilium(options, DeployCiliumOptionsAndDNS)
 			testHostFirewall(kubectl)
 		})
@@ -707,11 +632,6 @@ var _ = Describe("K8sDatapathConfig", func() {
 			} else {
 				options["autoDirectNodeRoutes"] = "true"
 			}
-			if helpers.RunsWithKubeProxyReplacement() {
-				// BPF IPv6 masquerade not currently supported with host firewall - GH-26074
-				options["enableIPv6Masquerade"] = "false"
-			}
-			deploymentManager.DeployCilium(options, DeployCiliumOptionsAndDNS)
 			deploymentManager.DeployCilium(options, DeployCiliumOptionsAndDNS)
 			testHostFirewall(kubectl)
 		})
@@ -725,62 +645,8 @@ var _ = Describe("K8sDatapathConfig", func() {
 			if !helpers.RunsOnGKE() {
 				options["autoDirectNodeRoutes"] = "true"
 			}
-			if helpers.RunsWithKubeProxyReplacement() {
-				// BPF IPv6 masquerade not currently supported with host firewall - GH-26074
-				options["enableIPv6Masquerade"] = "false"
-			}
-			deploymentManager.DeployCilium(options, DeployCiliumOptionsAndDNS)
 			deploymentManager.DeployCilium(options, DeployCiliumOptionsAndDNS)
 			testHostFirewall(kubectl)
-		})
-	})
-
-	SkipContextIf(func() bool {
-		return helpers.SkipQuarantined() || helpers.DoesNotRunOnNetNextKernel()
-	}, "High-scale IPcache", func() {
-		const hsIPcacheFile = "high-scale-ipcache.yaml"
-
-		AfterEach(func() {
-			hsIPcacheYAML := helpers.ManifestGet(kubectl.BasePath(), hsIPcacheFile)
-			_ = kubectl.Delete(hsIPcacheYAML)
-		})
-
-		testHighScaleIPcache := func(tunnelProto string, epRoutesConfig string) {
-			options := map[string]string{
-				"highScaleIPcache.enabled":    "true",
-				"routingMode":                 "native",
-				"bpf.monitorAggregation":      "none",
-				"ipv6.enabled":                "false",
-				"wellKnownIdentities.enabled": "true",
-				"tunnelProtocol":              tunnelProto,
-				"endpointRoutes.enabled":      epRoutesConfig,
-			}
-			if !helpers.RunsOnGKE() {
-				options["autoDirectNodeRoutes"] = "true"
-			}
-			if helpers.RunsWithKubeProxy() {
-				options["kubeProxyReplacement"] = "disabled"
-			}
-			deploymentManager.DeployCilium(options, DeployCiliumOptionsAndDNS)
-
-			cmd := fmt.Sprintf("bpftool map update pinned %scilium_world_cidrs4 key 0 0 0 0 0 0 0 0 value 1", bpffsDir)
-			kubectl.CiliumExecMustSucceedOnAll(context.TODO(), cmd)
-
-			hsIPcacheYAML := helpers.ManifestGet(kubectl.BasePath(), hsIPcacheFile)
-			kubectl.Create(hsIPcacheYAML).ExpectSuccess("Unable to create resource %q", hsIPcacheYAML)
-
-			// We need a longer timeout here because of the larger number of
-			// pods that need to be deployed.
-			err := kubectl.WaitforPods(helpers.DefaultNamespace, "-l type=client", 2*helpers.HelperTimeout)
-			Expect(err).ToNot(HaveOccurred(), "Client pods not ready after timeout")
-		}
-
-		It("Test ingress policy enforcement with VXLAN and no endpoint routes", func() {
-			testHighScaleIPcache("vxlan", "false")
-		})
-
-		It("Test ingress policy enforcement with GENEVE and endpoint routes", func() {
-			testHighScaleIPcache("geneve", "true")
 		})
 	})
 
@@ -1155,7 +1021,7 @@ func checkMonitorOutput(monitorOutput []byte, egressPktCount, ingressPktCount in
 	By("Looking for TCP notifications using the ephemeral port %q", portBytes)
 	port, err := strconv.Atoi(string(portBytes))
 	if err != nil {
-		return fmt.Errorf("ephemeral port %q could not be converted to integer: %s",
+		return fmt.Errorf("ephemeral port %q could not be converted to integer: %w",
 			string(portBytes), err)
 	}
 

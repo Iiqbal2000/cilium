@@ -126,7 +126,7 @@ func TestNewCapacity(t *testing.T) {
 		t.Run(fmt.Sprintf("n=%d", n), func(t *testing.T) {
 			c, err := NewCapacity(n)
 			assert.Nil(t, c)
-			assert.NotNil(t, err)
+			assert.Error(t, err)
 		})
 	}
 }
@@ -697,7 +697,7 @@ func TestRingFunctionalitySerialized(t *testing.T) {
 	}
 
 	_, err := r.read(lastWrite)
-	if err != io.EOF {
+	if !errors.Is(err, io.EOF) {
 		t.Errorf("Should not be able to read position %x, got %v", lastWrite, err)
 	}
 	lastWrite--

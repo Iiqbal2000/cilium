@@ -4,47 +4,39 @@
 package envoy
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
-	. "github.com/cilium/checkmate"
+	"github.com/cilium/hive/hivetest"
 	cilium "github.com/cilium/proxy/go/cilium/api"
 	envoy_config_core "github.com/cilium/proxy/go/envoy/config/core/v3"
 	envoy_config_listener "github.com/cilium/proxy/go/envoy/config/listener/v3"
 	envoy_config_route "github.com/cilium/proxy/go/envoy/config/route/v3"
 	envoy_type_matcher "github.com/cilium/proxy/go/envoy/type/matcher/v3"
 	"github.com/cilium/proxy/pkg/policy/api/kafka"
+	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/types"
 
-	"github.com/cilium/cilium/pkg/checker"
+	"github.com/cilium/cilium/pkg/container/versioned"
 	"github.com/cilium/cilium/pkg/identity"
-	"github.com/cilium/cilium/pkg/identity/cache"
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/policy"
 	"github.com/cilium/cilium/pkg/policy/api"
 	"github.com/cilium/cilium/pkg/proxy/endpoint"
 	"github.com/cilium/cilium/pkg/proxy/endpoint/test"
-	testidentity "github.com/cilium/cilium/pkg/testutils/identity"
-	"github.com/cilium/cilium/pkg/u8proto"
+	testpolicy "github.com/cilium/cilium/pkg/testutils/policy"
 )
 
-type ServerSuite struct{}
-
-type DummySelectorCacheUser struct{}
-
-func (d *DummySelectorCacheUser) IdentitySelectionUpdated(selector policy.CachedSelector, added, deleted []identity.NumericIdentity) {
-}
-
 var (
-	_        = Suite(&ServerSuite{})
 	IPv4Addr = "10.1.1.1"
-	Identity = identity.NumericIdentity(123)
 
 	ep endpoint.EndpointUpdater = &test.ProxyUpdaterMock{
-		Id:       1000,
-		Ipv4:     "10.0.0.1",
-		Ipv6:     "f00d::1",
-		Labels:   []string{"id.foo", "id.bar"},
-		Identity: Identity,
+		Id:            1000,
+		Ipv4:          "10.0.0.1",
+		Ipv6:          "f00d::1",
+		VersionHandle: versioned.Latest(),
 	}
 )
 
@@ -187,9 +179,9 @@ var ExpectedHeaders3 = []*envoy_config_route.HeaderMatcher{
 }
 
 var (
-	dummySelectorCacheUser = &DummySelectorCacheUser{}
+	dummySelectorCacheUser = &testpolicy.DummySelectorCacheUser{}
 
-	IdentityCache = cache.IdentityCache{
+	IdentityCache = identity.IdentityMap{
 		1001: labels.LabelArray{
 			labels.NewLabel("app", "etcd", labels.LabelSourceK8s),
 			labels.NewLabel("version", "v1", labels.LabelSourceK8s),
@@ -203,27 +195,26 @@ var (
 			labels.NewLabel("version", "v1", labels.LabelSourceK8s),
 		},
 	}
-	identityAllocator = testidentity.NewMockIdentityAllocator(IdentityCache)
-	testSelectorCache = policy.NewSelectorCache(identityAllocator, IdentityCache)
+	testSelectorCache = policy.NewSelectorCache(IdentityCache)
 
-	wildcardCachedSelector, _ = testSelectorCache.AddIdentitySelector(dummySelectorCacheUser, nil, api.WildcardEndpointSelector)
+	wildcardCachedSelector, _ = testSelectorCache.AddIdentitySelector(dummySelectorCacheUser, policy.EmptyStringLabels, api.WildcardEndpointSelector)
 
 	EndpointSelector1 = api.NewESFromLabels(
 		labels.NewLabel("app", "etcd", labels.LabelSourceK8s),
 	)
-	cachedSelector1, _ = testSelectorCache.AddIdentitySelector(dummySelectorCacheUser, nil, EndpointSelector1)
+	cachedSelector1, _ = testSelectorCache.AddIdentitySelector(dummySelectorCacheUser, policy.EmptyStringLabels, EndpointSelector1)
 
 	// EndpointSelector1 with FromRequires("k8s:version=v2") folded in
 	RequiresV2Selector1 = api.NewESFromLabels(
 		labels.NewLabel("app", "etcd", labels.LabelSourceK8s),
 		labels.NewLabel("version", "v2", labels.LabelSourceK8s),
 	)
-	cachedRequiresV2Selector1, _ = testSelectorCache.AddIdentitySelector(dummySelectorCacheUser, nil, RequiresV2Selector1)
+	cachedRequiresV2Selector1, _ = testSelectorCache.AddIdentitySelector(dummySelectorCacheUser, policy.EmptyStringLabels, RequiresV2Selector1)
 
 	EndpointSelector2 = api.NewESFromLabels(
 		labels.NewLabel("version", "v1", labels.LabelSourceK8s),
 	)
-	cachedSelector2, _ = testSelectorCache.AddIdentitySelector(dummySelectorCacheUser, nil, EndpointSelector2)
+	cachedSelector2, _ = testSelectorCache.AddIdentitySelector(dummySelectorCacheUser, policy.EmptyStringLabels, EndpointSelector2)
 )
 
 var L7Rules12 = &policy.PerSelectorPolicy{L7Rules: api.L7Rules{HTTP: []api.PortRuleHTTP{*PortRuleHTTP1, *PortRuleHTTP2}}}
@@ -285,7 +276,7 @@ var ExpectedPortNetworkPolicyRule1Wildcard = &cilium.PortNetworkPolicyRule{
 	L7: ExpectedHttpRule1,
 }
 
-var L4PolicyMap1 = map[string]*policy.L4Filter{
+var L4PolicyMap1 = policy.NewL4PolicyMapWithValues(map[string]*policy.L4Filter{
 	"80/TCP": {
 		Port:     80,
 		Protocol: api.ProtoTCP,
@@ -294,9 +285,9 @@ var L4PolicyMap1 = map[string]*policy.L4Filter{
 			cachedSelector1: L7Rules12,
 		},
 	},
-}
+})
 
-var L4PolicyMap1HeaderMatch = map[string]*policy.L4Filter{
+var L4PolicyMap1HeaderMatch = policy.NewL4PolicyMapWithValues(map[string]*policy.L4Filter{
 	"80/TCP": {
 		Port:     80,
 		Protocol: api.ProtoTCP,
@@ -305,9 +296,9 @@ var L4PolicyMap1HeaderMatch = map[string]*policy.L4Filter{
 			cachedSelector1: L7Rules12HeaderMatch,
 		},
 	},
-}
+})
 
-var L4PolicyMap1RequiresV2 = map[string]*policy.L4Filter{
+var L4PolicyMap1RequiresV2 = policy.NewL4PolicyMapWithValues(map[string]*policy.L4Filter{
 	"80/TCP": {
 		Port:     80,
 		Protocol: api.ProtoTCP,
@@ -317,9 +308,9 @@ var L4PolicyMap1RequiresV2 = map[string]*policy.L4Filter{
 			cachedRequiresV2Selector1: L7Rules12,
 		},
 	},
-}
+})
 
-var L4PolicyMap2 = map[string]*policy.L4Filter{
+var L4PolicyMap2 = policy.NewL4PolicyMapWithValues(map[string]*policy.L4Filter{
 	"8080/TCP": {
 		Port:     8080,
 		Protocol: api.ProtoTCP,
@@ -328,9 +319,9 @@ var L4PolicyMap2 = map[string]*policy.L4Filter{
 			cachedSelector2: L7Rules1,
 		},
 	},
-}
+})
 
-var L4PolicyMap3 = map[string]*policy.L4Filter{
+var L4PolicyMap3 = policy.NewL4PolicyMapWithValues(map[string]*policy.L4Filter{
 	"80/TCP": {
 		Port:     80,
 		Protocol: api.ProtoTCP,
@@ -339,10 +330,10 @@ var L4PolicyMap3 = map[string]*policy.L4Filter{
 			wildcardCachedSelector: L7Rules12,
 		},
 	},
-}
+})
 
 // L4PolicyMap4 is an L4-only policy, with no L7 rules.
-var L4PolicyMap4 = map[string]*policy.L4Filter{
+var L4PolicyMap4 = policy.NewL4PolicyMapWithValues(map[string]*policy.L4Filter{
 	"80/TCP": {
 		Port:     80,
 		Protocol: api.ProtoTCP,
@@ -350,10 +341,10 @@ var L4PolicyMap4 = map[string]*policy.L4Filter{
 			cachedSelector1: &policy.PerSelectorPolicy{L7Rules: api.L7Rules{}},
 		},
 	},
-}
+})
 
 // L4PolicyMap5 is an L4-only policy, with no L7 rules.
-var L4PolicyMap5 = map[string]*policy.L4Filter{
+var L4PolicyMap5 = policy.NewL4PolicyMapWithValues(map[string]*policy.L4Filter{
 	"80/TCP": {
 		Port:     80,
 		Protocol: api.ProtoTCP,
@@ -361,10 +352,10 @@ var L4PolicyMap5 = map[string]*policy.L4Filter{
 			wildcardCachedSelector: &policy.PerSelectorPolicy{L7Rules: api.L7Rules{}},
 		},
 	},
-}
+})
 
 // L4PolicyMapSNI is an L4-only policy, with SNI enforcement
-var L4PolicyMapSNI = map[string]*policy.L4Filter{
+var L4PolicyMapSNI = policy.NewL4PolicyMapWithValues(map[string]*policy.L4Filter{
 	"443/TCP": {
 		Port:     443,
 		Protocol: api.ProtoTCP,
@@ -377,7 +368,7 @@ var L4PolicyMapSNI = map[string]*policy.L4Filter{
 			},
 		},
 	},
-}
+})
 
 var ExpectedPerPortPoliciesSNI = []*cilium.PortNetworkPolicy{
 	{
@@ -457,22 +448,161 @@ var L4Policy2 = &policy.L4Policy{
 	Egress:  policy.L4DirectionPolicy{PortRules: L4PolicyMap2},
 }
 
-func (s *ServerSuite) TestGetHTTPRule(c *C) {
-	obtained, canShortCircuit := getHTTPRule(nil, PortRuleHTTP1, "")
-	c.Assert(obtained.Headers, checker.ExportedEquals, ExpectedHeaders1)
-	c.Assert(canShortCircuit, Equals, true)
+var PortRuleHeaderMatchSecret = &api.PortRuleHTTP{
+	HeaderMatches: []*api.HeaderMatch{
+		{
+			Mismatch: "",
+			Name:     "VeryImportantHeader",
+			Secret: &api.Secret{
+				Name:      "secretName",
+				Namespace: "cilium-secrets",
+			},
+		},
+	},
 }
 
-func (s *ServerSuite) Test_getWildcardNetworkPolicyRule(c *C) {
+var expectedHeadersPortRuleHeaderMatchSecretNilSecretManager = []*envoy_config_route.HeaderMatcher{
+	{
+		Name: "VeryImportantHeader",
+		HeaderMatchSpecifier: &envoy_config_route.HeaderMatcher_StringMatch{
+			StringMatch: &envoy_type_matcher.StringMatcher{
+				MatchPattern: &envoy_type_matcher.StringMatcher_Exact{
+					Exact: "",
+				},
+			},
+		},
+		InvertMatch: true,
+	},
+}
+
+var expectedHeadersPortRuleHeaderMatchInline = []*envoy_config_route.HeaderMatcher{
+	{
+		Name: "VeryImportantHeader",
+		HeaderMatchSpecifier: &envoy_config_route.HeaderMatcher_StringMatch{
+			StringMatch: &envoy_type_matcher.StringMatcher{
+				MatchPattern: &envoy_type_matcher.StringMatcher_Exact{
+					Exact: "somevalue",
+				},
+			},
+		},
+	},
+}
+
+// var expectedHeadersPortRuleHeaderMatchSDS = []*envoy_config_route.HeaderMatcher{
+// 	{
+// 		Name:                 "VeryImportantHeader",
+// 		HeaderMatchSpecifier: &envoy_config_route.HeaderMatcher_PresentMatch{PresentMatch: true},
+// 	},
+// }
+
+var expectedHeaderMatchesPortRuleHeaderMatchSDS = []*cilium.HeaderMatch{
+	{
+		Name:           "VeryImportantHeader",
+		ValueSdsSecret: "cilium-secrets/secretName",
+	},
+}
+
+var expectedHeadersPortRuleHeaderMatchSDS []*envoy_config_route.HeaderMatcher
+
+var PortRuleHeaderMatchSecretLogOnMismatch = &api.PortRuleHTTP{
+	HeaderMatches: []*api.HeaderMatch{
+		{
+			Mismatch: api.MismatchActionLog,
+			Name:     "VeryImportantHeader",
+			Secret: &api.Secret{
+				Name:      "secretName",
+				Namespace: "cilium-secrets",
+			},
+		},
+	},
+}
+
+var expectedHeaderMatchesLogOnMismatchPortRuleHeaderMatchSDS = []*cilium.HeaderMatch{
+	{
+		Name:           "VeryImportantHeader",
+		ValueSdsSecret: "cilium-secrets/secretName",
+		MismatchAction: cilium.HeaderMatch_CONTINUE_ON_MISMATCH,
+	},
+}
+
+type mockSecretManagerInlineSecrets struct{}
+
+func (m mockSecretManagerInlineSecrets) GetSecretString(_ context.Context, secret *api.Secret, ns string) (string, error) {
+	return "somevalue", nil
+}
+
+func (m mockSecretManagerInlineSecrets) PolicySecretSyncEnabled() bool {
+	return false
+}
+
+func (m mockSecretManagerInlineSecrets) SecretsOnlyFromSecretsNamespace() bool {
+	return false
+}
+
+func (m mockSecretManagerInlineSecrets) GetSecretSyncNamespace() string {
+	// unimplemented
+	return ""
+}
+
+type mockSecretManagerSDSSecrets struct{}
+
+func (m mockSecretManagerSDSSecrets) GetSecretString(_ context.Context, secret *api.Secret, ns string) (string, error) {
+	return "", nil
+}
+
+func (m mockSecretManagerSDSSecrets) PolicySecretSyncEnabled() bool {
+	return true
+}
+
+func (m mockSecretManagerSDSSecrets) SecretsOnlyFromSecretsNamespace() bool {
+	return true
+}
+
+func (m mockSecretManagerSDSSecrets) GetSecretSyncNamespace() string {
+	// unimplemented
+	return ""
+}
+
+func TestGetHTTPRule(t *testing.T) {
+	log.Logger.SetLevel(logrus.DebugLevel)
+
+	obtained, canShortCircuit := getHTTPRule(nil, PortRuleHTTP1, "", "")
+	require.Equal(t, ExpectedHeaders1, obtained.Headers)
+	require.True(t, canShortCircuit)
+
+	result, canShortCircuit := getHTTPRule(nil, PortRuleHeaderMatchSecret, "", "")
+	require.Equal(t, expectedHeadersPortRuleHeaderMatchSecretNilSecretManager, result.Headers)
+	require.True(t, canShortCircuit)
+
+	var smInline mockSecretManagerInlineSecrets
+	result, canShortCircuit = getHTTPRule(smInline, PortRuleHeaderMatchSecret, "", "")
+	require.Equal(t, expectedHeadersPortRuleHeaderMatchInline, result.Headers)
+	require.True(t, canShortCircuit)
+
+	var smSDS mockSecretManagerSDSSecrets
+	result, canShortCircuit = getHTTPRule(smSDS, PortRuleHeaderMatchSecret, "", "")
+	require.Equal(t, expectedHeadersPortRuleHeaderMatchSDS, result.Headers)
+	require.False(t, canShortCircuit)
+	require.Equal(t, expectedHeaderMatchesPortRuleHeaderMatchSDS, result.HeaderMatches)
+
+	result, canShortCircuit = getHTTPRule(smSDS, PortRuleHeaderMatchSecretLogOnMismatch, "", "")
+	require.Nil(t, result.Headers)
+	require.False(t, canShortCircuit)
+	require.Equal(t, expectedHeaderMatchesLogOnMismatchPortRuleHeaderMatchSDS, result.HeaderMatches)
+}
+
+func Test_getWildcardNetworkPolicyRule(t *testing.T) {
+	version := versioned.Latest()
 	perSelectorPoliciesWithWildcard := policy.L7DataMap{
 		cachedSelector1:           nil,
 		cachedRequiresV2Selector1: nil,
 		wildcardCachedSelector:    nil,
 	}
 
-	obtained := getWildcardNetworkPolicyRule(perSelectorPoliciesWithWildcard)
-	c.Assert(obtained, checker.ExportedEquals,
-		&cilium.PortNetworkPolicyRule{})
+	xds := testXdsServer(t)
+
+	obtained := xds.getWildcardNetworkPolicyRule(version, perSelectorPoliciesWithWildcard)
+	require.Equal(t, &cilium.PortNetworkPolicyRule{}, obtained)
 
 	// both cachedSelector2 and cachedSelector2 select identity 1001, but duplicates must have been removed
 	perSelectorPolicies := policy.L7DataMap{
@@ -481,55 +611,57 @@ func (s *ServerSuite) Test_getWildcardNetworkPolicyRule(c *C) {
 		cachedRequiresV2Selector1: nil,
 	}
 
-	obtained = getWildcardNetworkPolicyRule(perSelectorPolicies)
-	c.Assert(obtained, checker.ExportedEquals,
-		&cilium.PortNetworkPolicyRule{
-			RemotePolicies: []uint32{1001, 1002, 1003},
-		})
+	obtained = xds.getWildcardNetworkPolicyRule(version, perSelectorPolicies)
+	require.Equal(t, &cilium.PortNetworkPolicyRule{
+		RemotePolicies: []uint32{1001, 1002, 1003},
+	}, obtained)
 }
 
-func (s *ServerSuite) TestGetPortNetworkPolicyRule(c *C) {
-	obtained, canShortCircuit := getPortNetworkPolicyRule(cachedSelector1, cachedSelector1.IsWildcard(), policy.ParserTypeHTTP, L7Rules12)
-	c.Assert(obtained, checker.ExportedEquals, ExpectedPortNetworkPolicyRule12)
-	c.Assert(canShortCircuit, Equals, true)
+func TestGetPortNetworkPolicyRule(t *testing.T) {
+	version := versioned.Latest()
+	obtained, canShortCircuit := getPortNetworkPolicyRule(version, cachedSelector1, cachedSelector1.IsWildcard(), policy.ParserTypeHTTP, L7Rules12, false, false, "")
+	require.Equal(t, ExpectedPortNetworkPolicyRule12, obtained)
+	require.True(t, canShortCircuit)
 
-	obtained, canShortCircuit = getPortNetworkPolicyRule(cachedSelector1, cachedSelector1.IsWildcard(), policy.ParserTypeHTTP, L7Rules12HeaderMatch)
-	c.Assert(obtained, checker.ExportedEquals, ExpectedPortNetworkPolicyRule122HeaderMatch)
-	c.Assert(canShortCircuit, Equals, false)
+	obtained, canShortCircuit = getPortNetworkPolicyRule(version, cachedSelector1, cachedSelector1.IsWildcard(), policy.ParserTypeHTTP, L7Rules12HeaderMatch, false, false, "")
+	require.Equal(t, ExpectedPortNetworkPolicyRule122HeaderMatch, obtained)
+	require.False(t, canShortCircuit)
 
-	obtained, canShortCircuit = getPortNetworkPolicyRule(cachedSelector2, cachedSelector2.IsWildcard(), policy.ParserTypeHTTP, L7Rules1)
-	c.Assert(obtained, checker.ExportedEquals, ExpectedPortNetworkPolicyRule1)
-	c.Assert(canShortCircuit, Equals, true)
+	obtained, canShortCircuit = getPortNetworkPolicyRule(version, cachedSelector2, cachedSelector2.IsWildcard(), policy.ParserTypeHTTP, L7Rules1, false, false, "")
+	require.Equal(t, ExpectedPortNetworkPolicyRule1, obtained)
+	require.True(t, canShortCircuit)
 }
 
-func (s *ServerSuite) TestGetDirectionNetworkPolicy(c *C) {
+func TestGetDirectionNetworkPolicy(t *testing.T) {
 	// L4+L7
-	obtained := getDirectionNetworkPolicy(ep, L4PolicyMap1, true, nil, "ingress")
-	c.Assert(obtained, checker.ExportedEquals, ExpectedPerPortPolicies12Wildcard)
+	xds := testXdsServer(t)
+	obtained := xds.getDirectionNetworkPolicy(ep, L4PolicyMap1, true, false, false, "ingress", "")
+	require.Equal(t, ExpectedPerPortPolicies12Wildcard, obtained)
 
 	// L4+L7 with header mods
-	obtained = getDirectionNetworkPolicy(ep, L4PolicyMap1HeaderMatch, true, nil, "ingress")
-	c.Assert(obtained, checker.ExportedEquals, ExpectedPerPortPolicies122HeaderMatchWildcard)
+	obtained = xds.getDirectionNetworkPolicy(ep, L4PolicyMap1HeaderMatch, true, false, false, "ingress", "")
+	require.Equal(t, ExpectedPerPortPolicies122HeaderMatchWildcard, obtained)
 
 	// L4+L7
-	obtained = getDirectionNetworkPolicy(ep, L4PolicyMap2, true, nil, "ingress")
-	c.Assert(obtained, checker.ExportedEquals, ExpectedPerPortPolicies1Wildcard)
+	obtained = xds.getDirectionNetworkPolicy(ep, L4PolicyMap2, true, false, false, "ingress", "")
+	require.Equal(t, ExpectedPerPortPolicies1Wildcard, obtained)
 
 	// L4-only
-	obtained = getDirectionNetworkPolicy(ep, L4PolicyMap4, true, nil, "ingress")
-	c.Assert(obtained, checker.ExportedEquals, ExpectedPerPortPoliciesWildcard)
+	obtained = xds.getDirectionNetworkPolicy(ep, L4PolicyMap4, true, false, false, "ingress", "")
+	require.Equal(t, ExpectedPerPortPoliciesWildcard, obtained)
 
 	// L4-only
-	obtained = getDirectionNetworkPolicy(ep, L4PolicyMap5, true, nil, "ingress")
-	c.Assert(obtained, checker.ExportedEquals, ExpectedPerPortPoliciesWildcard)
+	obtained = xds.getDirectionNetworkPolicy(ep, L4PolicyMap5, true, false, false, "ingress", "")
+	require.Equal(t, ExpectedPerPortPoliciesWildcard, obtained)
 
 	// L4-only with SNI
-	obtained = getDirectionNetworkPolicy(ep, L4PolicyMapSNI, true, nil, "ingress")
-	c.Assert(obtained, checker.ExportedEquals, ExpectedPerPortPoliciesSNI)
+	obtained = xds.getDirectionNetworkPolicy(ep, L4PolicyMapSNI, true, false, false, "ingress", "")
+	require.Equal(t, ExpectedPerPortPoliciesSNI, obtained)
 }
 
-func (s *ServerSuite) TestGetNetworkPolicy(c *C) {
-	obtained := getNetworkPolicy(ep, nil, []string{IPv4Addr}, L4Policy1, true, true)
+func TestGetNetworkPolicy(t *testing.T) {
+	xds := testXdsServer(t)
+	obtained := xds.getNetworkPolicy(ep, []string{IPv4Addr}, L4Policy1, true, true, false, false, "")
 	expected := &cilium.NetworkPolicy{
 		EndpointIps:            []string{IPv4Addr},
 		EndpointId:             uint64(ep.GetID()),
@@ -537,11 +669,12 @@ func (s *ServerSuite) TestGetNetworkPolicy(c *C) {
 		EgressPerPortPolicies:  ExpectedPerPortPolicies1Wildcard,
 		ConntrackMapName:       "global",
 	}
-	c.Assert(obtained, checker.ExportedEquals, expected)
+	require.Equal(t, expected, obtained)
 }
 
-func (s *ServerSuite) TestGetNetworkPolicyWildcard(c *C) {
-	obtained := getNetworkPolicy(ep, nil, []string{IPv4Addr}, L4Policy2, true, true)
+func TestGetNetworkPolicyWildcard(t *testing.T) {
+	xds := testXdsServer(t)
+	obtained := xds.getNetworkPolicy(ep, []string{IPv4Addr}, L4Policy2, true, true, false, false, "")
 	expected := &cilium.NetworkPolicy{
 		EndpointIps:            []string{IPv4Addr},
 		EndpointId:             uint64(ep.GetID()),
@@ -549,11 +682,12 @@ func (s *ServerSuite) TestGetNetworkPolicyWildcard(c *C) {
 		EgressPerPortPolicies:  ExpectedPerPortPolicies1Wildcard,
 		ConntrackMapName:       "global",
 	}
-	c.Assert(obtained, checker.ExportedEquals, expected)
+	require.Equal(t, expected, obtained)
 }
 
-func (s *ServerSuite) TestGetNetworkPolicyDeny(c *C) {
-	obtained := getNetworkPolicy(ep, nil, []string{IPv4Addr}, L4Policy1RequiresV2, true, true)
+func TestGetNetworkPolicyDeny(t *testing.T) {
+	xds := testXdsServer(t)
+	obtained := xds.getNetworkPolicy(ep, []string{IPv4Addr}, L4Policy1RequiresV2, true, true, false, false, "")
 	expected := &cilium.NetworkPolicy{
 		EndpointIps:            []string{IPv4Addr},
 		EndpointId:             uint64(ep.GetID()),
@@ -561,11 +695,12 @@ func (s *ServerSuite) TestGetNetworkPolicyDeny(c *C) {
 		EgressPerPortPolicies:  ExpectedPerPortPolicies1Wildcard,
 		ConntrackMapName:       "global",
 	}
-	c.Assert(obtained, checker.ExportedEquals, expected)
+	require.Equal(t, expected, obtained)
 }
 
-func (s *ServerSuite) TestGetNetworkPolicyWildcardDeny(c *C) {
-	obtained := getNetworkPolicy(ep, nil, []string{IPv4Addr}, L4Policy1RequiresV2, true, true)
+func TestGetNetworkPolicyWildcardDeny(t *testing.T) {
+	xds := testXdsServer(t)
+	obtained := xds.getNetworkPolicy(ep, []string{IPv4Addr}, L4Policy1RequiresV2, true, true, false, false, "")
 	expected := &cilium.NetworkPolicy{
 		EndpointIps:            []string{IPv4Addr},
 		EndpointId:             uint64(ep.GetID()),
@@ -573,11 +708,12 @@ func (s *ServerSuite) TestGetNetworkPolicyWildcardDeny(c *C) {
 		EgressPerPortPolicies:  ExpectedPerPortPolicies1Wildcard,
 		ConntrackMapName:       "global",
 	}
-	c.Assert(obtained, checker.ExportedEquals, expected)
+	require.Equal(t, expected, obtained)
 }
 
-func (s *ServerSuite) TestGetNetworkPolicyNil(c *C) {
-	obtained := getNetworkPolicy(ep, nil, []string{IPv4Addr}, nil, true, true)
+func TestGetNetworkPolicyNil(t *testing.T) {
+	xds := testXdsServer(t)
+	obtained := xds.getNetworkPolicy(ep, []string{IPv4Addr}, nil, true, true, false, false, "")
 	expected := &cilium.NetworkPolicy{
 		EndpointIps:            []string{IPv4Addr},
 		EndpointId:             uint64(ep.GetID()),
@@ -585,11 +721,12 @@ func (s *ServerSuite) TestGetNetworkPolicyNil(c *C) {
 		EgressPerPortPolicies:  nil,
 		ConntrackMapName:       "global",
 	}
-	c.Assert(obtained, checker.ExportedEquals, expected)
+	require.Equal(t, expected, obtained)
 }
 
-func (s *ServerSuite) TestGetNetworkPolicyIngressNotEnforced(c *C) {
-	obtained := getNetworkPolicy(ep, nil, []string{IPv4Addr}, L4Policy2, false, true)
+func TestGetNetworkPolicyIngressNotEnforced(t *testing.T) {
+	xds := testXdsServer(t)
+	obtained := xds.getNetworkPolicy(ep, []string{IPv4Addr}, L4Policy2, false, true, false, false, "")
 	expected := &cilium.NetworkPolicy{
 		EndpointIps:            []string{IPv4Addr},
 		EndpointId:             uint64(ep.GetID()),
@@ -597,11 +734,12 @@ func (s *ServerSuite) TestGetNetworkPolicyIngressNotEnforced(c *C) {
 		EgressPerPortPolicies:  ExpectedPerPortPolicies1Wildcard,
 		ConntrackMapName:       "global",
 	}
-	c.Assert(obtained, checker.ExportedEquals, expected)
+	require.Equal(t, expected, obtained)
 }
 
-func (s *ServerSuite) TestGetNetworkPolicyEgressNotEnforced(c *C) {
-	obtained := getNetworkPolicy(ep, nil, []string{IPv4Addr}, L4Policy1RequiresV2, true, false)
+func TestGetNetworkPolicyEgressNotEnforced(t *testing.T) {
+	xds := testXdsServer(t)
+	obtained := xds.getNetworkPolicy(ep, []string{IPv4Addr}, L4Policy1RequiresV2, true, false, false, false, "")
 	expected := &cilium.NetworkPolicy{
 		EndpointIps:            []string{IPv4Addr},
 		EndpointId:             uint64(ep.GetID()),
@@ -609,11 +747,11 @@ func (s *ServerSuite) TestGetNetworkPolicyEgressNotEnforced(c *C) {
 		EgressPerPortPolicies:  allowAllPortNetworkPolicy,
 		ConntrackMapName:       "global",
 	}
-	c.Assert(obtained, checker.ExportedEquals, expected)
+	require.Equal(t, expected, obtained)
 }
 
 var L4PolicyL7 = &policy.L4Policy{
-	Ingress: policy.L4DirectionPolicy{PortRules: map[string]*policy.L4Filter{
+	Ingress: policy.L4DirectionPolicy{PortRules: policy.NewL4PolicyMapWithValues(map[string]*policy.L4Filter{
 		"9090/TCP": {
 			Port: 9090, Protocol: api.ProtoTCP,
 			L7Parser: "tester",
@@ -623,54 +761,61 @@ var L4PolicyL7 = &policy.L4Policy{
 					L7: []api.PortRuleL7{
 						map[string]string{
 							"method": "PUT",
-							"path":   "/"},
+							"path":   "/",
+						},
 						map[string]string{
 							"method": "GET",
-							"path":   "/"},
+							"path":   "/",
+						},
 					},
 				}},
 			},
 			Ingress: true,
 		},
-	}},
+	})},
 }
 
 var ExpectedPerPortPoliciesL7 = []*cilium.PortNetworkPolicy{
 	{
 		Port:     9090,
 		Protocol: envoy_config_core.SocketAddress_TCP,
-		Rules: []*cilium.PortNetworkPolicyRule{{
-			// RemotePolicies: []uint32{1001, 1002}, // Effective wildcard due to only one selector in the policy
-			L7Proto: "tester",
-			L7: &cilium.PortNetworkPolicyRule_L7Rules{
-				L7Rules: &cilium.L7NetworkPolicyRules{
-					L7AllowRules: []*cilium.L7NetworkPolicyRule{
-						{Rule: map[string]string{
-							"method": "PUT",
-							"path":   "/"}},
-						{Rule: map[string]string{
-							"method": "GET",
-							"path":   "/"}},
+		Rules: []*cilium.PortNetworkPolicyRule{
+			{
+				// RemotePolicies: []uint32{1001, 1002}, // Effective wildcard due to only one selector in the policy
+				L7Proto: "tester",
+				L7: &cilium.PortNetworkPolicyRule_L7Rules{
+					L7Rules: &cilium.L7NetworkPolicyRules{
+						L7AllowRules: []*cilium.L7NetworkPolicyRule{
+							{Rule: map[string]string{
+								"method": "PUT",
+								"path":   "/",
+							}},
+							{Rule: map[string]string{
+								"method": "GET",
+								"path":   "/",
+							}},
+						},
 					},
 				},
-			}},
+			},
 		},
 	},
 }
 
-func (s *ServerSuite) TestGetNetworkPolicyL7(c *C) {
-	obtained := getNetworkPolicy(ep, nil, []string{IPv4Addr}, L4PolicyL7, true, true)
+func TestGetNetworkPolicyL7(t *testing.T) {
+	xds := testXdsServer(t)
+	obtained := xds.getNetworkPolicy(ep, []string{IPv4Addr}, L4PolicyL7, true, true, false, false, "")
 	expected := &cilium.NetworkPolicy{
 		EndpointIps:            []string{IPv4Addr},
 		EndpointId:             uint64(ep.GetID()),
 		IngressPerPortPolicies: ExpectedPerPortPoliciesL7,
 		ConntrackMapName:       "global",
 	}
-	c.Assert(obtained, checker.ExportedEquals, expected)
+	require.Equal(t, expected, obtained)
 }
 
 var L4PolicyKafka = &policy.L4Policy{
-	Ingress: policy.L4DirectionPolicy{PortRules: map[string]*policy.L4Filter{
+	Ingress: policy.L4DirectionPolicy{PortRules: policy.NewL4PolicyMapWithValues(map[string]*policy.L4Filter{
 		"9090/TCP": {
 			Port: 9092, Protocol: api.ProtoTCP,
 			L7Parser: "kafka",
@@ -684,48 +829,53 @@ var L4PolicyKafka = &policy.L4Policy{
 			},
 			Ingress: true,
 		},
-	}},
+	})},
 }
 
 var ExpectedPerPortPoliciesKafka = []*cilium.PortNetworkPolicy{
 	{
 		Port:     9092,
 		Protocol: envoy_config_core.SocketAddress_TCP,
-		Rules: []*cilium.PortNetworkPolicyRule{{
-			// RemotePolicies: []uint32{1001, 1002}, // Effective wildcard due to only one selector in the policy
-			L7Proto: "kafka",
-			L7: &cilium.PortNetworkPolicyRule_KafkaRules{
-				KafkaRules: &cilium.KafkaNetworkPolicyRules{
-					KafkaRules: []*cilium.KafkaNetworkPolicyRule{{
-						ApiVersion: -1,
-						ApiKeys: []int32{int32(kafka.FetchKey), int32(kafka.OffsetsKey),
-							int32(kafka.MetadataKey), int32(kafka.OffsetCommitKey),
-							int32(kafka.OffsetFetchKey), int32(kafka.FindCoordinatorKey),
-							int32(kafka.JoinGroupKey), int32(kafka.HeartbeatKey),
-							int32(kafka.LeaveGroupKey), int32(kafka.SyncgroupKey),
-							int32(kafka.APIVersionsKey)},
-						ClientId: "",
-						Topic:    "deathstar-plans",
-					}},
+		Rules: []*cilium.PortNetworkPolicyRule{
+			{
+				// RemotePolicies: []uint32{1001, 1002}, // Effective wildcard due to only one selector in the policy
+				L7Proto: "kafka",
+				L7: &cilium.PortNetworkPolicyRule_KafkaRules{
+					KafkaRules: &cilium.KafkaNetworkPolicyRules{
+						KafkaRules: []*cilium.KafkaNetworkPolicyRule{{
+							ApiVersion: -1,
+							ApiKeys: []int32{
+								int32(kafka.FetchKey), int32(kafka.OffsetsKey),
+								int32(kafka.MetadataKey), int32(kafka.OffsetCommitKey),
+								int32(kafka.OffsetFetchKey), int32(kafka.FindCoordinatorKey),
+								int32(kafka.JoinGroupKey), int32(kafka.HeartbeatKey),
+								int32(kafka.LeaveGroupKey), int32(kafka.SyncgroupKey),
+								int32(kafka.APIVersionsKey),
+							},
+							ClientId: "",
+							Topic:    "deathstar-plans",
+						}},
+					},
 				},
-			}},
+			},
 		},
 	},
 }
 
-func (s *ServerSuite) TestGetNetworkPolicyKafka(c *C) {
-	obtained := getNetworkPolicy(ep, nil, []string{IPv4Addr}, L4PolicyKafka, true, true)
+func TestGetNetworkPolicyKafka(t *testing.T) {
+	xds := testXdsServer(t)
+	obtained := xds.getNetworkPolicy(ep, []string{IPv4Addr}, L4PolicyKafka, true, true, false, false, "")
 	expected := &cilium.NetworkPolicy{
 		EndpointIps:            []string{IPv4Addr},
 		EndpointId:             uint64(ep.GetID()),
 		IngressPerPortPolicies: ExpectedPerPortPoliciesKafka,
 		ConntrackMapName:       "global",
 	}
-	c.Assert(obtained, checker.ExportedEquals, expected)
+	require.Equal(t, expected, obtained)
 }
 
 var L4PolicyMySQL = &policy.L4Policy{
-	Egress: policy.L4DirectionPolicy{PortRules: map[string]*policy.L4Filter{
+	Egress: policy.L4DirectionPolicy{PortRules: policy.NewL4PolicyMapWithValues(map[string]*policy.L4Filter{
 		"3306/TCP": {
 			Port: 3306, Protocol: api.ProtoTCP,
 			L7Parser: "envoy.filters.network.mysql_proxy",
@@ -735,39 +885,42 @@ var L4PolicyMySQL = &policy.L4Policy{
 					L7: []api.PortRuleL7{
 						map[string]string{
 							"action":     "deny",
-							"user.mysql": "select"},
+							"user.mysql": "select",
+						},
 					},
 				}},
 			},
 			Ingress: false,
 		},
-	}},
+	})},
 }
 
 var ExpectedPerPortPoliciesMySQL = []*cilium.PortNetworkPolicy{
 	{
 		Port:     3306,
 		Protocol: envoy_config_core.SocketAddress_TCP,
-		Rules: []*cilium.PortNetworkPolicyRule{{
-			// RemotePolicies: []uint32{1001, 1002}, // Effective wildcard due to only one selector in the policy
-			L7Proto: "envoy.filters.network.mysql_proxy",
-			L7: &cilium.PortNetworkPolicyRule_L7Rules{
-				L7Rules: &cilium.L7NetworkPolicyRules{
-					L7DenyRules: []*cilium.L7NetworkPolicyRule{{
-						MetadataRule: []*envoy_type_matcher.MetadataMatcher{{
-							Filter: "envoy.filters.network.mysql_proxy",
-							Path: []*envoy_type_matcher.MetadataMatcher_PathSegment{{
-								Segment: &envoy_type_matcher.MetadataMatcher_PathSegment_Key{Key: "user.mysql"},
-							}},
-							Value: &envoy_type_matcher.ValueMatcher{
-								MatchPattern: &envoy_type_matcher.ValueMatcher_ListMatch{
-									ListMatch: &envoy_type_matcher.ListMatcher{
-										MatchPattern: &envoy_type_matcher.ListMatcher_OneOf{
-											OneOf: &envoy_type_matcher.ValueMatcher{
-												MatchPattern: &envoy_type_matcher.ValueMatcher_StringMatch{
-													StringMatch: &envoy_type_matcher.StringMatcher{
-														MatchPattern: &envoy_type_matcher.StringMatcher_Exact{
-															Exact: "select",
+		Rules: []*cilium.PortNetworkPolicyRule{
+			{
+				// RemotePolicies: []uint32{1001, 1002}, // Effective wildcard due to only one selector in the policy
+				L7Proto: "envoy.filters.network.mysql_proxy",
+				L7: &cilium.PortNetworkPolicyRule_L7Rules{
+					L7Rules: &cilium.L7NetworkPolicyRules{
+						L7DenyRules: []*cilium.L7NetworkPolicyRule{{
+							MetadataRule: []*envoy_type_matcher.MetadataMatcher{{
+								Filter: "envoy.filters.network.mysql_proxy",
+								Path: []*envoy_type_matcher.MetadataMatcher_PathSegment{{
+									Segment: &envoy_type_matcher.MetadataMatcher_PathSegment_Key{Key: "user.mysql"},
+								}},
+								Value: &envoy_type_matcher.ValueMatcher{
+									MatchPattern: &envoy_type_matcher.ValueMatcher_ListMatch{
+										ListMatch: &envoy_type_matcher.ListMatcher{
+											MatchPattern: &envoy_type_matcher.ListMatcher_OneOf{
+												OneOf: &envoy_type_matcher.ValueMatcher{
+													MatchPattern: &envoy_type_matcher.ValueMatcher_StringMatch{
+														StringMatch: &envoy_type_matcher.StringMatcher{
+															MatchPattern: &envoy_type_matcher.StringMatcher_Exact{
+																Exact: "select",
+															},
 														},
 													},
 												},
@@ -775,157 +928,709 @@ var ExpectedPerPortPoliciesMySQL = []*cilium.PortNetworkPolicy{
 										},
 									},
 								},
-							},
+							}},
 						}},
-					}},
+					},
 				},
-			}},
+			},
 		},
 	},
 }
 
-func (s *ServerSuite) TestGetNetworkPolicyMySQL(c *C) {
-	obtained := getNetworkPolicy(ep, nil, []string{IPv4Addr}, L4PolicyMySQL, true, true)
+func TestGetNetworkPolicyMySQL(t *testing.T) {
+	xds := testXdsServer(t)
+	obtained := xds.getNetworkPolicy(ep, []string{IPv4Addr}, L4PolicyMySQL, true, true, false, false, "")
 	expected := &cilium.NetworkPolicy{
 		EndpointIps:           []string{IPv4Addr},
 		EndpointId:            uint64(ep.GetID()),
 		EgressPerPortPolicies: ExpectedPerPortPoliciesMySQL,
 		ConntrackMapName:      "global",
 	}
-	c.Assert(obtained, checker.ExportedEquals, expected)
+	require.Equal(t, expected, obtained)
 }
 
-var kafkaIngressVisibilityPolicy = &policy.VisibilityPolicy{
-	Ingress: policy.DirectionalVisibilityPolicy{
-		"9092/TCP": &policy.VisibilityMetadata{ //"<Ingress/9092/TCP/Kafka>"
-			Port:       9092,
-			Parser:     "Kafka",
-			Proto:      u8proto.TCP,
-			Ingress:    true,
-			L7Metadata: make(policy.L7DataMap),
-		},
+var fullValuesTLSContext = &policy.TLSContext{
+	TrustedCA:        "foo",
+	CertificateChain: "certchain",
+	PrivateKey:       "privatekey",
+	Secret: types.NamespacedName{
+		Name:      "testsecret",
+		Namespace: "testnamespace",
 	},
 }
 
-func (s *ServerSuite) TestGetNetworkPolicyProxylibVisibility(c *C) {
-	// No visibility gets allow-all policies
-	// Allow-all policies are generated also when l4 filter is nil when policy is not enforced.
-	obtained := getNetworkPolicy(ep, nil, []string{IPv4Addr}, nil, false, false)
+var onlyTrustedCAOriginatingTLSContext = &policy.TLSContext{
+	TrustedCA: "foo",
+	Secret: types.NamespacedName{
+		Name:      "testsecret",
+		Namespace: "testnamespace",
+	},
+}
 
-	expected := &cilium.NetworkPolicy{
-		EndpointIps:            []string{IPv4Addr},
-		EndpointId:             uint64(ep.GetID()),
-		IngressPerPortPolicies: allowAllPortNetworkPolicy,
-		EgressPerPortPolicies:  allowAllPortNetworkPolicy,
-		ConntrackMapName:       "global",
-	}
+var onlyTerminationDetailsTLSContext = &policy.TLSContext{
+	CertificateChain: "certchain",
+	PrivateKey:       "privatekey",
+	Secret: types.NamespacedName{
+		Name:      "testsecret",
+		Namespace: "testnamespace",
+	},
+}
 
-	c.Assert(obtained, checker.ExportedEquals, expected)
+var fullValuesTLSContextFromFile = &policy.TLSContext{
+	TrustedCA:        "foo",
+	CertificateChain: "certchain",
+	PrivateKey:       "privatekey",
+	FromFile:         true,
+	Secret: types.NamespacedName{
+		Name:      "testsecret",
+		Namespace: "testnamespace",
+	},
+}
 
-	obtained = getNetworkPolicy(ep, kafkaIngressVisibilityPolicy, []string{IPv4Addr}, nil, false, false)
+var onlyTrustedCAOriginatingTLSContextFromFile = &policy.TLSContext{
+	TrustedCA: "foo",
+	FromFile:  true,
+	Secret: types.NamespacedName{
+		Name:      "testsecret",
+		Namespace: "testnamespace",
+	},
+}
 
-	// Visibility policies still contain the allow-all policies, when policy is not enforced
-	expected = &cilium.NetworkPolicy{
-		EndpointIps: []string{IPv4Addr},
-		EndpointId:  uint64(ep.GetID()),
-		IngressPerPortPolicies: []*cilium.PortNetworkPolicy{
-			allowAllTCPPortNetworkPolicy,
-			{
-				Port:     uint32(9092),
-				Protocol: envoy_config_core.SocketAddress_TCP,
-				Rules: []*cilium.PortNetworkPolicyRule{
-					{
-						L7Proto: "Kafka",
+var onlyTerminationDetailsTLSContextFromFile = &policy.TLSContext{
+	CertificateChain: "certchain",
+	PrivateKey:       "privatekey",
+	FromFile:         true,
+	Secret: types.NamespacedName{
+		Name:      "testsecret",
+		Namespace: "testnamespace",
+	},
+}
+
+// newL4PolicyTLSEgress is a small helper to reduce boilerplate.
+func newL4PolicyTLSEgress(tls *policy.TLSContext) *policy.L4Policy {
+	return &policy.L4Policy{
+		Egress: policy.L4DirectionPolicy{PortRules: policy.NewL4PolicyMapWithValues(map[string]*policy.L4Filter{
+			"443/TCP": {
+				Port: 443, Protocol: api.ProtoTCP,
+				L7Parser: "tls",
+				PerSelectorPolicies: policy.L7DataMap{
+					cachedSelector1: &policy.PerSelectorPolicy{
+						OriginatingTLS: tls,
 					},
 				},
 			},
-		},
-		EgressPerPortPolicies: allowAllPortNetworkPolicy,
-		ConntrackMapName:      "global",
+		})},
 	}
-
-	c.Assert(obtained, checker.ExportedEquals, expected)
 }
 
-var L4PolicyTLSEgress = &policy.L4Policy{
-	Egress: policy.L4DirectionPolicy{PortRules: map[string]*policy.L4Filter{
+var L4PolicyTLSEgressFullValues = newL4PolicyTLSEgress(fullValuesTLSContext)
+
+var L4PolicyTLSEgressFullValuesFromFile = newL4PolicyTLSEgress(fullValuesTLSContextFromFile)
+
+var L4PolicyTLSEgressOnlyTrustedCA = newL4PolicyTLSEgress(onlyTrustedCAOriginatingTLSContext)
+
+var L4PolicyTLSEgressOnlyTrustedCAFromFile = newL4PolicyTLSEgress(onlyTrustedCAOriginatingTLSContextFromFile)
+
+func newEgressPortNetworkPolicyReturnVal(tls *cilium.TLSContext) []*cilium.PortNetworkPolicy {
+	return []*cilium.PortNetworkPolicy{
+		{
+			Port:     443,
+			Protocol: envoy_config_core.SocketAddress_TCP,
+			Rules: []*cilium.PortNetworkPolicyRule{{
+				UpstreamTlsContext: tls,
+			}},
+		},
+	}
+}
+
+var ciliumTLSContextOnlyValidatingSDSDetails = &cilium.TLSContext{
+	ValidationContextSdsSecret: "cilium-secrets/testnamespace-testsecret",
+}
+
+var ciliumTLSContextOnlySDSDetails = &cilium.TLSContext{
+	TlsSdsSecret: "cilium-secrets/testnamespace-testsecret",
+}
+
+var ciliumTLSContextOnlyTrustedCa = &cilium.TLSContext{
+	TrustedCa: "foo",
+}
+
+var ciliumTLSContextAllDetails = &cilium.TLSContext{
+	TrustedCa:        "foo",
+	CertificateChain: "certchain",
+	PrivateKey:       "privatekey",
+}
+
+var ciliumTLSContextOnlyTerminationDetails = &cilium.TLSContext{
+	CertificateChain: "certchain",
+	PrivateKey:       "privatekey",
+}
+
+var ExpectedPerPortPoliciesTLSEgress = newEgressPortNetworkPolicyReturnVal(ciliumTLSContextOnlyValidatingSDSDetails)
+
+var ExpectedPerPortPoliciesTLSEgressNoSync = newEgressPortNetworkPolicyReturnVal(ciliumTLSContextOnlyTrustedCa)
+
+var ExpectedPerPortPoliciesTLSEgressNoSyncUseFullContext = newEgressPortNetworkPolicyReturnVal(ciliumTLSContextAllDetails)
+
+func newL4PolicyTLSIngress(tls *policy.TLSContext) *policy.L4Policy {
+	return &policy.L4Policy{
+		Ingress: policy.L4DirectionPolicy{PortRules: policy.NewL4PolicyMapWithValues(map[string]*policy.L4Filter{
+			"443/TCP": {
+				Port: 443, Protocol: api.ProtoTCP,
+				L7Parser: "tls",
+				PerSelectorPolicies: policy.L7DataMap{
+					cachedSelector1: &policy.PerSelectorPolicy{
+						TerminatingTLS: tls,
+					},
+				},
+			},
+		})},
+	}
+}
+
+var L4PolicyTLSIngressFullValues = newL4PolicyTLSIngress(fullValuesTLSContext)
+
+var L4PolicyTLSIngressFullValuesFromFile = newL4PolicyTLSIngress(fullValuesTLSContextFromFile)
+
+var L4PolicyTLSIngressOnlyTerminationDetails = newL4PolicyTLSIngress(onlyTerminationDetailsTLSContext)
+
+var L4PolicyTLSIngressOnlyTerminationDetailsFromFile = newL4PolicyTLSIngress(onlyTerminationDetailsTLSContextFromFile)
+
+func newIngressPortNetworkPolicyReturnVal(tls *cilium.TLSContext) []*cilium.PortNetworkPolicy {
+	return []*cilium.PortNetworkPolicy{
+		{
+			Port:     443,
+			Protocol: envoy_config_core.SocketAddress_TCP,
+			Rules: []*cilium.PortNetworkPolicyRule{{
+				DownstreamTlsContext: tls,
+			}},
+		},
+	}
+}
+
+var ExpectedPerPortPoliciesTLSIngress = newIngressPortNetworkPolicyReturnVal(ciliumTLSContextOnlySDSDetails)
+
+var ExpectedPerPortPoliciesTLSIngressNoSync = newIngressPortNetworkPolicyReturnVal(ciliumTLSContextOnlyTerminationDetails)
+
+var ExpectedPerPortPoliciesTLSIngressNoSyncUseFullContext = newIngressPortNetworkPolicyReturnVal(ciliumTLSContextAllDetails)
+
+var L4PolicyTLSFullContext = &policy.L4Policy{
+	Ingress: policy.L4DirectionPolicy{PortRules: policy.NewL4PolicyMapWithValues(map[string]*policy.L4Filter{
 		"443/TCP": {
 			Port: 443, Protocol: api.ProtoTCP,
 			L7Parser: "tls",
 			PerSelectorPolicies: policy.L7DataMap{
 				cachedSelector1: &policy.PerSelectorPolicy{
-					OriginatingTLS: &policy.TLSContext{
-						TrustedCA: "foo",
+					TerminatingTLS: &policy.TLSContext{
+						CertificateChain: "terminatingCertchain",
+						PrivateKey:       "terminatingKey",
+						TrustedCA:        "terminatingCA",
+						Secret: types.NamespacedName{
+							Name:      "terminating-tls",
+							Namespace: "tlsns",
+						},
 					},
-				},
-			},
-		},
-	}},
-}
-
-var ExpectedPerPortPoliciesTLSEgress = []*cilium.PortNetworkPolicy{
-	{
-		Port:     443,
-		Protocol: envoy_config_core.SocketAddress_TCP,
-		Rules: []*cilium.PortNetworkPolicyRule{{
-			UpstreamTlsContext: &cilium.TLSContext{
-				TrustedCa: "foo",
-			},
-		}},
-	},
-}
-
-func (s *ServerSuite) TestGetNetworkPolicyTLSEgress(c *C) {
-	obtained := getNetworkPolicy(ep, nil, []string{IPv4Addr}, L4PolicyTLSEgress, true, true)
-	expected := &cilium.NetworkPolicy{
-		EndpointIps:           []string{IPv4Addr},
-		EndpointId:            uint64(ep.GetID()),
-		EgressPerPortPolicies: ExpectedPerPortPoliciesTLSEgress,
-		ConntrackMapName:      "global",
-	}
-	c.Assert(obtained, checker.ExportedEquals, expected)
-}
-
-var L4PolicyTLSIngress = &policy.L4Policy{
-	Ingress: policy.L4DirectionPolicy{PortRules: map[string]*policy.L4Filter{
-		"443/TCP": {
-			Port: 443, Protocol: api.ProtoTCP,
-			L7Parser: "tls",
-			PerSelectorPolicies: policy.L7DataMap{
-				cachedSelector1: &policy.PerSelectorPolicy{
 					OriginatingTLS: &policy.TLSContext{
-						CertificateChain: "certchain",
-						PrivateKey:       "key",
+						CertificateChain: "originatingCertchain",
+						PrivateKey:       "originatingKey",
+						TrustedCA:        "originatingCA",
+						Secret: types.NamespacedName{
+							Name:      "originating-tls",
+							Namespace: "tlsns",
+						},
 					},
 				},
 			},
 			Ingress: true,
 		},
-	}},
+	})},
 }
 
-var ExpectedPerPortPoliciesTLSIngress = []*cilium.PortNetworkPolicy{
+var ExpectedPerPortPoliciesTLSFullContext = []*cilium.PortNetworkPolicy{
 	{
 		Port:     443,
 		Protocol: envoy_config_core.SocketAddress_TCP,
 		Rules: []*cilium.PortNetworkPolicyRule{{
+			DownstreamTlsContext: &cilium.TLSContext{
+				CertificateChain: "terminatingCertchain",
+				PrivateKey:       "terminatingKey",
+				TrustedCa:        "terminatingCA",
+			},
 			UpstreamTlsContext: &cilium.TLSContext{
-				CertificateChain: "certchain",
-				PrivateKey:       "key",
+				CertificateChain: "originatingCertchain",
+				PrivateKey:       "originatingKey",
+				TrustedCa:        "originatingCA",
 			},
 		}},
 	},
 }
 
-func (s *ServerSuite) TestGetNetworkPolicyTLSIngress(c *C) {
-	obtained := getNetworkPolicy(ep, nil, []string{IPv4Addr}, L4PolicyTLSIngress, true, true)
-	expected := &cilium.NetworkPolicy{
-		EndpointIps:            []string{IPv4Addr},
-		EndpointId:             uint64(ep.GetID()),
-		IngressPerPortPolicies: ExpectedPerPortPoliciesTLSIngress,
-		ConntrackMapName:       "global",
+var ExpectedPerPortPoliciesTLSNotFullContext = []*cilium.PortNetworkPolicy{
+	{
+		Port:     443,
+		Protocol: envoy_config_core.SocketAddress_TCP,
+		Rules: []*cilium.PortNetworkPolicyRule{{
+			DownstreamTlsContext: &cilium.TLSContext{
+				CertificateChain: "terminatingCertchain",
+				PrivateKey:       "terminatingKey",
+			},
+			UpstreamTlsContext: &cilium.TLSContext{
+				TrustedCa: "originatingCA",
+			},
+		}},
+	},
+}
+
+var ExpectedPerPortPoliciesBothWaysTLSSDS = []*cilium.PortNetworkPolicy{
+	{
+		Port:     443,
+		Protocol: envoy_config_core.SocketAddress_TCP,
+		Rules: []*cilium.PortNetworkPolicyRule{{
+			DownstreamTlsContext: &cilium.TLSContext{
+				TlsSdsSecret: "cilium-secrets/tlsns-terminating-tls",
+			},
+			UpstreamTlsContext: &cilium.TLSContext{
+				ValidationContextSdsSecret: "cilium-secrets/tlsns-originating-tls",
+			},
+		}},
+	},
+}
+
+func TestGetNetworkPolicyTLSInterception(t *testing.T) {
+	type args struct {
+		inputPolicy            *policy.L4Policy
+		useFullTLSContext      bool
+		useSDS                 bool
+		policySecretsNamespace string
 	}
-	c.Assert(obtained, checker.ExportedEquals, expected)
+
+	tests := []struct {
+		name        string
+		args        args
+		wantEgress  []*cilium.PortNetworkPolicy
+		wantIngress []*cilium.PortNetworkPolicy
+	}{
+		{
+			name: "Egress Originating TLS Fully Populated with secret sync",
+			args: args{
+				inputPolicy:            L4PolicyTLSEgressFullValues,
+				useFullTLSContext:      false,
+				useSDS:                 true,
+				policySecretsNamespace: "cilium-secrets",
+			},
+			wantEgress:  ExpectedPerPortPoliciesTLSEgress,
+			wantIngress: nil,
+		},
+		{
+			name: "Egress Originating TLS Fully Populated, UseFullTLSContext, no sync",
+			args: args{
+				inputPolicy:            L4PolicyTLSEgressFullValues,
+				useFullTLSContext:      true,
+				useSDS:                 false,
+				policySecretsNamespace: "",
+			},
+			wantEgress:  ExpectedPerPortPoliciesTLSEgressNoSyncUseFullContext,
+			wantIngress: nil,
+		},
+		{
+			name: "Egress Originating TLS Fully Populated, UseFullTLSContext, no sync, secretsNamespace",
+			args: args{
+				inputPolicy:            L4PolicyTLSEgressFullValues,
+				useFullTLSContext:      true,
+				useSDS:                 false,
+				policySecretsNamespace: "cilium-secrets",
+			},
+			wantEgress:  ExpectedPerPortPoliciesTLSEgressNoSyncUseFullContext,
+			wantIngress: nil,
+		},
+		{
+			name: "Egress Originating TLS Fully Populated, no sync",
+			args: args{
+				inputPolicy:            L4PolicyTLSEgressFullValues,
+				useFullTLSContext:      false,
+				useSDS:                 false,
+				policySecretsNamespace: "",
+			},
+			wantEgress:  ExpectedPerPortPoliciesTLSEgressNoSync,
+			wantIngress: nil,
+		},
+		{
+			name: "Egress Originating TLS Fully Populated, no sync, secretsNamespace",
+			args: args{
+				inputPolicy:            L4PolicyTLSEgressFullValues,
+				useFullTLSContext:      false,
+				useSDS:                 false,
+				policySecretsNamespace: "cilium-secrets",
+			},
+			wantEgress:  ExpectedPerPortPoliciesTLSEgressNoSync,
+			wantIngress: nil,
+		},
+		{
+			name: "Egress Originating TLS Only TrustedCA with secret sync",
+			args: args{
+				inputPolicy:            L4PolicyTLSEgressOnlyTrustedCA,
+				useFullTLSContext:      false,
+				useSDS:                 true,
+				policySecretsNamespace: "cilium-secrets",
+			},
+			wantEgress:  ExpectedPerPortPoliciesTLSEgress,
+			wantIngress: nil,
+		},
+		{
+			name: "Egress Originating TLS Only TrustedCA, UseFullTLSContext, no sync",
+			args: args{
+				inputPolicy:            L4PolicyTLSEgressOnlyTrustedCA,
+				useFullTLSContext:      true,
+				useSDS:                 false,
+				policySecretsNamespace: "",
+			},
+			wantEgress:  ExpectedPerPortPoliciesTLSEgressNoSync,
+			wantIngress: nil,
+		},
+		{
+			name: "Egress Originating TLS Only TrustedCA, no sync",
+			args: args{
+				inputPolicy:            L4PolicyTLSEgressOnlyTrustedCA,
+				useFullTLSContext:      false,
+				useSDS:                 false,
+				policySecretsNamespace: "",
+			},
+			wantEgress:  ExpectedPerPortPoliciesTLSEgressNoSync,
+			wantIngress: nil,
+		},
+		{
+			name: "Egress Originating TLS Only TrustedCA, UseFullTLSContext, no sync, secretsNamespace",
+			args: args{
+				inputPolicy:            L4PolicyTLSEgressOnlyTrustedCA,
+				useFullTLSContext:      true,
+				useSDS:                 false,
+				policySecretsNamespace: "cilium-secrets",
+			},
+			wantEgress:  ExpectedPerPortPoliciesTLSEgressNoSync,
+			wantIngress: nil,
+		},
+		{
+			name: "Egress Originating TLS Only TrustedCA, no sync, secretsNamespace",
+			args: args{
+				inputPolicy:            L4PolicyTLSEgressOnlyTrustedCA,
+				useFullTLSContext:      false,
+				useSDS:                 false,
+				policySecretsNamespace: "cilium-secrets",
+			},
+			wantEgress:  ExpectedPerPortPoliciesTLSEgressNoSync,
+			wantIngress: nil,
+		},
+		{
+			name: "Egress Originating TLS Fully Populated with secret sync, fromFile",
+			args: args{
+				inputPolicy:            L4PolicyTLSEgressFullValuesFromFile,
+				useFullTLSContext:      false,
+				useSDS:                 true,
+				policySecretsNamespace: "cilium-secrets",
+			},
+			wantEgress:  ExpectedPerPortPoliciesTLSEgressNoSync,
+			wantIngress: nil,
+		},
+		{
+			name: "Egress Originating TLS Fully Populated, UseFullTLSContext, no sync, fromFile",
+			args: args{
+				inputPolicy:            L4PolicyTLSEgressFullValuesFromFile,
+				useFullTLSContext:      true,
+				useSDS:                 false,
+				policySecretsNamespace: "",
+			},
+			wantEgress:  ExpectedPerPortPoliciesTLSEgressNoSyncUseFullContext,
+			wantIngress: nil,
+		},
+		{
+			name: "Egress Originating TLS Fully Populated, no sync, fromFile",
+			args: args{
+				inputPolicy:            L4PolicyTLSEgressFullValuesFromFile,
+				useFullTLSContext:      false,
+				useSDS:                 false,
+				policySecretsNamespace: "",
+			},
+			wantEgress:  ExpectedPerPortPoliciesTLSEgressNoSync,
+			wantIngress: nil,
+		},
+		{
+			name: "Egress Originating TLS Only TrustedCA with secret sync, fromFile",
+			args: args{
+				inputPolicy:            L4PolicyTLSEgressOnlyTrustedCAFromFile,
+				useFullTLSContext:      false,
+				useSDS:                 true,
+				policySecretsNamespace: "cilium-secrets",
+			},
+			wantEgress:  ExpectedPerPortPoliciesTLSEgressNoSync,
+			wantIngress: nil,
+		},
+		{
+			name: "Egress Originating TLS Only TrustedCA, UseFullTLSContext, no sync, fromFile",
+			args: args{
+				inputPolicy:            L4PolicyTLSEgressOnlyTrustedCAFromFile,
+				useFullTLSContext:      true,
+				useSDS:                 false,
+				policySecretsNamespace: "",
+			},
+			wantEgress:  ExpectedPerPortPoliciesTLSEgressNoSync,
+			wantIngress: nil,
+		},
+		{
+			name: "Egress Originating TLS Only TrustedCA, no sync, fromFile",
+			args: args{
+				inputPolicy:            L4PolicyTLSEgressOnlyTrustedCAFromFile,
+				useFullTLSContext:      false,
+				useSDS:                 false,
+				policySecretsNamespace: "",
+			},
+			wantEgress:  ExpectedPerPortPoliciesTLSEgressNoSync,
+			wantIngress: nil,
+		},
+		{
+			name: "Ingress Terminating TLS Fully Populated with secret sync",
+			args: args{
+				inputPolicy:            L4PolicyTLSIngressFullValues,
+				useFullTLSContext:      false,
+				useSDS:                 true,
+				policySecretsNamespace: "cilium-secrets",
+			},
+			wantEgress:  nil,
+			wantIngress: ExpectedPerPortPoliciesTLSIngress,
+		},
+		{
+			name: "Ingress Terminating TLS Fully Populated, UseFullTLSContext, no sync",
+			args: args{
+				inputPolicy:            L4PolicyTLSIngressFullValues,
+				useFullTLSContext:      true,
+				useSDS:                 false,
+				policySecretsNamespace: "",
+			},
+			wantEgress:  nil,
+			wantIngress: ExpectedPerPortPoliciesTLSIngressNoSyncUseFullContext,
+		},
+		{
+			name: "Ingress Terminating TLS Fully Populated, no sync",
+			args: args{
+				inputPolicy:            L4PolicyTLSIngressFullValues,
+				useFullTLSContext:      false,
+				useSDS:                 false,
+				policySecretsNamespace: "",
+			},
+			wantEgress:  nil,
+			wantIngress: ExpectedPerPortPoliciesTLSIngressNoSync,
+		},
+		{
+			name: "Ingress Terminating TLS Fully Populated, UseFullTLSContext, no sync, secretsNamespace",
+			args: args{
+				inputPolicy:            L4PolicyTLSIngressFullValues,
+				useFullTLSContext:      true,
+				useSDS:                 false,
+				policySecretsNamespace: "cilium-secrets",
+			},
+			wantEgress:  nil,
+			wantIngress: ExpectedPerPortPoliciesTLSIngressNoSyncUseFullContext,
+		},
+		{
+			name: "Ingress Terminating TLS Fully Populated, no sync, secretsNamespace",
+			args: args{
+				inputPolicy:            L4PolicyTLSIngressFullValues,
+				useFullTLSContext:      false,
+				useSDS:                 false,
+				policySecretsNamespace: "cilium-secrets",
+			},
+			wantEgress:  nil,
+			wantIngress: ExpectedPerPortPoliciesTLSIngressNoSync,
+		},
+		{
+			name: "Ingress Terminating TLS Only Termination details with secret sync",
+			args: args{
+				inputPolicy:            L4PolicyTLSIngressOnlyTerminationDetails,
+				useFullTLSContext:      false,
+				useSDS:                 true,
+				policySecretsNamespace: "cilium-secrets",
+			},
+			wantEgress:  nil,
+			wantIngress: ExpectedPerPortPoliciesTLSIngress,
+		},
+		{
+			name: "Ingress Terminating TLS Only Termination details, UseFullTLSContext, no sync",
+			args: args{
+				inputPolicy:            L4PolicyTLSIngressOnlyTerminationDetails,
+				useFullTLSContext:      true,
+				useSDS:                 false,
+				policySecretsNamespace: "",
+			},
+			wantEgress:  nil,
+			wantIngress: ExpectedPerPortPoliciesTLSIngressNoSync,
+		},
+		{
+			name: "Ingress Terminating TLS Only Termination details, no sync",
+			args: args{
+				inputPolicy:            L4PolicyTLSIngressOnlyTerminationDetails,
+				useFullTLSContext:      false,
+				useSDS:                 false,
+				policySecretsNamespace: "",
+			},
+			wantEgress:  nil,
+			wantIngress: ExpectedPerPortPoliciesTLSIngressNoSync,
+		},
+		{
+			name: "Ingress Terminating TLS Only Termination details, UseFullTLSContext, no sync, secretsNamespace",
+			args: args{
+				inputPolicy:            L4PolicyTLSIngressOnlyTerminationDetails,
+				useFullTLSContext:      true,
+				useSDS:                 false,
+				policySecretsNamespace: "cilium-secrets",
+			},
+			wantEgress:  nil,
+			wantIngress: ExpectedPerPortPoliciesTLSIngressNoSync,
+		},
+		{
+			name: "Ingress Terminating TLS Only Termination details, no sync, secretsNamespace",
+			args: args{
+				inputPolicy:            L4PolicyTLSIngressOnlyTerminationDetails,
+				useFullTLSContext:      false,
+				useSDS:                 false,
+				policySecretsNamespace: "cilium-secrets",
+			},
+			wantEgress:  nil,
+			wantIngress: ExpectedPerPortPoliciesTLSIngressNoSync,
+		},
+		{
+			name: "Ingress Terminating TLS Fully Populated with secret sync, fromFile",
+			args: args{
+				inputPolicy:            L4PolicyTLSIngressFullValuesFromFile,
+				useFullTLSContext:      false,
+				useSDS:                 true,
+				policySecretsNamespace: "cilium-secrets",
+			},
+			wantEgress:  nil,
+			wantIngress: ExpectedPerPortPoliciesTLSIngressNoSync,
+		},
+		{
+			name: "Ingress Terminating TLS Fully Populated, UseFullTLSContext, no sync, fromFile",
+			args: args{
+				inputPolicy:            L4PolicyTLSIngressFullValuesFromFile,
+				useFullTLSContext:      true,
+				useSDS:                 false,
+				policySecretsNamespace: "",
+			},
+			wantEgress:  nil,
+			wantIngress: ExpectedPerPortPoliciesTLSIngressNoSyncUseFullContext,
+		},
+		{
+			name: "Ingress Terminating TLS Fully Populated, no sync, fromFile",
+			args: args{
+				inputPolicy:            L4PolicyTLSIngressFullValuesFromFile,
+				useFullTLSContext:      false,
+				useSDS:                 false,
+				policySecretsNamespace: "",
+			},
+			wantEgress:  nil,
+			wantIngress: ExpectedPerPortPoliciesTLSIngressNoSync,
+		},
+		{
+			name: "Ingress Terminating TLS Only Termination details with secret sync, fromFile",
+			args: args{
+				inputPolicy:            L4PolicyTLSIngressOnlyTerminationDetailsFromFile,
+				useFullTLSContext:      false,
+				useSDS:                 true,
+				policySecretsNamespace: "cilium-secrets",
+			},
+			wantEgress:  nil,
+			wantIngress: ExpectedPerPortPoliciesTLSIngressNoSync,
+		},
+		{
+			name: "Ingress Terminating TLS Only Termination details, UseFullTLSContext, no sync, fromFile",
+			args: args{
+				inputPolicy:            L4PolicyTLSIngressOnlyTerminationDetailsFromFile,
+				useFullTLSContext:      true,
+				useSDS:                 false,
+				policySecretsNamespace: "",
+			},
+			wantEgress:  nil,
+			wantIngress: ExpectedPerPortPoliciesTLSIngressNoSync,
+		},
+		{
+			name: "Ingress Terminating TLS Only Termination details, no sync, fromFile",
+			args: args{
+				inputPolicy:            L4PolicyTLSIngressOnlyTerminationDetailsFromFile,
+				useFullTLSContext:      false,
+				useSDS:                 false,
+				policySecretsNamespace: "",
+			},
+			wantEgress:  nil,
+			wantIngress: ExpectedPerPortPoliciesTLSIngressNoSync,
+		},
+		{
+			name: "Both directions, full details, with sync",
+			args: args{
+				inputPolicy:            L4PolicyTLSFullContext,
+				useFullTLSContext:      false,
+				useSDS:                 true,
+				policySecretsNamespace: "cilium-secrets",
+			},
+			wantEgress:  nil,
+			wantIngress: ExpectedPerPortPoliciesBothWaysTLSSDS,
+		},
+		{
+			name: "Both directions, full details, no sync",
+			args: args{
+				inputPolicy:            L4PolicyTLSFullContext,
+				useFullTLSContext:      false,
+				useSDS:                 false,
+				policySecretsNamespace: "cilium-secrets",
+			},
+			wantEgress:  nil,
+			wantIngress: ExpectedPerPortPoliciesTLSNotFullContext,
+		},
+		// These next two tests check what happens when no sync is enabled, and useFullTLSContext is either true or false
+		// (i.e., don't implement buggy behaviour).
+		// When useFullTLSContext is false, we correctly strip out the CA for a terminatingTLS/downstreamTls and the
+		// cert/key on originatingTLS/upstreamTls. Leaving them in can result in incorrect behaviour from Envoy when using
+		// Cilium L7 policy that's not done via SDS, see https://github.com/cilium/cilium/issues/31761 for
+		// full details.
+		//
+		// When Secret Sync and SDS are in use, the use of the TlsSdsSecret and ValidationContextSdsSecret mean that
+		// SDS is not susceptible to that bug.
+		{
+			name: "Both directions, full details, no sync",
+			args: args{
+				inputPolicy:            L4PolicyTLSFullContext,
+				useFullTLSContext:      false,
+				useSDS:                 false,
+				policySecretsNamespace: "",
+			},
+			wantEgress:  nil,
+			wantIngress: ExpectedPerPortPoliciesTLSNotFullContext,
+		},
+		{
+			name: "Both directions, full details, no sync, usefullcontext",
+			args: args{
+				inputPolicy:            L4PolicyTLSFullContext,
+				useFullTLSContext:      true,
+				useSDS:                 false,
+				policySecretsNamespace: "",
+			},
+			wantEgress:  nil,
+			wantIngress: ExpectedPerPortPoliciesTLSFullContext,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			xds := testXdsServer(t)
+			obtained := xds.getNetworkPolicy(ep, []string{IPv4Addr}, tt.args.inputPolicy, true, true, tt.args.useFullTLSContext, tt.args.useSDS, tt.args.policySecretsNamespace)
+			expected := &cilium.NetworkPolicy{
+				EndpointIps:            []string{IPv4Addr},
+				EndpointId:             uint64(ep.GetID()),
+				IngressPerPortPolicies: tt.wantIngress,
+				EgressPerPortPolicies:  tt.wantEgress,
+				ConntrackMapName:       "global",
+			}
+			require.Equal(t, expected, obtained)
+		})
+	}
 }
 
 func Test_getPublicListenerAddress(t *testing.T) {
@@ -1065,7 +1770,7 @@ func Test_getLocalListenerAddresses(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, gotAdditional := getLocalListenerAddresses(tt.args.port, tt.args.ipv4, tt.args.ipv6)
+			got, gotAdditional := GetLocalListenerAddresses(tt.args.port, tt.args.ipv4, tt.args.ipv6)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("getLocalListenerAddresses() got = %v, want %v", got, tt.want)
 			}
@@ -1074,4 +1779,8 @@ func Test_getLocalListenerAddresses(t *testing.T) {
 			}
 		})
 	}
+}
+
+func testXdsServer(t *testing.T) *xdsServer {
+	return &xdsServer{logger: hivetest.Logger(t)}
 }

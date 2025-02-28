@@ -5,8 +5,11 @@ package observer
 
 import (
 	"context"
+	"errors"
 	"io"
 
+	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/status"
@@ -16,7 +19,7 @@ import (
 	relaypb "github.com/cilium/cilium/api/v1/relay"
 	poolTypes "github.com/cilium/cilium/pkg/hubble/relay/pool/types"
 	"github.com/cilium/cilium/pkg/hubble/relay/queue"
-	"github.com/cilium/cilium/pkg/inctimer"
+	"github.com/cilium/cilium/pkg/lock"
 	nodeTypes "github.com/cilium/cilium/pkg/node/types"
 	"github.com/cilium/cilium/pkg/time"
 )
@@ -42,19 +45,19 @@ func retrieveFlowsFromPeer(
 	}
 	for {
 		flow, err := c.Recv()
-		switch err {
-		case io.EOF, context.Canceled:
-			return nil
-		case nil:
-			select {
-			case flows <- flow:
-			case <-ctx.Done():
+		if err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
 				return nil
 			}
-		default:
-			if status.Code(err) != codes.Canceled {
-				return err
+			if status.Code(err) == codes.Canceled {
+				return nil
 			}
+			return err
+		}
+
+		select {
+		case flows <- flow:
+		case <-ctx.Done():
 			return nil
 		}
 	}
@@ -71,8 +74,6 @@ func sortFlows(
 
 	go func() {
 		defer close(sortedFlows)
-		bufferTimer, bufferTimerDone := inctimer.New()
-		defer bufferTimerDone()
 	flowsLoop:
 		for {
 			select {
@@ -89,7 +90,7 @@ func sortFlows(
 					}
 				}
 				pq.Push(flow)
-			case t := <-bufferTimer.After(bufferDrainTimeout):
+			case t := <-time.After(bufferDrainTimeout):
 				// Make sure to drain old flows from the queue when no new
 				// flows are received. The bufferDrainTimeout duration is used
 				// as a sorting window.
@@ -201,7 +202,7 @@ func aggregateErrors(
 				}
 
 				pendingResponse = response
-				flushPending = inctimer.After(errorAggregationWindow)
+				flushPending = time.After(errorAggregationWindow)
 			case <-flushPending:
 				select {
 				case aggregated <- pendingResponse:
@@ -217,4 +218,84 @@ func aggregateErrors(
 
 	}()
 	return aggregated
+}
+
+func sendFlowsResponse(ctx context.Context, stream observerpb.Observer_GetFlowsServer, sortedFlows <-chan *observerpb.GetFlowsResponse) error {
+	for {
+		select {
+		case flow, ok := <-sortedFlows:
+			if !ok {
+				return nil
+			}
+			if err := stream.Send(flow); err != nil {
+				return err
+			}
+		case <-ctx.Done():
+			return nil
+		}
+	}
+}
+
+func newFlowCollector(req *observerpb.GetFlowsRequest, opts options) *flowCollector {
+	fc := &flowCollector{
+		log: opts.log,
+		ocb: opts.ocb,
+
+		req: req,
+
+		connectedNodes: map[string]struct{}{},
+	}
+	return fc
+}
+
+type flowCollector struct {
+	log logrus.FieldLogger
+	ocb observerClientBuilder
+
+	req *observerpb.GetFlowsRequest
+
+	mu             lock.Mutex
+	connectedNodes map[string]struct{}
+}
+
+func (fc *flowCollector) collect(ctx context.Context, g *errgroup.Group, peers []poolTypes.Peer, flows chan *observerpb.GetFlowsResponse) ([]string, []string) {
+	var connected, unavailable []string
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	for _, p := range peers {
+		if _, ok := fc.connectedNodes[p.Name]; ok {
+			connected = append(connected, p.Name)
+			continue
+		}
+		if !isAvailable(p.Conn) {
+			fc.log.WithField("address", p.Address).Infof(
+				"No connection to peer %s, skipping", p.Name,
+			)
+			unavailable = append(unavailable, p.Name)
+			continue
+		}
+		connected = append(connected, p.Name)
+		fc.connectedNodes[p.Name] = struct{}{}
+		g.Go(func() error {
+			// retrieveFlowsFromPeer returns blocks until the peer finishes
+			// the request by closing the connection, an error occurs,
+			// or ctx expires.
+			err := retrieveFlowsFromPeer(ctx, fc.ocb.observerClient(&p), fc.req, flows)
+			if err != nil {
+				fc.log.WithFields(logrus.Fields{
+					"error": err,
+					"peer":  p,
+				}).Warning("Failed to retrieve flows from peer")
+				fc.mu.Lock()
+				delete(fc.connectedNodes, p.Name)
+				fc.mu.Unlock()
+				select {
+				case flows <- nodeStatusError(err, p.Name):
+				case <-ctx.Done():
+				}
+			}
+			return nil
+		})
+	}
+	return connected, unavailable
 }

@@ -8,14 +8,19 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"net/netip"
+	"slices"
 	"sort"
+	"strconv"
+	"strings"
 
+	"github.com/cilium/hive/cell"
+	"github.com/osrg/gobgp/v3/pkg/packet/bgp"
 	"github.com/sirupsen/logrus"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/cilium/cilium/pkg/bgpv1/manager/instance"
 	"github.com/cilium/cilium/pkg/bgpv1/manager/store"
 	"github.com/cilium/cilium/pkg/bgpv1/types"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	v2api "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	v2alpha1api "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	"github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/labels"
@@ -64,9 +69,14 @@ func (r *RoutePolicyReconciler) Priority() int {
 	return 70
 }
 
+func (r *RoutePolicyReconciler) Init(_ *instance.ServerWithConfig) error {
+	return nil
+}
+
+func (r *RoutePolicyReconciler) Cleanup(_ *instance.ServerWithConfig) {}
+
 func (r *RoutePolicyReconciler) Reconcile(ctx context.Context, params ReconcileParams) error {
 	l := log.WithFields(logrus.Fields{"component": "RoutePolicyReconciler"})
-	l.Infof("Begin reconciling routing policies for virtual router with local ASN %v", params.DesiredConfig.LocalASN)
 
 	if params.DesiredConfig == nil {
 		return fmt.Errorf("attempted routing policy reconciliation with nil DesiredConfig")
@@ -82,15 +92,16 @@ func (r *RoutePolicyReconciler) Reconcile(ctx context.Context, params ReconcileP
 	currentPolicies := r.getMetadata(params.CurrentServer)
 
 	// compile set of desired policies
+	// note: only per-neighbor export policies are supported at this time
 	desiredPolicies := make(map[string]*types.RoutePolicy)
 	for _, n := range params.DesiredConfig.Neighbors {
 		for _, routeAttrs := range n.AdvertisedPathAttributes {
-			policy, err := r.pathAttributesToPolicy(routeAttrs, n.PeerAddress, params)
+			exportPolicy, err := r.pathAttributesToPolicy(routeAttrs, n.PeerAddress, params)
 			if err != nil {
 				return fmt.Errorf("failed to convert BGP PathAttributes to a RoutePolicy: %w", err)
 			}
-			if len(policy.Statements) > 0 {
-				desiredPolicies[policy.Name] = policy
+			if len(exportPolicy.Statements) > 0 {
+				desiredPolicies[exportPolicy.Name] = exportPolicy
 			}
 		}
 	}
@@ -117,7 +128,10 @@ func (r *RoutePolicyReconciler) Reconcile(ctx context.Context, params ReconcileP
 	// add missing policies
 	for _, p := range toAdd {
 		l.Infof("Adding route policy %s to vrouter %d", p.Name, params.DesiredConfig.LocalASN)
-		err := params.CurrentServer.Server.AddRoutePolicy(ctx, types.RoutePolicyRequest{Policy: p})
+		err := params.CurrentServer.Server.AddRoutePolicy(ctx, types.RoutePolicyRequest{
+			DefaultExportAction: types.RoutePolicyActionNone, // no change to the default action
+			Policy:              p,
+		})
 		if err != nil {
 			return fmt.Errorf("failed adding route policy %v to vrouter %d: %w", p.Name, params.DesiredConfig.LocalASN, err)
 		}
@@ -133,7 +147,10 @@ func (r *RoutePolicyReconciler) Reconcile(ctx context.Context, params ReconcileP
 		if err != nil {
 			return fmt.Errorf("failed removing route policy %v from vrouter %d: %w", existing.Name, params.DesiredConfig.LocalASN, err)
 		}
-		err = params.CurrentServer.Server.AddRoutePolicy(ctx, types.RoutePolicyRequest{Policy: p})
+		err = params.CurrentServer.Server.AddRoutePolicy(ctx, types.RoutePolicyRequest{
+			DefaultExportAction: types.RoutePolicyActionNone, // no change to the default action
+			Policy:              p,
+		})
 		if err != nil {
 			return fmt.Errorf("failed adding route policy %v to vrouter %d: %w", p.Name, params.DesiredConfig.LocalASN, err)
 		}
@@ -180,6 +197,7 @@ func (r *RoutePolicyReconciler) storeMetadata(sc *instance.ServerWithConfig, met
 	sc.ReconcilerMetadata[r.Name()] = meta
 }
 
+// pathAttributesToPolicy prepares an export policy configured by CRD using the Advertised Path Attributes feature
 func (r *RoutePolicyReconciler) pathAttributesToPolicy(attrs v2alpha1api.CiliumBGPPathAttributes, neighborAddress string, params ReconcileParams) (*types.RoutePolicy, error) {
 	var v4Prefixes, v6Prefixes types.PolicyPrefixMatchList
 
@@ -196,7 +214,11 @@ func (r *RoutePolicyReconciler) pathAttributesToPolicy(attrs v2alpha1api.CiliumB
 	switch attrs.SelectorType {
 	case v2alpha1api.CPIPKindDefinition:
 		localPools := r.populateLocalPools(params.CiliumNode)
-		for _, pool := range r.podPoolStore.List() {
+		podPoolList, err := r.podPoolStore.List()
+		if err != nil {
+			return nil, fmt.Errorf("failed to list pod ip pools from store: %w", err)
+		}
+		for _, pool := range podPoolList {
 			if attrs.Selector != nil && !labelSelector.Matches(labels.Set(pool.Labels)) {
 				continue
 			}
@@ -214,14 +236,19 @@ func (r *RoutePolicyReconciler) pathAttributesToPolicy(attrs v2alpha1api.CiliumB
 			}
 		}
 	case v2alpha1api.CiliumLoadBalancerIPPoolSelectorName:
-		for _, pool := range r.lbPoolStore.List() {
+		lbPoolList, err := r.lbPoolStore.List()
+		if err != nil {
+			return nil, fmt.Errorf("failed to list lb ip pools from store: %w", err)
+		}
+		for _, pool := range lbPoolList {
 			if pool.Spec.Disabled {
 				continue
 			}
 			if attrs.Selector != nil && !labelSelector.Matches(labels.Set(pool.Labels)) {
 				continue
 			}
-			for _, cidrBlock := range pool.Spec.Cidrs {
+			prefixesSeen := sets.New[netip.Prefix]()
+			for _, cidrBlock := range pool.Spec.Blocks {
 				cidr, err := netip.ParsePrefix(string(cidrBlock.Cidr))
 				if err != nil {
 					return nil, fmt.Errorf("failed to parse IPAM pool CIDR %s: %w", cidrBlock.Cidr, err)
@@ -231,6 +258,7 @@ func (r *RoutePolicyReconciler) pathAttributesToPolicy(attrs v2alpha1api.CiliumB
 				} else {
 					v6Prefixes = append(v6Prefixes, &types.RoutePolicyPrefixMatch{CIDR: cidr, PrefixLenMin: maxPrefixLenIPv6, PrefixLenMax: maxPrefixLenIPv6})
 				}
+				prefixesSeen.Insert(cidr)
 			}
 		}
 	case v2alpha1api.PodCIDRSelectorName:
@@ -256,17 +284,16 @@ func (r *RoutePolicyReconciler) pathAttributesToPolicy(attrs v2alpha1api.CiliumB
 	sort.Slice(v4Prefixes, v4Prefixes.Less)
 	sort.Slice(v6Prefixes, v6Prefixes.Less)
 
-	// sort communities to have consistent order for DeepEqual
+	// dedup + sort communities to have consistent order for DeepEqual
 	var communities, largeCommunities []string
 	if attrs.Communities != nil {
-		for _, c := range attrs.Communities.Standard {
-			communities = append(communities, string(c))
+		communities, err = mergeAndDedupCommunities(attrs.Communities.Standard, attrs.Communities.WellKnown)
+		if err != nil {
+			return nil, err
 		}
-		sort.Strings(communities)
-		for _, c := range attrs.Communities.Large {
-			largeCommunities = append(largeCommunities, string(c))
-		}
-		sort.Strings(largeCommunities)
+		largeCommunities = dedupLargeCommunities(attrs.Communities.Large)
+		slices.Sort(communities)
+		slices.Sort(largeCommunities)
 	}
 
 	// Due to a GoBGP limitation, we need to generate a separate statement for v4 and v6 prefixes, as families
@@ -352,4 +379,66 @@ func peerAddressFromPolicy(p *types.RoutePolicy) string {
 		}
 	}
 	return ""
+}
+
+// mergeAndDedupCommunities merges numeric standard community and well-known community strings,
+// deduplicated by their actual community values.
+func mergeAndDedupCommunities(standard []v2alpha1api.BGPStandardCommunity, wellKnown []v2alpha1api.BGPWellKnownCommunity) ([]string, error) {
+	var res []string
+	existing := sets.New[uint32]()
+	for _, c := range standard {
+		val, err := parseCommunity(string(c))
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse standard BGP community: %w", err)
+		}
+		if existing.Has(val) {
+			continue
+		}
+		existing.Insert(val)
+		res = append(res, string(c))
+	}
+	for _, c := range wellKnown {
+		val, ok := bgp.WellKnownCommunityValueMap[string(c)]
+		if !ok {
+			return nil, fmt.Errorf("invalid well-known community value '%s'", c)
+		}
+		if existing.Has(uint32(val)) {
+			continue
+		}
+		existing.Insert(uint32(val))
+		res = append(res, string(c))
+	}
+	return res, nil
+}
+
+func parseCommunity(communityStr string) (uint32, error) {
+	// parse as <0-65535>:<0-65535>
+	if elems := strings.Split(communityStr, ":"); len(elems) == 2 {
+		fst, err := strconv.ParseUint(elems[0], 10, 16)
+		if err != nil {
+			return 0, err
+		}
+		snd, err := strconv.ParseUint(elems[1], 10, 16)
+		if err != nil {
+			return 0, err
+		}
+		return uint32(fst<<16 | snd), nil
+	}
+	// parse as a single decimal number
+	c, err := strconv.ParseUint(communityStr, 10, 32)
+	return uint32(c), err
+}
+
+// dedupLargeCommunities returns deduplicated large communities as a string slice.
+func dedupLargeCommunities(communities []v2alpha1api.BGPLargeCommunity) []string {
+	var res []string
+	existing := sets.New[string]()
+	for _, c := range communities {
+		if existing.Has(string(c)) {
+			continue
+		}
+		existing.Insert(string(c))
+		res = append(res, string(c))
+	}
+	return res
 }

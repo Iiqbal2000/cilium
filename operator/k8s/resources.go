@@ -4,17 +4,20 @@
 package k8s
 
 import (
-	"github.com/cilium/cilium/pkg/hive/cell"
+	"github.com/cilium/hive/cell"
+	mcsapiv1alpha1 "sigs.k8s.io/mcs-api/pkg/apis/v1alpha1"
+
+	"github.com/cilium/cilium/pkg/clustermesh/mcsapi"
 	"github.com/cilium/cilium/pkg/k8s"
 	cilium_api_v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	cilium_api_v2alpha1 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
-	slim_networkingv1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/networking/v1"
 )
 
 const (
 	CiliumEndpointIndexIdentity = "identity"
+	PodNodeNameIndex            = "pod-node"
 )
 
 var (
@@ -30,15 +33,24 @@ var (
 		cell.Config(k8s.DefaultConfig),
 		cell.Provide(
 			k8s.ServiceResource,
+			mcsapi.ServiceExportResource,
 			k8s.EndpointsResource,
 			k8s.LBIPPoolsResource,
 			k8s.CiliumIdentityResource,
 			k8s.CiliumPodIPPoolResource,
+			k8s.CiliumBGPPeeringPolicyResource,
+			CiliumBGPClusterConfigResource,
+			k8s.CiliumBGPAdvertisementResource,
+			k8s.CiliumBGPPeerConfigResource,
+			k8s.CiliumBGPNodeConfigResource,
+			CiliumBGPNodeConfigOverrideResource,
 			CiliumEndpointResource,
 			CiliumEndpointSliceResource,
-			k8s.CiliumNodeResource,
-			k8s.PodResource,
-			IngressClassResource,
+			CiliumNodeResource,
+			PodResource,
+			k8s.NamespaceResource,
+			k8s.CiliumNetworkPolicyResource,
+			k8s.CiliumClusterwideNetworkPolicyResource,
 		),
 	)
 )
@@ -48,6 +60,7 @@ type Resources struct {
 	cell.In
 
 	Services             resource.Resource[*slim_corev1.Service]
+	ServiceExports       resource.Resource[*mcsapiv1alpha1.ServiceExport]
 	Endpoints            resource.Resource[*k8s.Endpoints]
 	LBIPPools            resource.Resource[*cilium_api_v2alpha1.CiliumLoadBalancerIPPool]
 	Identities           resource.Resource[*cilium_api_v2.CiliumIdentity]
@@ -56,5 +69,25 @@ type Resources struct {
 	CiliumEndpointSlices resource.Resource[*cilium_api_v2alpha1.CiliumEndpointSlice]
 	CiliumNodes          resource.Resource[*cilium_api_v2.CiliumNode]
 	Pods                 resource.Resource[*slim_corev1.Pod]
-	IngressClasses       resource.Resource[*slim_networkingv1.IngressClass]
+	Namespaces           resource.Resource[*slim_corev1.Namespace]
+}
+
+// HasCEWithIdentity returns true or false if the Cilium Endpoint store has
+// the given identity.
+func HasCEWithIdentity(cepStore resource.Store[*cilium_api_v2.CiliumEndpoint], identity string) bool {
+	if cepStore == nil {
+		return false
+	}
+	ces, _ := cepStore.IndexKeys(CiliumEndpointIndexIdentity, identity)
+
+	return len(ces) != 0
+}
+
+// podNodeNameIndexFunc indexes pods by node name.
+func PodNodeNameIndexFunc(obj interface{}) ([]string, error) {
+	pod := obj.(*slim_corev1.Pod)
+	if pod.Spec.NodeName != "" {
+		return []string{pod.Spec.NodeName}, nil
+	}
+	return []string{}, nil
 }

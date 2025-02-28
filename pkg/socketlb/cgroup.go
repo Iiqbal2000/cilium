@@ -181,36 +181,41 @@ func detachCgroup(name, cgroupRoot, pinPath string) error {
 
 // detachAll detaches all programs attached to cgroupRoot with the corresponding attach type.
 func detachAll(attach ebpf.AttachType, cgroupRoot string) error {
+	cg, err := os.Open(cgroupRoot)
+	if err != nil {
+		return fmt.Errorf("open cgroup %s: %w", cgroupRoot, err)
+	}
+	defer cg.Close()
+
 	// Query the program ids of all programs currently attached to the given cgroup
 	// with the given attach type. In ciliums case this should always return only one id.
 	ids, err := link.QueryPrograms(link.QueryOptions{
-		Path:   cgroupRoot,
+		Target: int(cg.Fd()),
 		Attach: attach,
 	})
 	// We know the cgroup root exists, so EINVAL will likely mean querying
 	// the given attach type is not supported.
 	if errors.Is(err, unix.EINVAL) {
-		err = fmt.Errorf("%s: %w", err, link.ErrNotSupported)
+		err = fmt.Errorf("%w: %w", err, link.ErrNotSupported)
+	}
+	// Even though the cgroup exists, QueryPrograms will return EBADF
+	// on a cgroupv1.
+	if errors.Is(err, unix.EBADF) {
+		log.Debug("The cgroup exists but is a cgroupv1. No detachment necessary")
+		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("query cgroup %s for type %s: %w", cgroupRoot, attach, err)
 	}
-
-	if len(ids) == 0 {
+	if ids == nil || len(ids.Programs) == 0 {
 		log.Debugf("No programs in cgroup %s with attach type %s", cgroupRoot, attach)
 		return nil
 	}
 
-	cg, err := os.Open(cgroupRoot)
-	if err != nil {
-		return fmt.Errorf("open cgroup %s: %w", cg.Name(), err)
-	}
-	defer cg.Close()
-
 	// cilium owns the cgroup and assumes only one program is attached.
 	// This allows to remove all ids returned in the query phase.
-	for _, id := range ids {
-		prog, err := ebpf.NewProgramFromID(id)
+	for _, id := range ids.Programs {
+		prog, err := ebpf.NewProgramFromID(id.ID)
 		if err != nil {
 			return fmt.Errorf("could not open program id %d: %w", id, err)
 		}

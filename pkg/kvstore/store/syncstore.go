@@ -17,6 +17,7 @@ import (
 	"k8s.io/client-go/util/workqueue"
 
 	"github.com/cilium/cilium/pkg/kvstore"
+	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/time"
@@ -64,12 +65,12 @@ type wqSyncStore struct {
 	workers   uint
 	withLease bool
 
-	limiter   workqueue.RateLimiter
-	workqueue workqueue.RateLimitingInterface
-	state     sync.Map /* map[string][]byte --- map[NamedKey.GetKeyName()]Key.Marshal() */
+	limiter   workqueue.TypedRateLimiter[workqueueKey]
+	workqueue workqueue.TypedRateLimitingInterface[workqueueKey]
+	state     lock.Map[string, []byte] // map[NamedKey.GetKeyName()]Key.Marshal()
 
-	synced          atomic.Bool // Synced() has been triggered
-	pendingSync     sync.Map    // map[string]struct{}: the set of keys still to sync
+	synced          atomic.Bool                // Synced() has been triggered
+	pendingSync     lock.Map[string, struct{}] // the set of keys still to sync
 	syncedKey       string
 	syncedCallbacks []func(context.Context)
 
@@ -79,12 +80,15 @@ type wqSyncStore struct {
 	syncedMetric prometheus.Gauge
 }
 
-type syncCanary struct{ skipCallbacks bool }
+type workqueueKey struct {
+	value      string
+	syncCanary *struct{ skipCallbacks bool }
+}
 
 type WSSOpt func(*wqSyncStore)
 
 // WSSWithRateLimiter sets the rate limiting algorithm to be used when requeueing failed events.
-func WSSWithRateLimiter(limiter workqueue.RateLimiter) WSSOpt {
+func WSSWithRateLimiter(limiter workqueue.TypedRateLimiter[workqueueKey]) WSSOpt {
 	return func(wss *wqSyncStore) {
 		wss.limiter = limiter
 	}
@@ -122,7 +126,7 @@ func newWorkqueueSyncStore(clusterName string, backend SyncStoreBackend, prefix 
 
 		workers:   1,
 		withLease: true,
-		limiter:   workqueue.DefaultControllerRateLimiter(),
+		limiter:   workqueue.DefaultTypedControllerRateLimiter[workqueueKey](),
 		syncedKey: prefix,
 
 		log: log.WithField(logfields.Prefix, prefix),
@@ -133,7 +137,7 @@ func newWorkqueueSyncStore(clusterName string, backend SyncStoreBackend, prefix 
 	}
 
 	wss.log = wss.log.WithField(logfields.ClusterName, wss.source)
-	wss.workqueue = workqueue.NewRateLimitingQueue(wss.limiter)
+	wss.workqueue = workqueue.NewTypedRateLimitingQueue(wss.limiter)
 	wss.queuedMetric = m.KVStoreSyncQueueSize.WithLabelValues(kvstore.GetScopeFromKey(prefix), wss.source)
 	wss.errorsMetric = m.KVStoreSyncErrors.WithLabelValues(kvstore.GetScopeFromKey(prefix), wss.source)
 	wss.syncedMetric = m.KVStoreInitialSyncCompleted.WithLabelValues(kvstore.GetScopeFromKey(prefix), wss.source, "write")
@@ -182,14 +186,14 @@ func (wss *wqSyncStore) UpsertKey(_ context.Context, k Key) error {
 	}
 
 	prevValue, loaded := wss.state.Swap(key, value)
-	if loaded && bytes.Equal(prevValue.([]byte), value) {
+	if loaded && bytes.Equal(prevValue, value) {
 		wss.log.WithField(logfields.Key, k).Debug("ignoring upsert request for already up-to-date key")
 	} else {
 		if !wss.synced.Load() {
 			wss.pendingSync.Store(key, struct{}{})
 		}
 
-		wss.workqueue.Add(key)
+		wss.workqueue.Add(workqueueKey{value: key})
 		wss.queuedMetric.Set(float64(wss.workqueue.Len()))
 	}
 
@@ -202,7 +206,7 @@ func (wss *wqSyncStore) UpsertKey(_ context.Context, k Key) error {
 func (wss *wqSyncStore) DeleteKey(_ context.Context, k NamedKey) error {
 	key := k.GetKeyName()
 	if _, loaded := wss.state.LoadAndDelete(key); loaded {
-		wss.workqueue.Add(key)
+		wss.workqueue.Add(workqueueKey{value: key})
 		wss.queuedMetric.Set(float64(wss.workqueue.Len()))
 	} else {
 		wss.log.WithField(logfields.Key, key).Debug("ignoring delete request for non-existing key")
@@ -214,7 +218,7 @@ func (wss *wqSyncStore) DeleteKey(_ context.Context, k NamedKey) error {
 func (wss *wqSyncStore) Synced(_ context.Context, callbacks ...func(ctx context.Context)) error {
 	if synced := wss.synced.Swap(true); !synced {
 		wss.syncedCallbacks = callbacks
-		wss.workqueue.Add(syncCanary{})
+		wss.workqueue.Add(workqueueKey{syncCanary: &struct{ skipCallbacks bool }{}})
 	}
 	return nil
 }
@@ -246,20 +250,21 @@ func (wss *wqSyncStore) processNextItem(ctx context.Context) bool {
 	// Since no error occurred, forget this item so it does not get queued again
 	// until another change happens.
 	wss.workqueue.Forget(key)
-	wss.pendingSync.Delete(key)
+	wss.pendingSync.Delete(key.value)
 	return true
 }
 
-func (wss *wqSyncStore) handle(ctx context.Context, key interface{}) error {
-	if value, ok := key.(syncCanary); ok {
-		return wss.handleSync(ctx, value.skipCallbacks)
+func (wss *wqSyncStore) handle(ctx context.Context, item workqueueKey) error {
+	if item.syncCanary != nil {
+		return wss.handleSync(ctx, item.syncCanary.skipCallbacks)
 	}
+	key := item.value
 
 	if value, ok := wss.state.Load(key); ok {
-		return wss.handleUpsert(ctx, key.(string), value.([]byte))
+		return wss.handleUpsert(ctx, key, value)
 	}
 
-	return wss.handleDelete(ctx, key.(string))
+	return wss.handleDelete(ctx, key)
 }
 
 func (wss *wqSyncStore) handleUpsert(ctx context.Context, key string, value []byte) error {
@@ -290,7 +295,7 @@ func (wss *wqSyncStore) handleDelete(ctx context.Context, key string) error {
 func (wss *wqSyncStore) handleSync(ctx context.Context, skipCallbacks bool) error {
 	// This could be replaced by wss.toSync.Len() == 0 if it only existed...
 	syncCompleted := true
-	wss.pendingSync.Range(func(any, any) bool {
+	wss.pendingSync.Range(func(string, struct{}) bool {
 		syncCompleted = false
 		return false
 	})
@@ -329,7 +334,7 @@ func (wss *wqSyncStore) handleExpiredLease(key string) {
 	if key == wss.getSyncedKey() {
 		// Re-enqueue the creation of the sync canary, but make sure that
 		// the registered callbacks are not executed a second time.
-		wss.workqueue.Add(syncCanary{skipCallbacks: true})
+		wss.workqueue.Add(workqueueKey{syncCanary: &struct{ skipCallbacks bool }{true}})
 		return
 	}
 
@@ -341,7 +346,7 @@ func (wss *wqSyncStore) handleExpiredLease(key string) {
 			wss.pendingSync.Store(key, struct{}{})
 		}
 
-		wss.workqueue.Add(key)
+		wss.workqueue.Add(workqueueKey{value: key})
 	}
 }
 

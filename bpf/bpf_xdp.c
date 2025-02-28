@@ -5,8 +5,17 @@
 #include <bpf/api.h>
 
 #include <node_config.h>
+#include <bpf/config/global.h>
 #include <netdev_config.h>
 #include <filter_config.h>
+
+#define IS_BPF_XDP 1
+
+/* WORLD_IPV{4,6}_ID varies based on dualstack being enabled. Real values are
+ * written into node_config.h at runtime. */
+#define SECLABEL WORLD_ID
+#define SECLABEL_IPV4 WORLD_IPV4_ID
+#define SECLABEL_IPV6 WORLD_IPV6_ID
 
 #define SKIP_POLICY_MAP 1
 
@@ -104,6 +113,7 @@ int tail_lb_ipv4(struct __ctx_buff *ctx)
 		int l3_off = ETH_HLEN;
 		void *data, *data_end;
 		struct iphdr *ip4;
+		bool __maybe_unused is_dsr = false;
 
 		if (!revalidate_data(ctx, &data, &data_end, &ip4)) {
 			ret = DROP_INVALID;
@@ -184,27 +194,27 @@ int tail_lb_ipv4(struct __ctx_buff *ctx)
 no_encap:
 #endif /* ENABLE_DSR && !ENABLE_DSR_HYBRID && DSR_ENCAP_MODE == DSR_ENCAP_GENEVE */
 
-		ret = nodeport_lb4(ctx, ip4, l3_off, 0, &ext_err);
-		if (ret == NAT_46X64_RECIRC) {
-			ep_tail_call(ctx, CILIUM_CALL_IPV6_FROM_NETDEV);
-			return send_drop_notify_error(ctx, 0, DROP_MISSED_TAIL_CALL,
-						      CTX_ACT_DROP, METRIC_INGRESS);
-		}
+		ret = nodeport_lb4(ctx, ip4, l3_off, UNKNOWN_ID, NULL, &ext_err, &is_dsr);
+		if (ret == NAT_46X64_RECIRC)
+			ret = tail_call_internal(ctx, CILIUM_CALL_IPV6_FROM_NETDEV,
+						 &ext_err);
 	}
 
 out:
 	if (IS_ERR(ret))
-		return send_drop_notify_error_ext(ctx, 0, ret, ext_err,
-						  CTX_ACT_DROP, METRIC_INGRESS);
+		return send_drop_notify_error_ext(ctx, UNKNOWN_ID, ret, ext_err,
+						  METRIC_INGRESS);
 
 	return bpf_xdp_exit(ctx, ret);
 }
 
 static __always_inline int check_v4_lb(struct __ctx_buff *ctx)
 {
-	ep_tail_call(ctx, CILIUM_CALL_IPV4_FROM_NETDEV);
-	return send_drop_notify_error(ctx, 0, DROP_MISSED_TAIL_CALL, CTX_ACT_DROP,
-				      METRIC_INGRESS);
+	__s8 ext_err = 0;
+	int ret;
+
+	ret = tail_call_internal(ctx, CILIUM_CALL_IPV4_FROM_NETDEV, &ext_err);
+	return send_drop_notify_error_ext(ctx, UNKNOWN_ID, ret, ext_err, METRIC_INGRESS);
 }
 #else
 static __always_inline int check_v4_lb(struct __ctx_buff *ctx __maybe_unused)
@@ -257,13 +267,14 @@ int tail_lb_ipv6(struct __ctx_buff *ctx)
 	if (!ctx_skip_nodeport(ctx)) {
 		void *data, *data_end;
 		struct ipv6hdr *ip6;
+		bool is_dsr = false;
 
 		if (!revalidate_data(ctx, &data, &data_end, &ip6)) {
 			ret = DROP_INVALID;
 			goto drop_err;
 		}
 
-		ret = nodeport_lb6(ctx, ip6, 0, &ext_err);
+		ret = nodeport_lb6(ctx, ip6, UNKNOWN_ID, NULL, &ext_err, &is_dsr);
 		if (IS_ERR(ret))
 			goto drop_err;
 	}
@@ -271,15 +282,16 @@ int tail_lb_ipv6(struct __ctx_buff *ctx)
 	return bpf_xdp_exit(ctx, ret);
 
 drop_err:
-	return send_drop_notify_error_ext(ctx, 0, ret, ext_err,
-					  CTX_ACT_DROP, METRIC_INGRESS);
+	return send_drop_notify_error_ext(ctx, UNKNOWN_ID, ret, ext_err, METRIC_INGRESS);
 }
 
 static __always_inline int check_v6_lb(struct __ctx_buff *ctx)
 {
-	ep_tail_call(ctx, CILIUM_CALL_IPV6_FROM_NETDEV);
-	return send_drop_notify_error(ctx, 0, DROP_MISSED_TAIL_CALL, CTX_ACT_DROP,
-				      METRIC_INGRESS);
+	__s8 ext_err = 0;
+	int ret;
+
+	ret = tail_call_internal(ctx, CILIUM_CALL_IPV6_FROM_NETDEV, &ext_err);
+	return send_drop_notify_error_ext(ctx, UNKNOWN_ID, ret, ext_err, METRIC_INGRESS);
 }
 #else
 static __always_inline int check_v6_lb(struct __ctx_buff *ctx __maybe_unused)
@@ -321,6 +333,10 @@ static __always_inline int check_v6(struct __ctx_buff *ctx)
 #endif /* ENABLE_PREFILTER */
 #endif /* ENABLE_IPV6 */
 
+#ifndef xdp_early_hook
+#define xdp_early_hook(ctx, proto) CTX_ACT_OK
+#endif
+
 static __always_inline int check_filters(struct __ctx_buff *ctx)
 {
 	int ret = CTX_ACT_OK;
@@ -331,6 +347,10 @@ static __always_inline int check_filters(struct __ctx_buff *ctx)
 
 	ctx_store_meta(ctx, XFER_MARKER, 0);
 	ctx_skip_nodeport_clear(ctx);
+
+	ret = xdp_early_hook(ctx, proto);
+	if (ret != CTX_ACT_OK)
+		return ret;
 
 	switch (proto) {
 #ifdef ENABLE_IPV4

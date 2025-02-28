@@ -6,27 +6,30 @@ package clustermesh
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net"
 	"path"
 	"sync"
 
+	"github.com/cilium/hive/cell"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"k8s.io/apimachinery/pkg/runtime"
 
 	cmk8s "github.com/cilium/cilium/clustermesh-apiserver/clustermesh/k8s"
+	"github.com/cilium/cilium/clustermesh-apiserver/syncstate"
 	operatorWatchers "github.com/cilium/cilium/operator/watchers"
+	"github.com/cilium/cilium/pkg/clustermesh/mcsapi"
+	"github.com/cilium/cilium/pkg/clustermesh/operator"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	cmutils "github.com/cilium/cilium/pkg/clustermesh/utils"
 	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	"github.com/cilium/cilium/pkg/identity"
 	identityCache "github.com/cilium/cilium/pkg/identity/cache"
 	"github.com/cilium/cilium/pkg/ipcache"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
 	"github.com/cilium/cilium/pkg/k8s/resource"
-	"github.com/cilium/cilium/pkg/k8s/synced"
 	"github.com/cilium/cilium/pkg/k8s/types"
 	"github.com/cilium/cilium/pkg/kvstore"
 	"github.com/cilium/cilium/pkg/kvstore/store"
@@ -38,6 +41,7 @@ import (
 	nodeTypes "github.com/cilium/cilium/pkg/node/types"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/promise"
+	"github.com/cilium/cilium/pkg/version"
 )
 
 var (
@@ -49,18 +53,17 @@ func NewCmd(h *hive.Hive) *cobra.Command {
 		Use:   "clustermesh",
 		Short: "Run ClusterMesh",
 		Run: func(cmd *cobra.Command, args []string) {
-			if err := h.Run(); err != nil {
+			if err := h.Run(slog.Default()); err != nil {
 				log.Fatal(err)
 			}
 		},
 		PreRun: func(cmd *cobra.Command, args []string) {
 			// Overwrite the metrics namespace with the one specific for the ClusterMesh API Server
 			metrics.Namespace = metrics.CiliumClusterMeshAPIServerNamespace
+			option.Config.SetupLogging(h.Viper(), "clustermesh-apiserver")
 			option.Config.Populate(h.Viper())
-			if option.Config.Debug {
-				log.Logger.SetLevel(logrus.DebugLevel)
-			}
 			option.LogRegisteredOptions(h.Viper(), log)
+			log.Infof("Cilium ClusterMesh %s", version.Version)
 		},
 	}
 
@@ -72,17 +75,20 @@ func NewCmd(h *hive.Hive) *cobra.Command {
 type parameters struct {
 	cell.In
 
-	ExternalWorkloadsConfig
+	CfgMCSAPI      operator.MCSAPIConfig
 	ClusterInfo    cmtypes.ClusterInfo
 	Clientset      k8sClient.Clientset
 	Resources      cmk8s.Resources
 	BackendPromise promise.Promise[kvstore.BackendOperations]
 	StoreFactory   store.Factory
+	SyncState      syncstate.SyncState
+
+	Logger *slog.Logger
 }
 
-func registerHooks(lc hive.Lifecycle, params parameters) error {
-	lc.Append(hive.Hook{
-		OnStart: func(ctx hive.HookContext) error {
+func registerHooks(lc cell.Lifecycle, params parameters) error {
+	lc.Append(cell.Hook{
+		OnStart: func(ctx cell.HookContext) error {
 			if !params.Clientset.IsEnabled() {
 				return errors.New("Kubernetes client not configured, cannot continue.")
 			}
@@ -92,7 +98,7 @@ func registerHooks(lc hive.Lifecycle, params parameters) error {
 				return err
 			}
 
-			startServer(ctx, params.ClusterInfo, params.EnableExternalWorkloads, params.Clientset, backend, params.Resources, params.StoreFactory)
+			startServer(params.ClusterInfo, params.Clientset, backend, params.Resources, params.StoreFactory, params.SyncState, params.CfgMCSAPI.ClusterMeshEnableMCSAPI, params.Logger)
 			return nil
 		},
 	})
@@ -100,17 +106,17 @@ func registerHooks(lc hive.Lifecycle, params parameters) error {
 }
 
 type identitySynchronizer struct {
-	store   store.SyncStore
-	encoder func([]byte) string
+	store        store.SyncStore
+	syncCallback func(context.Context)
 }
 
-func newIdentitySynchronizer(ctx context.Context, cinfo cmtypes.ClusterInfo, backend kvstore.BackendOperations, factory store.Factory) synchronizer {
+func newIdentitySynchronizer(ctx context.Context, cinfo cmtypes.ClusterInfo, backend kvstore.BackendOperations, factory store.Factory, syncCallback func(context.Context)) synchronizer {
 	identitiesStore := factory.NewSyncStore(cinfo.Name, backend,
 		path.Join(identityCache.IdentitiesPath, "id"),
 		store.WSSWithSyncedKeyOverride(identityCache.IdentitiesPath))
 	go identitiesStore.Run(ctx)
 
-	return &identitySynchronizer{store: identitiesStore, encoder: backend.Encode}
+	return &identitySynchronizer{store: identitiesStore, syncCallback: syncCallback}
 }
 
 func parseLabelArrayFromMap(base map[string]string) labels.LabelArray {
@@ -139,7 +145,7 @@ func (is *identitySynchronizer) upsert(ctx context.Context, _ resource.Key, obj 
 	}
 
 	scopedLog.Info("Upserting identity in etcd")
-	kv := store.NewKVPair(identity.Name, is.encoder(labels))
+	kv := store.NewKVPair(identity.Name, string(labels))
 	if err := is.store.UpsertKey(ctx, kv); err != nil {
 		// The only errors surfaced by WorkqueueSyncStore are the unrecoverable ones.
 		log.WithError(err).Warning("Unable to upsert identity in etcd")
@@ -162,7 +168,7 @@ func (is *identitySynchronizer) delete(ctx context.Context, key resource.Key) er
 
 func (is *identitySynchronizer) synced(ctx context.Context) error {
 	log.Info("Initial list of identities successfully received from Kubernetes")
-	return is.store.Synced(ctx)
+	return is.store.Synced(ctx, is.syncCallback)
 }
 
 type nodeStub struct {
@@ -175,15 +181,16 @@ func (n *nodeStub) GetKeyName() string {
 }
 
 type nodeSynchronizer struct {
-	clusterInfo cmtypes.ClusterInfo
-	store       store.SyncStore
+	clusterInfo  cmtypes.ClusterInfo
+	store        store.SyncStore
+	syncCallback func(context.Context)
 }
 
-func newNodeSynchronizer(ctx context.Context, cinfo cmtypes.ClusterInfo, backend kvstore.BackendOperations, factory store.Factory) synchronizer {
+func newNodeSynchronizer(ctx context.Context, cinfo cmtypes.ClusterInfo, backend kvstore.BackendOperations, factory store.Factory, syncCallback func(context.Context)) synchronizer {
 	nodesStore := factory.NewSyncStore(cinfo.Name, backend, nodeStore.NodeStorePrefix)
 	go nodesStore.Run(ctx)
 
-	return &nodeSynchronizer{clusterInfo: cinfo, store: nodesStore}
+	return &nodeSynchronizer{clusterInfo: cinfo, store: nodesStore, syncCallback: syncCallback}
 }
 
 func (ns *nodeSynchronizer) upsert(ctx context.Context, _ resource.Key, obj runtime.Object) error {
@@ -221,25 +228,27 @@ func (ns *nodeSynchronizer) delete(ctx context.Context, key resource.Key) error 
 
 func (ns *nodeSynchronizer) synced(ctx context.Context) error {
 	log.Info("Initial list of nodes successfully received from Kubernetes")
-	return ns.store.Synced(ctx)
+	return ns.store.Synced(ctx, ns.syncCallback)
 }
 
 type ipmap map[string]struct{}
 
 type endpointSynchronizer struct {
-	store store.SyncStore
-	cache map[string]ipmap
+	store        store.SyncStore
+	cache        map[string]ipmap
+	syncCallback func(context.Context)
 }
 
-func newEndpointSynchronizer(ctx context.Context, cinfo cmtypes.ClusterInfo, backend kvstore.BackendOperations, factory store.Factory) synchronizer {
+func newEndpointSynchronizer(ctx context.Context, cinfo cmtypes.ClusterInfo, backend kvstore.BackendOperations, factory store.Factory, syncCallback func(context.Context)) synchronizer {
 	endpointsStore := factory.NewSyncStore(cinfo.Name, backend,
 		path.Join(ipcache.IPIdentitiesPath, ipcache.DefaultAddressSpace),
 		store.WSSWithSyncedKeyOverride(ipcache.IPIdentitiesPath))
 	go endpointsStore.Run(ctx)
 
 	return &endpointSynchronizer{
-		store: endpointsStore,
-		cache: make(map[string]ipmap),
+		store:        endpointsStore,
+		cache:        make(map[string]ipmap),
+		syncCallback: syncCallback,
 	}
 }
 
@@ -299,7 +308,7 @@ func (es *endpointSynchronizer) delete(ctx context.Context, key resource.Key) er
 
 func (es *endpointSynchronizer) synced(ctx context.Context) error {
 	log.Info("Initial list of endpoints successfully received from Kubernetes")
-	return es.store.Synced(ctx)
+	return es.store.Synced(ctx, es.syncCallback)
 }
 
 func (es *endpointSynchronizer) deleteEndpoints(ctx context.Context, key resource.Key, ips ipmap) {
@@ -335,46 +344,58 @@ func synchronize[T runtime.Object](ctx context.Context, r resource.Resource[T], 
 }
 
 func startServer(
-	startCtx hive.HookContext,
 	cinfo cmtypes.ClusterInfo,
-	allServices bool,
 	clientset k8sClient.Clientset,
 	backend kvstore.BackendOperations,
 	resources cmk8s.Resources,
 	factory store.Factory,
+	syncState syncstate.SyncState,
+	clusterMeshEnableMCSAPI bool,
+	logger *slog.Logger,
 ) {
 	log.WithFields(logrus.Fields{
 		"cluster-name": cinfo.Name,
 		"cluster-id":   cinfo.ID,
 	}).Info("Starting clustermesh-apiserver...")
 
-	synced.SyncCRDs(startCtx, clientset, synced.ClusterMeshAPIServerResourceNames(), &synced.Resources{}, &synced.APIGroups{})
-
 	config := cmtypes.CiliumClusterConfig{
 		ID: cinfo.ID,
 		Capabilities: cmtypes.CiliumClusterConfigCapabilities{
-			SyncedCanaries:       true,
-			MaxConnectedClusters: cinfo.MaxConnectedClusters,
+			SyncedCanaries:        true,
+			MaxConnectedClusters:  cinfo.MaxConnectedClusters,
+			ServiceExportsEnabled: &clusterMeshEnableMCSAPI,
 		},
 	}
 
-	if err := cmutils.SetClusterConfig(context.Background(), cinfo.Name, &config, backend); err != nil {
+	_, err := cmutils.EnforceClusterConfig(context.Background(), cinfo.Name, config, backend, log)
+	if err != nil {
 		log.WithError(err).Fatal("Unable to set local cluster config on kvstore")
 	}
 
 	ctx := context.Background()
-	go synchronize(ctx, resources.CiliumIdentities, newIdentitySynchronizer(ctx, cinfo, backend, factory))
-	go synchronize(ctx, resources.CiliumNodes, newNodeSynchronizer(ctx, cinfo, backend, factory))
-	go synchronize(ctx, resources.CiliumSlimEndpoints, newEndpointSynchronizer(ctx, cinfo, backend, factory))
+	go synchronize(ctx, resources.CiliumIdentities, newIdentitySynchronizer(ctx, cinfo, backend, factory, syncState.WaitForResource()))
+	go synchronize(ctx, resources.CiliumNodes, newNodeSynchronizer(ctx, cinfo, backend, factory, syncState.WaitForResource()))
+	go synchronize(ctx, resources.CiliumSlimEndpoints, newEndpointSynchronizer(ctx, cinfo, backend, factory, syncState.WaitForResource()))
 	operatorWatchers.StartSynchronizingServices(ctx, &sync.WaitGroup{}, operatorWatchers.ServiceSyncParameters{
 		ClusterInfo:  cinfo,
 		Clientset:    clientset,
 		Services:     resources.Services,
 		Endpoints:    resources.Endpoints,
 		Backend:      backend,
-		SharedOnly:   !allServices,
 		StoreFactory: factory,
+		SyncCallback: syncState.WaitForResource(),
+	}, logger)
+	go mcsapi.StartSynchronizingServiceExports(ctx, mcsapi.ServiceExportSyncParameters{
+		ClusterName:             cinfo.Name,
+		ClusterMeshEnableMCSAPI: clusterMeshEnableMCSAPI,
+		Clientset:               clientset,
+		ServiceExports:          resources.ServiceExports,
+		Services:                resources.Services,
+		Backend:                 backend,
+		StoreFactory:            factory,
+		SyncCallback:            syncState.WaitForResource(),
 	})
+	syncState.Stop()
 
 	log.Info("Initialization complete")
 }

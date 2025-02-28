@@ -7,18 +7,22 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
+	"testing"
 
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/hivetest"
 	"github.com/sirupsen/logrus"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/pointer"
+	"k8s.io/apimachinery/pkg/watch"
+	k8sTesting "k8s.io/client-go/testing"
+	"k8s.io/utils/ptr"
 
 	daemon_k8s "github.com/cilium/cilium/daemon/k8s"
 	"github.com/cilium/cilium/pkg/annotation"
 	"github.com/cilium/cilium/pkg/bgpv1"
 	"github.com/cilium/cilium/pkg/bgpv1/agent"
 	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
-	"github.com/cilium/cilium/pkg/hive/job"
 	ipamOption "github.com/cilium/cilium/pkg/ipam/option"
 	k8sPkg "github.com/cilium/cilium/pkg/k8s"
 	cilium_api_v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
@@ -30,6 +34,7 @@ import (
 	slim_meta_v1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
 	clientset_core_v1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/client/clientset/versioned/typed/core/v1"
 	"github.com/cilium/cilium/pkg/k8s/utils"
+	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/option"
 )
 
@@ -86,6 +91,7 @@ type fixture struct {
 	policyClient  v2alpha1.CiliumBGPPeeringPolicyInterface
 	secretClient  clientset_core_v1.SecretInterface
 	hive          *hive.Hive
+	cells         []cell.Cell
 	bgp           *agent.Controller
 	ciliumNode    daemon_k8s.LocalCiliumNodeResource
 }
@@ -123,14 +129,51 @@ func newFixtureConf() fixtureConfig {
 	}
 }
 
-func newFixture(conf fixtureConfig) *fixture {
+func newFixture(t testing.TB, ctx context.Context, conf fixtureConfig) (*fixture, func()) {
 	f := &fixture{
 		config: conf,
 	}
 
-	f.fakeClientSet, _ = k8sClient.NewFakeClientset()
+	rws := map[string]*struct {
+		once    sync.Once
+		watchCh chan any
+	}{
+		"ciliumnodes":              {watchCh: make(chan any)},
+		"ciliumbgppeeringpolicies": {watchCh: make(chan any)},
+	}
+
+	watchReactorFn := func(action k8sTesting.Action) (handled bool, ret watch.Interface, err error) {
+		w := action.(k8sTesting.WatchAction)
+		gvr := w.GetResource()
+		ns := w.GetNamespace()
+		watch, err := f.fakeClientSet.CiliumFakeClientset.Tracker().Watch(gvr, ns)
+		if err != nil {
+			return false, nil, err
+		}
+		rw, ok := rws[w.GetResource().Resource]
+		if !ok {
+			return false, watch, nil
+		}
+		rw.once.Do(func() { close(rw.watchCh) })
+		return true, watch, nil
+	}
+
+	// make sure watchers are initialized before the test starts
+	watchersReadyFn := func() {
+		for name, rw := range rws {
+			select {
+			case <-ctx.Done():
+				t.Fatalf("Context expired while waiting for %s", name)
+			case <-rw.watchCh:
+			}
+		}
+	}
+
+	f.fakeClientSet, _ = k8sClient.NewFakeClientset(hivetest.Logger(t))
 	f.policyClient = f.fakeClientSet.CiliumFakeClientset.CiliumV2alpha1().CiliumBGPPeeringPolicies()
 	f.secretClient = f.fakeClientSet.SlimFakeClientset.CoreV1().Secrets("bgp-secrets")
+
+	f.fakeClientSet.CiliumFakeClientset.PrependWatchReactor("*", watchReactorFn)
 
 	// create initial cilium node
 	f.fakeClientSet.CiliumFakeClientset.Tracker().Add(&conf.node)
@@ -140,7 +183,7 @@ func newFixture(conf fixtureConfig) *fixture {
 	f.fakeClientSet.SlimFakeClientset.Tracker().Add(&conf.secret)
 
 	// Construct a new Hive with mocked out dependency cells.
-	f.hive = hive.New(
+	f.cells = []cell.Cell{
 		cell.Config(k8sPkg.DefaultConfig),
 
 		// service
@@ -153,7 +196,7 @@ func newFixture(conf fixtureConfig) *fixture {
 		cell.Provide(k8sPkg.LBIPPoolsResource),
 
 		// cilium node
-		cell.Provide(func(lc hive.Lifecycle, c k8sClient.Clientset) daemon_k8s.LocalCiliumNodeResource {
+		cell.Provide(func(lc cell.Lifecycle, c k8sClient.Clientset) daemon_k8s.LocalCiliumNodeResource {
 			store := resource.New[*cilium_api_v2.CiliumNode](
 				lc, utils.ListerWatcherFromTyped[*cilium_api_v2.CiliumNodeList](
 					c.CiliumV2().CiliumNodes(),
@@ -182,17 +225,18 @@ func newFixture(conf fixtureConfig) *fixture {
 			f.bgp = bgp
 		}),
 
-		job.Cell,
+		metrics.Cell,
 		bgpv1.Cell,
-	)
+	}
+	f.hive = hive.New(f.cells...)
 
-	return f
+	return f, watchersReadyFn
 }
 
 func setupSingleNeighbor(ctx context.Context, f *fixture, peerASN uint32) error {
 	f.config.policy.Spec.VirtualRouters[0] = cilium_api_v2alpha1.CiliumBGPVirtualRouter{
 		LocalASN:      int64(ciliumASN),
-		ExportPodCIDR: pointer.Bool(true),
+		ExportPodCIDR: ptr.To[bool](true),
 		Neighbors: []cilium_api_v2alpha1.CiliumBGPNeighbor{
 			{
 				PeerAddress: dummies[instance1Link].ipv4.String(),
@@ -205,8 +249,15 @@ func setupSingleNeighbor(ctx context.Context, f *fixture, peerASN uint32) error 
 	return err
 }
 
-// setup configures dummy links, gobgp and cilium bgp cell.
-func setup(ctx context.Context, peerConfigs []gobgpConfig, fixConfig fixtureConfig) (peers []*goBGP, f *fixture, cleanup func(), err error) {
+// setup configures the test environment based on provided gobgp and fixture config.
+func setup(ctx context.Context, t testing.TB, peerConfigs []gobgpConfig, fixConfig fixtureConfig) (peers []*goBGP, f *fixture, ready, cleanup func(), err error) {
+	f, ready = newFixture(t, ctx, fixConfig)
+	peers, cleanup, err = start(ctx, t, peerConfigs, f)
+	return
+}
+
+// start configures dummy links, starts gobgp and cilium bgp cell.
+func start(ctx context.Context, t testing.TB, peerConfigs []gobgpConfig, f *fixture) (peers []*goBGP, cleanup func(), err error) {
 	// cleanup old dummy links if they are hanging around
 	_ = teardownLinks()
 
@@ -220,7 +271,7 @@ func setup(ctx context.Context, peerConfigs []gobgpConfig, fixConfig fixtureConf
 		return
 	}
 
-	// setup goBGP
+	// start goBGP
 	for _, pConf := range peerConfigs {
 		var peer *goBGP
 		peer, err = startGoBGP(ctx, pConf)
@@ -230,9 +281,9 @@ func setup(ctx context.Context, peerConfigs []gobgpConfig, fixConfig fixtureConf
 		peers = append(peers, peer)
 	}
 
-	// setup cilium
-	f = newFixture(fixConfig)
-	err = f.hive.Start(ctx)
+	// start cilium
+	tlog := hivetest.Logger(t)
+	err = f.hive.Start(tlog, ctx)
 	if err != nil {
 		return
 	}
@@ -244,7 +295,7 @@ func setup(ctx context.Context, peerConfigs []gobgpConfig, fixConfig fixtureConf
 
 		f.bgp.BGPMgr.Stop()
 
-		f.hive.Stop(ctx)
+		f.hive.Stop(tlog, ctx)
 		teardownLinks()
 	}
 

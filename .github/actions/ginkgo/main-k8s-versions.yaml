@@ -1,23 +1,30 @@
 # This file contains which kernel versions should be run with which k8s versions
 ---
 include:
-  - k8s-version: "1.28"
+  - k8s-version: "1.32"
     ip-family: "dual"
     # renovate: datasource=docker
-    kube-image: "kindest/node:v1.28.0@sha256:b7a4cad12c197af3ba43202d3efe03246b3f0793f162afb40a33c923952d5b31"
+    kube-image: "quay.io/cilium/kindest-node:v1.32.0@sha256:22cf2864f90cfab0d442fda2decf2eae107edd03483053a902614dec637eff76"
     # renovate: datasource=docker depName=quay.io/lvh-images/kind
-    kernel: "bpf-next-20231030.012704@sha256:1b69d3a852cc36eabb3b563ef1d0a26a8293d8b72bb954dbf34da63531d917e2"
+    kernel: "bpf-next-20250110.013326"
 
-  - k8s-version: "1.27"
+  - k8s-version: "1.31"
     ip-family: "dual"
     # renovate: datasource=docker
-    kube-image: "kindest/node:v1.27.3@sha256:3966ac761ae0136263ffdb6cfd4db23ef8a83cba8a463690e98317add2c9ba72"
+    kube-image: "quay.io/cilium/kindest-node:v1.31.0@sha256:d2b2a8cd6fa282b9a4126938341a4d2924dfa96f60b1f983d519498c9cde1a99"
     # renovate: datasource=docker depName=quay.io/lvh-images/kind
-    kernel: "4.19-20231026.065108@sha256:a70d8180e9e6c1b1b6f7b049f802aa0dd829c64a9284604779c3dc9a9bec9ae8"
+    kernel: "rhel8.6-20241218.004849"
 
-  - k8s-version: "1.26"
+  - k8s-version: "1.30"
     ip-family: "dual"
     # renovate: datasource=docker
-    kube-image: "kindest/node:v1.26.6@sha256:6e2d8b28a5b601defe327b98bd1c2d1930b49e5d8c512e1895099e4504007adb"
+    kube-image: "quay.io/cilium/kindest-node:v1.30.0@sha256:edcb457c0b2ecc69a0fa9b0878bdcfd4a0f1205340cf08bf36a03d3a94a16dd9"
     # renovate: datasource=docker depName=quay.io/lvh-images/kind
-    kernel: "5.4-20231026.065108@sha256:09bb2ddc1073cd361bd89e34de99c12375f1f5d90dce954776a3aa67ec64570e"
+    kernel: "rhel8.6-20241218.004849"
+
+  - k8s-version: "1.29"
+    ip-family: "dual"
+    # renovate: datasource=docker
+    kube-image: "kindest/node:v1.29.14@sha256:8703bd94ee24e51b778d5556ae310c6c0fa67d761fae6379c8e0bb480e6fea29"
+    # renovate: datasource=docker depName=quay.io/lvh-images/kind
+    kernel: "5.4-20241218.004849"

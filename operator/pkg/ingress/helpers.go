@@ -6,35 +6,18 @@ package ingress
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strconv"
 
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/cilium/cilium/pkg/logging/logfields"
 )
 
-func isCiliumDefaultIngressController(ctx context.Context, c client.Client) bool {
-	ciliumIngressClass := &networkingv1.IngressClass{}
-	if err := c.Get(ctx, types.NamespacedName{Name: ciliumIngressClassName}, ciliumIngressClass); err != nil {
-		if !errors.IsNotFound(err) {
-			log.WithError(err).Warn("Failed to load Cilium IngressClass")
-			return false
-		}
-
-		return false
-	}
-
-	isDefault, err := isIngressClassMarkedAsDefault(*ciliumIngressClass)
-	if err != nil {
-		log.WithError(err).Warn("Failed to detect default class on IngressClass cilium")
-		return false
-	}
-
-	return isDefault
-}
-
-func isCiliumManagedIngress(ctx context.Context, c client.Client, ing networkingv1.Ingress) bool {
+func isCiliumManagedIngress(ctx context.Context, c client.Client, logger *slog.Logger, ing networkingv1.Ingress) bool {
 	ingressClassName := ingressClassName(ing)
 
 	if ingressClassName != nil && *ingressClassName == ciliumIngressClassName {
@@ -42,7 +25,26 @@ func isCiliumManagedIngress(ctx context.Context, c client.Client, ing networking
 	}
 
 	// Check for default Ingress class
-	return (ingressClassName == nil || *ingressClassName == "") && isCiliumDefaultIngressController(ctx, c)
+	return (ingressClassName == nil || *ingressClassName == "") && isCiliumDefaultIngressController(ctx, c, logger)
+}
+
+func isCiliumDefaultIngressController(ctx context.Context, c client.Client, logger *slog.Logger) bool {
+	ciliumIngressClass := &networkingv1.IngressClass{}
+	if err := c.Get(ctx, types.NamespacedName{Name: ciliumIngressClassName}, ciliumIngressClass); err != nil {
+		if !errors.IsNotFound(err) {
+			logger.Warn("Failed to load Cilium IngressClass", logfields.Error, err)
+		}
+
+		return false
+	}
+
+	isDefault, err := isIngressClassMarkedAsDefault(*ciliumIngressClass)
+	if err != nil {
+		logger.Warn("Failed to detect default class on IngressClass cilium", logfields.Error, err)
+		return false
+	}
+
+	return isDefault
 }
 
 func ingressClassName(ingress networkingv1.Ingress) *string {

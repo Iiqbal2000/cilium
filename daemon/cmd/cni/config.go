@@ -10,10 +10,12 @@ import (
 	"fmt"
 	"os"
 	"path"
-	"sort"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"text/template"
 
+	"github.com/cilium/hive/cell"
 	"github.com/containernetworking/cni/libcni"
 	"github.com/fsnotify/fsnotify"
 	"github.com/google/renameio/v2"
@@ -21,8 +23,8 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 
+	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/controller"
-	"github.com/cilium/cilium/pkg/hive"
 	"github.com/cilium/cilium/pkg/time"
 	cnitypes "github.com/cilium/cilium/plugins/cilium-cni/types"
 )
@@ -42,6 +44,8 @@ type cniConfigManager struct {
 
 	// watcher watches for changes in the CNI configuration directory
 	watcher *fsnotify.Watcher
+
+	status atomic.Pointer[models.Status]
 }
 
 // GetMTU returns the MTU as written in the CNI configuration file.
@@ -57,6 +61,16 @@ func (c *cniConfigManager) GetMTU() int {
 // GetChainingMode returns the configured chaining mode.
 func (c *cniConfigManager) GetChainingMode() string {
 	return c.config.CNIChainingMode
+}
+
+func (c *cniConfigManager) Status() *models.Status {
+	return c.status.Load()
+}
+
+// ExternalRoutingEnabled returns true if the chained plugin implements routing
+// for Endpoints (Pods).
+func (c *cniConfigManager) ExternalRoutingEnabled() bool {
+	return c.config.CNIExternalRouting
 }
 
 // GetCustomNetConf returns the parsed custom CNI configuration, if provided
@@ -169,8 +183,12 @@ var cniControllerGroup = controller.NewGroup("write-cni-file")
 // - cni-exlusive -- if true, then remove other existing CNI configurations
 // - cni-log-file=PATH -- A file for the CNI plugin to use for logging
 // - debug -- Whether or not the CNI plugin binary should be verbose
-func (c *cniConfigManager) Start(hive.HookContext) error {
+func (c *cniConfigManager) Start(cell.HookContext) error {
 	if c.config.WriteCNIConfWhenReady == "" {
+		c.status.Store(&models.Status{
+			Msg:   "CNI configuration management disabled",
+			State: models.StatusStateDisabled,
+		})
 		return nil
 	}
 
@@ -212,7 +230,7 @@ func (c *cniConfigManager) Start(hive.HookContext) error {
 	return nil
 }
 
-func (c *cniConfigManager) Stop(hive.HookContext) error {
+func (c *cniConfigManager) Stop(cell.HookContext) error {
 	c.doneFunc()
 	c.controller.RemoveAllAndWait()
 
@@ -253,9 +271,23 @@ func (c *cniConfigManager) watchForDirectoryChanges() {
 
 // setupCNIConfFile tries to render and write the CNI configuration file to disk.
 // Returns error on failure.
-func (c *cniConfigManager) setupCNIConfFile() error {
+func (c *cniConfigManager) setupCNIConfFile() (err error) {
 	var contents []byte
-	var err error
+	dest := path.Join(c.cniConfDir, c.cniConfFile)
+
+	defer func() {
+		if err != nil {
+			c.status.Store(&models.Status{
+				Msg:   fmt.Sprintf("failed to write CNI configuration file %s: %v", dest, err),
+				State: models.StatusStateFailure,
+			})
+		} else {
+			c.status.Store(&models.Status{
+				Msg:   fmt.Sprintf("successfully wrote CNI configuration file to %s", dest),
+				State: models.StatusStateOk,
+			})
+		}
+	}()
 
 	// generate CNI config, either by reading a user-supplied
 	// template file or rendering our own.
@@ -277,8 +309,6 @@ func (c *cniConfigManager) setupCNIConfFile() error {
 		return fmt.Errorf("failed to create the dir %s of the CNI configuration file: %w", c.cniConfDir, err)
 	}
 
-	dest := path.Join(c.cniConfDir, c.cniConfFile)
-
 	// Check to see if existing file is the same; if so, do nothing
 	existingContents, err := os.ReadFile(dest)
 	if err == nil && bytes.Equal(existingContents, contents) {
@@ -288,7 +318,7 @@ func (c *cniConfigManager) setupCNIConfFile() error {
 			c.log.Debugf("Failed to read existing CNI configuration file %s: %v", dest, err)
 		}
 		// commit CNI config
-		if err := renameio.WriteFile(dest, contents, 0644); err != nil {
+		if err := renameio.WriteFile(dest, contents, 0600); err != nil {
 			return fmt.Errorf("failed to write CNI configuration file at %s: %w", dest, err)
 		}
 		c.log.Infof("Wrote CNI configuration file to %s", dest)
@@ -334,7 +364,7 @@ func (c *cniConfigManager) renderCNIConf() (cniConfig []byte, err error) {
 func (c *cniConfigManager) mergeExistingCNIConfig(pluginConfig []byte) ([]byte, error) {
 	contents, err := c.findCNINetwork(c.config.CNIChainingTarget)
 	if err != nil {
-		return nil, fmt.Errorf("could not find existing CNI config for chaining %w", err)
+		return nil, fmt.Errorf("could not find existing CNI config for chaining: %w", err)
 	}
 
 	// Check to see if we're already inserted; otherwise we should append
@@ -422,7 +452,7 @@ func (c *cniConfigManager) findCNINetwork(wantNetwork string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to list files in %s: %w", c.cniConfDir, err)
 	}
-	sort.Strings(files)
+	slices.Sort(files)
 
 	for _, file := range files {
 		// Don't inject ourselves in to ourselves :-)

@@ -7,12 +7,12 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cilium/hive/cell"
 	"github.com/sirupsen/logrus"
 
 	"github.com/cilium/cilium/pkg/bgpv1/manager/instance"
 	"github.com/cilium/cilium/pkg/bgpv1/manager/store"
 	"github.com/cilium/cilium/pkg/bgpv1/types"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	v2alpha1api "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
@@ -53,6 +53,12 @@ func (r *NeighborReconciler) Priority() int {
 	return 60
 }
 
+func (r *NeighborReconciler) Init(_ *instance.ServerWithConfig) error {
+	return nil
+}
+
+func (r *NeighborReconciler) Cleanup(_ *instance.ServerWithConfig) {}
+
 func (r *NeighborReconciler) Reconcile(ctx context.Context, p ReconcileParams) error {
 	if p.DesiredConfig == nil {
 		return fmt.Errorf("attempted neighbor reconciliation with nil CiliumBGPPeeringPolicy")
@@ -69,14 +75,16 @@ func (r *NeighborReconciler) Reconcile(ctx context.Context, p ReconcileParams) e
 		toCreate []*v2alpha1api.CiliumBGPNeighbor
 		toRemove []*v2alpha1api.CiliumBGPNeighbor
 		toUpdate []*v2alpha1api.CiliumBGPNeighbor
-		curNeigh []v2alpha1api.CiliumBGPNeighbor = nil
+		curNeigh []*v2alpha1api.CiliumBGPNeighbor = nil
 	)
 	newNeigh := p.DesiredConfig.Neighbors
-	l.Debugf("Begin reconciling peers for virtual router with local ASN %v", p.DesiredConfig.LocalASN)
 
-	// sc.Config can be nil if there is no previous configuration.
-	if p.CurrentServer.Config != nil {
-		curNeigh = p.CurrentServer.Config.Neighbors
+	metaMap := r.getMetadata(p.CurrentServer)
+	if len(metaMap) > 0 {
+		curNeigh = []*v2alpha1api.CiliumBGPNeighbor{}
+		for _, meta := range metaMap {
+			curNeigh = append(curNeigh, meta.currentConfig)
+		}
 	}
 
 	// an nset member which book keeps which universe it exists in.
@@ -90,7 +98,7 @@ func (r *NeighborReconciler) Reconcile(ctx context.Context, p ReconcileParams) e
 	// populate set from universe of new neighbors
 	for i, n := range newNeigh {
 		var (
-			key = fmt.Sprintf("%s%d", n.PeerAddress, n.PeerASN)
+			key = r.neighborID(&n)
 			h   *member
 			ok  bool
 		)
@@ -104,19 +112,19 @@ func (r *NeighborReconciler) Reconcile(ctx context.Context, p ReconcileParams) e
 	}
 
 	// populate set from universe of current neighbors
-	for i, n := range curNeigh {
+	for _, n := range curNeigh {
 		var (
-			key = fmt.Sprintf("%s%d", n.PeerAddress, n.PeerASN)
+			key = r.neighborID(n)
 			h   *member
 			ok  bool
 		)
 		if h, ok = nset[key]; !ok {
 			nset[key] = &member{
-				cur: &curNeigh[i],
+				cur: n,
 			}
 			continue
 		}
-		h.cur = &curNeigh[i]
+		h.cur = n
 	}
 
 	for _, m := range nset {
@@ -145,23 +153,13 @@ func (r *NeighborReconciler) Reconcile(ctx context.Context, p ReconcileParams) e
 		}
 	}
 
-	if len(toCreate) > 0 || len(toRemove) > 0 || len(toUpdate) > 0 {
-		l.Infof("Reconciling peers for virtual router with local ASN %v", p.DesiredConfig.LocalASN)
-	} else {
-		l.Debugf("No peer changes necessary for virtual router with local ASN %v", p.DesiredConfig.LocalASN)
-	}
-
-	// create new neighbors
-	for _, n := range toCreate {
-		l.Infof("Adding peer %v %v to local ASN %v", n.PeerAddress, n.PeerASN, p.DesiredConfig.LocalASN)
-		tcpPassword, err := r.fetchPeerPassword(p.CurrentServer, n)
-		if err != nil {
-			return fmt.Errorf("failed fetching password for neighbor %v %v: %w", n.PeerAddress, n.PeerASN, err)
-		}
-		if err := p.CurrentServer.Server.AddNeighbor(ctx, types.NeighborRequest{Neighbor: n, Password: tcpPassword, VR: p.DesiredConfig}); err != nil {
+	// remove neighbors
+	for _, n := range toRemove {
+		l.Infof("Removing peer %v %v from local ASN %v", n.PeerAddress, n.PeerASN, p.DesiredConfig.LocalASN)
+		if err := p.CurrentServer.Server.RemoveNeighbor(ctx, types.ToNeighborV1(n, "")); err != nil {
 			return fmt.Errorf("failed while reconciling neighbor %v %v: %w", n.PeerAddress, n.PeerASN, err)
 		}
-		r.updatePeerPassword(p.CurrentServer, n, tcpPassword)
+		r.deleteMetadata(p.CurrentServer, n)
 	}
 
 	// update neighbors
@@ -171,29 +169,36 @@ func (r *NeighborReconciler) Reconcile(ctx context.Context, p ReconcileParams) e
 		if err != nil {
 			return fmt.Errorf("failed fetching password for neighbor %v %v: %w", n.PeerAddress, n.PeerASN, err)
 		}
-		if err := p.CurrentServer.Server.UpdateNeighbor(ctx, types.NeighborRequest{Neighbor: n, Password: tcpPassword, VR: p.DesiredConfig}); err != nil {
+		if err := p.CurrentServer.Server.UpdateNeighbor(ctx, types.ToNeighborV1(n, tcpPassword)); err != nil {
 			return fmt.Errorf("failed while reconciling neighbor %v %v: %w", n.PeerAddress, n.PeerASN, err)
 		}
-		if r.changedPeerPassword(p.CurrentServer, n, tcpPassword) {
-			r.updatePeerPassword(p.CurrentServer, n, tcpPassword)
-		}
+		r.updateMetadata(p.CurrentServer, n, tcpPassword)
 	}
 
-	// remove neighbors
-	for _, n := range toRemove {
-		l.Infof("Removing peer %v %v from local ASN %v", n.PeerAddress, n.PeerASN, p.DesiredConfig.LocalASN)
-		if err := p.CurrentServer.Server.RemoveNeighbor(ctx, types.NeighborRequest{Neighbor: n, VR: p.DesiredConfig}); err != nil {
+	// create new neighbors
+	for _, n := range toCreate {
+		l.Infof("Adding peer %v %v to local ASN %v", n.PeerAddress, n.PeerASN, p.DesiredConfig.LocalASN)
+		tcpPassword, err := r.fetchPeerPassword(p.CurrentServer, n)
+		if err != nil {
+			return fmt.Errorf("failed fetching password for neighbor %v %v: %w", n.PeerAddress, n.PeerASN, err)
+		}
+		if err := p.CurrentServer.Server.AddNeighbor(ctx, types.ToNeighborV1(n, tcpPassword)); err != nil {
 			return fmt.Errorf("failed while reconciling neighbor %v %v: %w", n.PeerAddress, n.PeerASN, err)
 		}
+		r.updateMetadata(p.CurrentServer, n, tcpPassword)
 	}
 
-	l.Infof("Done reconciling peers for virtual router with local ASN %v", p.DesiredConfig.LocalASN)
 	return nil
 }
 
 // NeighborReconcilerMetadata keeps a map of peers to passwords, fetched from
 // secrets. Key is PeerAddress+PeerASN.
-type NeighborReconcilerMetadata map[string]string
+type NeighborReconcilerMetadata map[string]neighborReconcilerMetadata
+
+type neighborReconcilerMetadata struct {
+	currentPassword string
+	currentConfig   *v2alpha1api.CiliumBGPNeighbor
+}
 
 func (r *NeighborReconciler) getMetadata(sc *instance.ServerWithConfig) NeighborReconcilerMetadata {
 	if _, found := sc.ReconcilerMetadata[r.Name()]; !found {
@@ -203,8 +208,6 @@ func (r *NeighborReconciler) getMetadata(sc *instance.ServerWithConfig) Neighbor
 }
 
 func (r *NeighborReconciler) fetchPeerPassword(sc *instance.ServerWithConfig, n *v2alpha1api.CiliumBGPNeighbor) (string, error) {
-	peerPasswords := r.getMetadata(sc)
-
 	l := log.WithFields(
 		logrus.Fields{
 			"component": "NeighborReconciler.fetchPeerPassword",
@@ -212,7 +215,7 @@ func (r *NeighborReconciler) fetchPeerPassword(sc *instance.ServerWithConfig, n 
 	)
 	if n.AuthSecretRef != nil {
 		secretRef := *n.AuthSecretRef
-		old := peerPasswords[fmt.Sprintf("%s%d", n.PeerAddress, n.PeerASN)]
+		old := r.getMetadata(sc)[r.neighborID(n)].currentPassword
 
 		secret, ok, err := r.fetchSecret(secretRef)
 		if err != nil {
@@ -252,16 +255,20 @@ func (r *NeighborReconciler) fetchSecret(name string) (map[string][]byte, bool, 
 }
 
 func (r *NeighborReconciler) changedPeerPassword(sc *instance.ServerWithConfig, n *v2alpha1api.CiliumBGPNeighbor, tcpPassword string) bool {
-	peerPasswords := r.getMetadata(sc)
-
-	key := fmt.Sprintf("%s%d", n.PeerAddress, n.PeerASN)
-	old := peerPasswords[key]
-	return old != tcpPassword
+	return r.getMetadata(sc)[r.neighborID(n)].currentPassword != tcpPassword
 }
 
-func (r *NeighborReconciler) updatePeerPassword(sc *instance.ServerWithConfig, n *v2alpha1api.CiliumBGPNeighbor, tcpPassword string) {
-	peerPasswords := r.getMetadata(sc)
+func (r *NeighborReconciler) updateMetadata(sc *instance.ServerWithConfig, n *v2alpha1api.CiliumBGPNeighbor, tcpPassword string) {
+	r.getMetadata(sc)[r.neighborID(n)] = neighborReconcilerMetadata{
+		currentPassword: tcpPassword,
+		currentConfig:   n.DeepCopy(),
+	}
+}
 
-	key := fmt.Sprintf("%s%d", n.PeerAddress, n.PeerASN)
-	peerPasswords[key] = tcpPassword
+func (r *NeighborReconciler) deleteMetadata(sc *instance.ServerWithConfig, n *v2alpha1api.CiliumBGPNeighbor) {
+	delete(r.getMetadata(sc), r.neighborID(n))
+}
+
+func (r *NeighborReconciler) neighborID(n *v2alpha1api.CiliumBGPNeighbor) string {
+	return fmt.Sprintf("%s%d", n.PeerAddress, n.PeerASN)
 }

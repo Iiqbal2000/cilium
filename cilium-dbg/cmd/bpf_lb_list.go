@@ -9,10 +9,12 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/cilium/cilium/pkg/bpf"
+	"github.com/cilium/cilium/pkg/byteorder"
 	"github.com/cilium/cilium/pkg/command"
 	"github.com/cilium/cilium/pkg/common"
 	"github.com/cilium/cilium/pkg/loadbalancer"
 	"github.com/cilium/cilium/pkg/maps/lbmap"
+	"github.com/cilium/cilium/pkg/u8proto"
 )
 
 const (
@@ -96,16 +98,20 @@ func dumpSVC(serviceList map[string][]string) {
 			if svcKey.IsIPv6() {
 				ip = "[::]"
 			}
-			entry = fmt.Sprintf("%s:%d (%d) (%d) [%s]", ip, 0, revNATID, backendSlot, flags)
+			extra := ""
+			if flags.IsL7LB() {
+				extra = fmt.Sprintf("(L7LB Proxy Port: %d)", byteorder.NetworkToHost16(uint16(svcVal.GetBackendID())))
+			}
+			entry = fmt.Sprintf("%s:%d (%d) (%d) [%s] %s", ip, 0, revNATID, backendSlot, flags, extra)
 		} else if backend, found := backendMap[backendID]; !found {
 			entry = fmt.Sprintf("backend %d not found", backendID)
 		} else {
-			fmtStr := "%s:%d (%d) (%d)"
+			fmtStr := "%s:%d/%s (%d) (%d)"
 			if svcKey.IsIPv6() {
-				fmtStr = "[%s]:%d (%d) (%d)"
+				fmtStr = "[%s]:%d/%s (%d) (%d)"
 			}
 			entry = fmt.Sprintf(fmtStr, backend.GetAddress(),
-				backend.GetPort(), revNATID, backendSlot)
+				backend.GetPort(), u8proto.U8proto(backend.GetProtocol()).String(), revNATID, backendSlot)
 		}
 
 		serviceList[svc] = append(serviceList[svc], entry)

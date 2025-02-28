@@ -24,10 +24,12 @@ understand the workflow of getting these changes reviewed and merged upstream.
    images
    codeoverview
    hive
+   statedb
    debugging
    hubble
    introducing_new_crds
    bgp_cplane
+   renovate
 
 The best way to get help if you get stuck is to ask a question on `Cilium
 Slack`_. With Cilium contributors across the globe, there is almost always

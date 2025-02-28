@@ -5,6 +5,14 @@
 #include "node_config.h"
 #include "common.h"
 #include "lib/maps.h"
+
+static __u64 mock_ktime_get_ns(void)
+{
+	return 3000 * NSEC_PER_SEC;
+}
+
+#define ktime_get_ns mock_ktime_get_ns
+
 #include "lib/ratelimit.h"
 
 CHECK("xdp", "ratelimit") int test_ratelimit(void)
@@ -15,7 +23,12 @@ CHECK("xdp", "ratelimit") int test_ratelimit(void)
 		.topup_interval_ns = NSEC_PER_SEC,
 	};
 	struct ratelimit_key key = {
-		.netdev_idx = 1,
+		.usage = RATELIMIT_USAGE_ICMPV6,
+		.key = {
+			.icmpv6 = {
+				.netdev_idx = 1,
+			},
+		},
 	};
 	struct ratelimit_value *value;
 
@@ -56,7 +69,7 @@ CHECK("xdp", "ratelimit") int test_ratelimit(void)
 
 		/* Set last topup to 1 interval ago */
 		value->tokens = 0;
-		value->last_topup = ktime_get_ns() - settings.topup_interval_ns;
+		value->last_topup = ktime_get_ns() - (settings.topup_interval_ns + 1);
 
 		if (!ratelimit_check_and_take(&key, &settings))
 			test_fatal("Rate limit not allowed after topup");

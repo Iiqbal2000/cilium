@@ -17,7 +17,6 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	"github.com/sirupsen/logrus"
 
-	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/metrics/metric"
 	"github.com/cilium/cilium/pkg/promise"
 	"github.com/cilium/cilium/pkg/source"
@@ -254,6 +253,12 @@ const (
 	LabelAddressType          = "address_type"
 	LabelAddressTypePrimary   = "primary"
 	LabelAddressTypeSecondary = "secondary"
+
+	// LabelConnectivityStatus is the label for connectivity statuses
+	LabelConnectivityStatus = "status"
+	LabelReachable          = "reachable"
+	LabelUnreachable        = "unreachable"
+	LabelUnknown            = "unknown"
 )
 
 var (
@@ -269,7 +274,7 @@ var (
 	BPFMapPressure = true
 
 	// BootstrapTimes is the durations of cilium-agent bootstrap sequence.
-	BootstrapTimes = NoOpObserverVec
+	BootstrapTimes = NoOpGaugeVec
 
 	// APIInteractions is the total time taken to process an API call made
 	// to the cilium-agent
@@ -284,6 +289,14 @@ var (
 	// NodeConnectivityLatency is the connectivity latency between local node to
 	// other node intra or inter cluster.
 	NodeConnectivityLatency = NoOpGaugeDeletableVec
+
+	// NodeHealthConnectivityStatus is the number of connections with connectivity status
+	// between local node to other node intra or inter cluster.
+	NodeHealthConnectivityStatus = NoOpGaugeVec
+
+	// NodeHealthConnectivityLatency is the histogram connectivity latency between local node to
+	// other node intra or inter cluster.
+	NodeHealthConnectivityLatency = NoOpObserverVec
 
 	// Endpoint
 
@@ -316,9 +329,11 @@ var (
 
 	// PolicyRegenerationCount is the total number of successful policy
 	// regenerations.
+	// Deprecated: Use EndpointRegenerationTotal.
 	PolicyRegenerationCount = NoOpCounter
 
-	// PolicyRegenerationTimeStats is the total time taken to generate policies
+	// PolicyRegenerationTimeStats is the total time taken to generate policies.
+	// Deprecated: Use EndpointRegenerationTimeStats.
 	PolicyRegenerationTimeStats = NoOpObserverVec
 
 	// PolicyRevision is the current policy revision number for this agent
@@ -338,20 +353,26 @@ var (
 	// time taken to fully deploy an endpoint.
 	PolicyImplementationDelay = NoOpObserverVec
 
+	// PolicyIncrementalUpdateDuration is the time it takes to apply an incremental update
+	// to the policy engine. An incremental update is a newly-learned identity that can be
+	// directly added to policy maps without a full policy recalculation.
+	PolicyIncrementalUpdateDuration = NoOpObserverVec
+
 	// CIDRGroup
 
 	// CIDRGroupsReferenced is the number of CNPs and CCNPs referencing at least one CiliumCIDRGroup.
 	// CNPs with empty or non-existing CIDRGroupRefs are not considered.
 	CIDRGroupsReferenced = NoOpGauge
 
-	// CIDRGroupTranslationTimeStats is the time taken to translate the policy field `FromCIDRGroupRef`
-	// after the referenced CIDRGroups have been updated or deleted.
-	CIDRGroupTranslationTimeStats = NoOpHistogram
-
 	// Identity
 
 	// Identity is the number of identities currently in use on the node by type
 	Identity = NoOpGaugeVec
+
+	// IdentityLabelSources is the number of identities in use on the node with
+	// have a particular label source. Note that an identity may contain labels
+	// from multiple sources and thus might be counted in multiple buckets
+	IdentityLabelSources = NoOpGaugeVec
 
 	// Events
 
@@ -411,6 +432,10 @@ var (
 
 	// ServicesEventsCount counts the number of services
 	ServicesEventsCount = NoOpCounterVec
+
+	// ServiceImplementationDelay the execution duration of the service handler in milliseconds.
+	// The metric reflects the time it took to program the service excluding the event queue latency.
+	ServiceImplementationDelay = NoOpObserverVec
 
 	// Errors and warnings
 
@@ -497,6 +522,9 @@ var (
 	// connection (aka zombie), per endpoint.
 	FQDNAliveZombieConnections = NoOpGaugeVec
 
+	// FQDNSelectors is the total number of registered ToFQDN selectors
+	FQDNSelectors = NoOpGauge
+
 	// FQDNSemaphoreRejectedTotal is the total number of DNS requests rejected
 	// by the DNS proxy because too many requests were in flight, as enforced by
 	// the admission semaphore.
@@ -519,18 +547,6 @@ var (
 
 	// BPFMapCapacity is the max capacity of bpf maps, labelled by map group classification.
 	BPFMapCapacity = NoOpGaugeVec
-
-	// TriggerPolicyUpdateTotal is the metric to count total number of
-	// policy update triggers
-	TriggerPolicyUpdateTotal = NoOpCounterVec
-
-	// TriggerPolicyUpdateFolds is the current level folding that is
-	// happening when running policy update triggers
-	TriggerPolicyUpdateFolds = NoOpGauge
-
-	// TriggerPolicyUpdateCallDuration measures the latency and call
-	// duration of policy update triggers
-	TriggerPolicyUpdateCallDuration = NoOpObserverVec
 
 	// VersionMetric labelled by Cilium version
 	VersionMetric = NoOpGaugeVec
@@ -639,10 +655,12 @@ var (
 )
 
 type LegacyMetrics struct {
-	BootstrapTimes                   metric.Vec[metric.Observer]
+	BootstrapTimes                   metric.Vec[metric.Gauge]
 	APIInteractions                  metric.Vec[metric.Observer]
 	NodeConnectivityStatus           metric.DeletableVec[metric.Gauge]
 	NodeConnectivityLatency          metric.DeletableVec[metric.Gauge]
+	NodeHealthConnectivityStatus     metric.Vec[metric.Gauge]
+	NodeHealthConnectivityLatency    metric.Vec[metric.Observer]
 	Endpoint                         metric.GaugeFunc
 	EndpointMaxIfindex               metric.Gauge
 	EndpointRegenerationTotal        metric.Vec[metric.Counter]
@@ -656,9 +674,10 @@ type LegacyMetrics struct {
 	PolicyChangeTotal                metric.Vec[metric.Counter]
 	PolicyEndpointStatus             metric.Vec[metric.Gauge]
 	PolicyImplementationDelay        metric.Vec[metric.Observer]
+	PolicyIncrementalUpdateDuration  metric.Vec[metric.Observer]
 	CIDRGroupsReferenced             metric.Gauge
-	CIDRGroupTranslationTimeStats    metric.Histogram
 	Identity                         metric.Vec[metric.Gauge]
+	IdentityLabelSources             metric.Vec[metric.Gauge]
 	EventTS                          metric.Vec[metric.Gauge]
 	EventLagK8s                      metric.Gauge
 	ProxyRedirects                   metric.Vec[metric.Gauge]
@@ -673,6 +692,7 @@ type LegacyMetrics struct {
 	ConntrackDumpResets              metric.Vec[metric.Counter]
 	SignalsHandled                   metric.Vec[metric.Counter]
 	ServicesEventsCount              metric.Vec[metric.Counter]
+	ServiceImplementationDelay       metric.Vec[metric.Observer]
 	ErrorsWarnings                   metric.Vec[metric.Counter]
 	ControllerRuns                   metric.Vec[metric.Counter]
 	ControllerRunsDuration           metric.Vec[metric.Observer]
@@ -693,15 +713,13 @@ type LegacyMetrics struct {
 	FQDNActiveNames                  metric.Vec[metric.Gauge]
 	FQDNActiveIPs                    metric.Vec[metric.Gauge]
 	FQDNAliveZombieConnections       metric.Vec[metric.Gauge]
+	FQDNSelectors                    metric.Gauge
 	FQDNSemaphoreRejectedTotal       metric.Counter
 	IPCacheErrorsTotal               metric.Vec[metric.Counter]
 	IPCacheEventsTotal               metric.Vec[metric.Counter]
 	BPFSyscallDuration               metric.Vec[metric.Observer]
 	BPFMapOps                        metric.Vec[metric.Counter]
 	BPFMapCapacity                   metric.Vec[metric.Gauge]
-	TriggerPolicyUpdateTotal         metric.Vec[metric.Counter]
-	TriggerPolicyUpdateFolds         metric.Gauge
-	TriggerPolicyUpdateCallDuration  metric.Vec[metric.Observer]
 	VersionMetric                    metric.Vec[metric.Gauge]
 	APILimiterWaitHistoryDuration    metric.Vec[metric.Observer]
 	APILimiterWaitDuration           metric.Vec[metric.Gauge]
@@ -721,7 +739,7 @@ type LegacyMetrics struct {
 
 func NewLegacyMetrics() *LegacyMetrics {
 	lm := &LegacyMetrics{
-		BootstrapTimes: metric.NewHistogramVec(metric.HistogramOpts{
+		BootstrapTimes: metric.NewGaugeVec(metric.GaugeOpts{
 			ConfigName: Namespace + "_" + SubsystemAgent + "_bootstrap_seconds",
 			Namespace:  Namespace,
 			Subsystem:  SubsystemAgent,
@@ -830,21 +848,21 @@ func NewLegacyMetrics() *LegacyMetrics {
 			},
 		}),
 
+		PolicyIncrementalUpdateDuration: metric.NewHistogramVec(metric.HistogramOpts{
+			ConfigName: Namespace + "_policy_incremental_update_duration",
+
+			Namespace: Namespace,
+			Name:      "policy_incremental_update_duration",
+			Help:      "Time between learning about a new identity and it being fully added to all policies.",
+			Buckets:   prometheus.ExponentialBuckets(10e-6, 10, 8),
+		}, []string{"scope"}),
+
 		CIDRGroupsReferenced: metric.NewGauge(metric.GaugeOpts{
 			ConfigName: Namespace + "cidrgroups_referenced",
 
 			Namespace: Namespace,
 			Name:      "cidrgroups_referenced",
 			Help:      "Number of CNPs and CCNPs referencing at least one CiliumCIDRGroup. CNPs with empty or non-existing CIDRGroupRefs are not considered",
-		}),
-
-		CIDRGroupTranslationTimeStats: metric.NewHistogram(metric.HistogramOpts{
-			ConfigName: Namespace + "cidrgroup_translation_time_stats_seconds",
-			Disabled:   true,
-
-			Namespace: Namespace,
-			Name:      "cidrgroup_translation_time_stats_seconds",
-			Help:      "CIDRGroup translation time stats",
 		}),
 
 		Identity: metric.NewGaugeVec(metric.GaugeOpts{
@@ -854,6 +872,14 @@ func NewLegacyMetrics() *LegacyMetrics {
 			Name:      "identity",
 			Help:      "Number of identities currently allocated",
 		}, []string{LabelType}),
+
+		IdentityLabelSources: metric.NewGaugeVec(metric.GaugeOpts{
+			ConfigName: Namespace + "_identity_label_sources",
+
+			Namespace: Namespace,
+			Name:      "identity_label_sources",
+			Help:      "Number of identities which contain at least one label of the given label source",
+		}, []string{LabelSource}),
 
 		EventTS: metric.NewGaugeVec(metric.GaugeOpts{
 			ConfigName: Namespace + "_event_ts",
@@ -981,12 +1007,15 @@ func NewLegacyMetrics() *LegacyMetrics {
 			Help:       "Number of services events labeled by action type",
 		}, []string{LabelAction}),
 
-		ErrorsWarnings: metric.NewCounterVec(metric.CounterOpts{
-			ConfigName: Namespace + "_errors_warnings_total",
+		ServiceImplementationDelay: metric.NewHistogramVec(metric.HistogramOpts{
+			ConfigName: Namespace + "_service_implementation_delay",
 			Namespace:  Namespace,
-			Name:       "errors_warnings_total",
-			Help:       "Number of total errors in cilium-agent instances",
-		}, []string{"level", "subsystem"}),
+			Name:       "service_implementation_delay",
+			Help: "Duration in seconds to propagate the data plane programming of a service, its network and endpoints " +
+				"from the time the service or the service pod was changed excluding the event queue latency",
+		}, []string{LabelAction}),
+
+		ErrorsWarnings: newErrorsWarningsMetric(),
 
 		ControllerRuns: metric.NewCounterVec(metric.CounterOpts{
 			ConfigName: Namespace + "_controllers_runs_total",
@@ -1009,51 +1038,19 @@ func NewLegacyMetrics() *LegacyMetrics {
 			Help:       "Number of times that Cilium has started a subprocess, labeled by subsystem",
 		}, []string{LabelSubsystem}),
 
-		KubernetesEventProcessed: metric.NewCounterVecWithLabels(metric.CounterOpts{
+		KubernetesEventProcessed: metric.NewCounterVec(metric.CounterOpts{
 			ConfigName: Namespace + "_kubernetes_events_total",
 			Namespace:  Namespace,
 			Name:       "kubernetes_events_total",
 			Help:       "Number of Kubernetes events processed labeled by scope, action and execution result",
-		},
-			metric.Labels{
-				{
-					Name:   LabelScope,
-					Values: metric.NewValues("CiliumNetworkPolicy", "CiliumClusterwideNetworkPolicy", "NetworkPolicy"),
-				},
-				{
-					Name:   LabelAction,
-					Values: metric.NewValues("update", "delete"),
-				},
-				{
-					Name:   LabelStatus,
-					Values: metric.NewValues("success", "failed"),
-				},
-			},
-		),
+		}, []string{LabelScope, LabelAction, LabelStatus}),
 
-		KubernetesEventReceived: metric.NewCounterVecWithLabels(metric.CounterOpts{
+		KubernetesEventReceived: metric.NewCounterVec(metric.CounterOpts{
 			ConfigName: Namespace + "_kubernetes_events_received_total",
 			Namespace:  Namespace,
 			Name:       "kubernetes_events_received_total",
 			Help:       "Number of Kubernetes events received labeled by scope, action, valid data and equalness",
-		}, metric.Labels{
-			{
-				Name:   LabelScope,
-				Values: metric.NewValues("CiliumNetworkPolicy", "CiliumClusterwideNetworkPolicy", "NetworkPolicy"),
-			},
-			{
-				Name:   LabelAction,
-				Values: metric.NewValues("update", "delete"),
-			},
-			{
-				Name:   "valid",
-				Values: LabelValuesBool,
-			},
-			{
-				Name:   "equal",
-				Values: LabelValuesBool,
-			},
-		}),
+		}, []string{LabelScope, LabelAction, "valid", "equal"}),
 
 		KubernetesAPIInteractions: metric.NewHistogramVec(metric.HistogramOpts{
 			ConfigName: Namespace + "_" + SubsystemK8sClient + "_api_latency_time_seconds",
@@ -1187,6 +1184,14 @@ func NewLegacyMetrics() *LegacyMetrics {
 			Help:       "Number of IPs associated with domains that have expired (by TTL) yet still associated with an active connection (aka zombie), per endpoint",
 		}, []string{LabelPeerEndpoint}),
 
+		FQDNSelectors: metric.NewGauge(metric.GaugeOpts{
+			ConfigName: Namespace + "_" + SubsystemFQDN + "_selectors",
+			Namespace:  Namespace,
+			Subsystem:  SubsystemFQDN,
+			Name:       "selectors",
+			Help:       "Number of registered ToFQDN selectors",
+		}),
+
 		FQDNSemaphoreRejectedTotal: metric.NewCounter(metric.CounterOpts{
 			ConfigName: Namespace + "_" + SubsystemFQDN + "_semaphore_rejected_total",
 			Disabled:   true,
@@ -1220,30 +1225,6 @@ func NewLegacyMetrics() *LegacyMetrics {
 			Name:       "map_capacity",
 			Help:       "Capacity of map, tagged by map group. All maps with a capacity of 65536 are grouped under 'default'",
 		}, []string{LabelMapGroup}),
-
-		TriggerPolicyUpdateTotal: metric.NewCounterVec(metric.CounterOpts{
-			ConfigName: Namespace + "_" + SubsystemTriggers + "_policy_update_total",
-			Namespace:  Namespace,
-			Subsystem:  SubsystemTriggers,
-			Name:       "policy_update_total",
-			Help:       "Total number of policy update trigger invocations labeled by reason",
-		}, []string{"reason"}),
-
-		TriggerPolicyUpdateFolds: metric.NewGauge(metric.GaugeOpts{
-			ConfigName: Namespace + "_" + SubsystemTriggers + "_policy_update_folds",
-			Namespace:  Namespace,
-			Subsystem:  SubsystemTriggers,
-			Name:       "policy_update_folds",
-			Help:       "Current number of folds",
-		}),
-
-		TriggerPolicyUpdateCallDuration: metric.NewHistogramVec(metric.HistogramOpts{
-			ConfigName: Namespace + "_" + SubsystemTriggers + "_policy_update_call_duration_seconds",
-			Namespace:  Namespace,
-			Subsystem:  SubsystemTriggers,
-			Name:       "policy_update_call_duration_seconds",
-			Help:       "Duration of policy update trigger",
-		}, []string{LabelType}),
 
 		VersionMetric: metric.NewGaugeVec(metric.GaugeOpts{
 			ConfigName: Namespace + "_version",
@@ -1307,7 +1288,7 @@ func NewLegacyMetrics() *LegacyMetrics {
 			Subsystem:  SubsystemAPILimiter,
 			Name:       "processed_requests_total",
 			Help:       "Total number of API requests processed",
-		}, []string{"api_call", LabelOutcome}),
+		}, []string{"api_call", LabelOutcome, LabelAPIReturnCode}),
 
 		EndpointPropagationDelay: metric.NewHistogramVec(metric.HistogramOpts{
 			ConfigName: Namespace + "_endpoint_propagation_delay_seconds",
@@ -1348,6 +1329,32 @@ func NewLegacyMetrics() *LegacyMetrics {
 			LabelAddressType,
 		}),
 
+		NodeHealthConnectivityStatus: metric.NewGaugeVec(metric.GaugeOpts{
+			ConfigName: Namespace + "_node_health_connectivity_status",
+			Namespace:  Namespace,
+			Name:       "node_health_connectivity_status",
+			Help:       "The number of endpoints with last observed status of both ICMP and HTTP connectivity between the current Cilium agent and other Cilium nodes",
+		}, []string{
+			LabelSourceCluster,
+			LabelSourceNodeName,
+			LabelType,
+			LabelConnectivityStatus,
+		}),
+
+		NodeHealthConnectivityLatency: metric.NewHistogramVec(metric.HistogramOpts{
+			ConfigName: Namespace + "_node_health_connectivity_latency_seconds",
+			Namespace:  Namespace,
+			Name:       "node_health_connectivity_latency_seconds",
+			Help:       "The histogram for last observed latency between the current Cilium agent and other Cilium nodes in seconds",
+			Buckets:    []float64{0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0},
+		}, []string{
+			LabelSourceCluster,
+			LabelSourceNodeName,
+			LabelType,
+			LabelProtocol,
+			LabelAddressType,
+		}),
+
 		WorkQueueDepth:                   WorkQueueDepth,
 		WorkQueueAddsTotal:               WorkQueueAddsTotal,
 		WorkQueueLatency:                 WorkQueueLatency,
@@ -1374,6 +1381,8 @@ func NewLegacyMetrics() *LegacyMetrics {
 	APIInteractions = lm.APIInteractions
 	NodeConnectivityStatus = lm.NodeConnectivityStatus
 	NodeConnectivityLatency = lm.NodeConnectivityLatency
+	NodeHealthConnectivityStatus = lm.NodeHealthConnectivityStatus
+	NodeHealthConnectivityLatency = lm.NodeHealthConnectivityLatency
 	Endpoint = lm.Endpoint
 	EndpointMaxIfindex = lm.EndpointMaxIfindex
 	EndpointRegenerationTotal = lm.EndpointRegenerationTotal
@@ -1387,9 +1396,10 @@ func NewLegacyMetrics() *LegacyMetrics {
 	PolicyChangeTotal = lm.PolicyChangeTotal
 	PolicyEndpointStatus = lm.PolicyEndpointStatus
 	PolicyImplementationDelay = lm.PolicyImplementationDelay
+	PolicyIncrementalUpdateDuration = lm.PolicyIncrementalUpdateDuration
 	CIDRGroupsReferenced = lm.CIDRGroupsReferenced
-	CIDRGroupTranslationTimeStats = lm.CIDRGroupTranslationTimeStats
 	Identity = lm.Identity
+	IdentityLabelSources = lm.IdentityLabelSources
 	EventTS = lm.EventTS
 	EventLagK8s = lm.EventLagK8s
 	ProxyRedirects = lm.ProxyRedirects
@@ -1404,6 +1414,7 @@ func NewLegacyMetrics() *LegacyMetrics {
 	ConntrackDumpResets = lm.ConntrackDumpResets
 	SignalsHandled = lm.SignalsHandled
 	ServicesEventsCount = lm.ServicesEventsCount
+	ServiceImplementationDelay = lm.ServiceImplementationDelay
 	ErrorsWarnings = lm.ErrorsWarnings
 	ControllerRuns = lm.ControllerRuns
 	ControllerRunsDuration = lm.ControllerRunsDuration
@@ -1424,15 +1435,13 @@ func NewLegacyMetrics() *LegacyMetrics {
 	FQDNActiveNames = lm.FQDNActiveNames
 	FQDNActiveIPs = lm.FQDNActiveIPs
 	FQDNAliveZombieConnections = lm.FQDNAliveZombieConnections
+	FQDNSelectors = lm.FQDNSelectors
 	FQDNSemaphoreRejectedTotal = lm.FQDNSemaphoreRejectedTotal
 	IPCacheErrorsTotal = lm.IPCacheErrorsTotal
 	IPCacheEventsTotal = lm.IPCacheEventsTotal
 	BPFSyscallDuration = lm.BPFSyscallDuration
 	BPFMapOps = lm.BPFMapOps
 	BPFMapCapacity = lm.BPFMapCapacity
-	TriggerPolicyUpdateTotal = lm.TriggerPolicyUpdateTotal
-	TriggerPolicyUpdateFolds = lm.TriggerPolicyUpdateFolds
-	TriggerPolicyUpdateCallDuration = lm.TriggerPolicyUpdateCallDuration
 	VersionMetric = lm.VersionMetric
 	APILimiterWaitHistoryDuration = lm.APILimiterWaitHistoryDuration
 	APILimiterWaitDuration = lm.APILimiterWaitDuration
@@ -1443,6 +1452,20 @@ func NewLegacyMetrics() *LegacyMetrics {
 	APILimiterProcessedRequests = lm.APILimiterProcessedRequests
 
 	return lm
+}
+
+// InitOperatorMetrics is used to init legacy metrics necessary during operator init.
+func InitOperatorMetrics() {
+	ErrorsWarnings = newErrorsWarningsMetric()
+}
+
+func newErrorsWarningsMetric() metric.Vec[metric.Counter] {
+	return metric.NewCounterVec(metric.CounterOpts{
+		ConfigName: Namespace + "_errors_warnings_total",
+		Namespace:  Namespace,
+		Name:       "errors_warnings_total",
+		Help:       "Number of total errors in cilium-agent instances",
+	}, []string{"level", "subsystem"})
 }
 
 // GaugeWithThreshold is a prometheus gauge that registers itself with
@@ -1541,19 +1564,6 @@ func Unregister(c prometheus.Collector) bool {
 	return false
 }
 
-// DumpMetrics gets the current Cilium metrics and dumps all into a
-// models.Metrics structure.If metrics cannot be retrieved, returns an error
-func DumpMetrics() ([]*models.Metric, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	reg, err := registry.Await(ctx)
-	if err == nil {
-		return reg.DumpMetrics()
-	}
-
-	return nil, nil
-}
-
 // withRegistry waits up to 1 second for the registry promise to resolve, if it does not then
 // we might be calling this function before hive has been started, so to avoid a deadlock,
 // wait in a routine so actions are deferred until the registry is initialized.
@@ -1604,6 +1614,14 @@ func Error2Outcome(err error) string {
 	}
 
 	return LabelValueOutcomeSuccess
+}
+
+// LabelOutcome2Code converts a label outcome to a code
+func LabelOutcome2Code(outcome string) int {
+	if outcome == LabelValueOutcomeSuccess {
+		return 200
+	}
+	return 500
 }
 
 func BoolToFloat64(v bool) float64 {
