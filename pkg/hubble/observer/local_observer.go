@@ -53,7 +53,7 @@ type LocalObserverServer struct {
 	log logrus.FieldLogger
 
 	// payloadParser decodes flowpb.Payload into flowpb.Flow
-	payloadParser *parser.Parser
+	payloadParser parser.Decoder
 
 	opts observeroption.Options
 
@@ -68,7 +68,7 @@ type LocalObserverServer struct {
 
 // NewLocalServer returns a new local observer server.
 func NewLocalServer(
-	payloadParser *parser.Parser,
+	payloadParser parser.Decoder,
 	namespaceManager NamespaceManager,
 	logger logrus.FieldLogger,
 	options ...observeroption.Option,
@@ -77,7 +77,7 @@ func NewLocalServer(
 	options = append(options, DefaultOptions...)
 	for _, opt := range options {
 		if err := opt(&opts); err != nil {
-			return nil, fmt.Errorf("failed to apply option: %v", err)
+			return nil, fmt.Errorf("failed to apply option: %w", err)
 		}
 	}
 
@@ -197,7 +197,7 @@ func (s *LocalObserverServer) GetStopped() chan struct{} {
 }
 
 // GetPayloadParser implements GRPCServer.GetPayloadParser.
-func (s *LocalObserverServer) GetPayloadParser() *parser.Parser {
+func (s *LocalObserverServer) GetPayloadParser() parser.Decoder {
 	return s.payloadParser
 }
 
@@ -257,7 +257,8 @@ func (s *LocalObserverServer) GetFlows(
 		}
 	}
 
-	filterList := append(filters.DefaultFilters, s.opts.OnBuildFilter...)
+	log := s.GetLogger()
+	filterList := append(filters.DefaultFilters(log), s.opts.OnBuildFilter...)
 	whitelist, err := filters.BuildFilterList(ctx, req.Whitelist, filterList)
 	if err != nil {
 		return err
@@ -268,7 +269,6 @@ func (s *LocalObserverServer) GetFlows(
 	}
 
 	start := time.Now()
-	log := s.GetLogger()
 	ring := s.GetRingBuffer()
 
 	i := uint64(0)
@@ -295,7 +295,12 @@ func (s *LocalObserverServer) GetFlows(
 		return err
 	}
 
-	mask, err := fieldmask.New(req.Experimental.GetFieldMask())
+	fm := req.GetFieldMask()
+	if len(fm.GetPaths()) == 0 {
+		// TODO: Remove req.Experimental.GetFieldMask after v1.17
+		fm = req.Experimental.GetFieldMask()
+	}
+	mask, err := fieldmask.New(fm)
 	if err != nil {
 		return err
 	}

@@ -38,8 +38,10 @@ Cluster Addressing Requirements
 
 .. note::
   
-  If you intend to connect two AKS (Azure Kubernetes Service) clusters together
-  you can follow the :ref:`gs_clustermesh_aks_prep` guide for instruction on
+  For cloud-specific deployments, you can check out the :ref:`gs_clustermesh_aks_prep`
+  guide for Azure Kubernetes Service (AKS), the :ref:`gs_clustermesh_eks_prep`
+  guide for Amazon Elastic Kubernetes Service (EKS) or the :ref:`gs_clustermesh_gke_prep` 
+  guide for Google Kubernetes Engine (GKE) clusters for instructions on
   how to meet the above requirements.
 
 Additional Requirements for Native-routed Datapath Modes
@@ -63,6 +65,41 @@ Additional Requirements for Native-routed Datapath Modes
   across any ports that the pods may use. This is typically accomplished with
   firewall rules allowing pods in different clusters to reach each other on all
   ports.
+
+Scaling Limitations
+=============================
+
+* By default, the maximum number of clusters that can be connected together using Cluster Mesh is
+  255. By using the option ``maxConnectedClusters`` this limit can be set to 511, at the expense of
+  lowering the maximum number of cluster-local identities. Reference the following table for valid
+  configurations and their corresponding cluster-local identity limits:
+
++------------------------+------------+----------+----------+
+| MaxConnectedClusters   | Maximum cluster-local identities |
++========================+============+==========+==========+
+| 255 (default)          | 65535                            |
++------------------------+------------+----------+----------+
+| 511                    | 32767                            |
++------------------------+------------+----------+----------+
+
+* All clusters across a Cluster Mesh must be configured with the same ``maxConnectedClusters``
+  value.
+
+ * ConfigMap option ``max-connected-clusters=511``
+ * Helm option ``--set clustermesh.maxConnectedClusters=511``
+ * ``cilium install`` option ``--set clustermesh.maxConnectedClusters=511``
+
+.. note::
+
+   This option controls the bit allocation of numeric identities and will affect the maximum number
+   of cluster-local identities that can be allocated. By default, cluster-local
+   :ref:`security_identities` are limited to 65535, regardless of whether Cluster Mesh is used or
+   not.
+
+.. warning::
+  ``MaxConnectedClusters`` can only be set once during Cilium installation and should not be
+  changed for existing clusters. Changing this option on a live cluster may result in connection
+  disruption and possible incorrect enforcement of network policies
 
 Install the Cilium CLI
 ======================
@@ -89,8 +126,13 @@ Specify the Cluster Name and ID
 Cilium needs to be installed onto each cluster.
 
 Each cluster must be assigned a unique human-readable name as well as a numeric
-cluster ID (1-255). It is best to assign both these attributes at installation
-time of Cilium:
+cluster ID (1-255). The cluster name must respect the following constraints:
+
+* It must contain at most 32 characters;
+* It must begin and end with a lower case alphanumeric character;
+* It may contain lower case alphanumeric characters and dashes between.
+
+It is best to assign both the cluster name and the cluster ID at installation time:
 
  * ConfigMap options ``cluster-name`` and ``cluster-id``
  * Helm options ``cluster.name`` and ``cluster.id``
@@ -146,13 +188,13 @@ clusters.
 
 .. note::
 
-   You can additionally opt in to :ref:`kvstoremesh` when enabling
-   Cluster Mesh. Make sure to configure the Cilium CLI in *helm* mode and run:
+   Starting from v1.16 KVStoreMesh is enabled by default.
+   You can opt out of :ref:`kvstoremesh` when enabling the Cluster Mesh.
 
    .. code-block:: shell-session
 
-     cilium clustermesh enable --context $CLUSTER1 --enable-kvstoremesh
-     cilium clustermesh enable --context $CLUSTER2 --enable-kvstoremesh
+     cilium clustermesh enable --context $CLUSTER1 --enable-kvstoremesh=false
+     cilium clustermesh enable --context $CLUSTER2 --enable-kvstoremesh=false
 
 .. important::
 
@@ -254,15 +296,14 @@ Troubleshooting
 
 Use the following list of steps to troubleshoot issues with ClusterMesh:
 
- #. Validate that the ``cilium-xxx`` as well as the ``cilium-operator-xxx`` pods
-    are healthy and ready. 
+ #. Validate that Cilium pods are healthy and ready:
 
     .. code-block:: shell-session
 
        cilium status --context $CLUSTER1
        cilium status --context $CLUSTER2
 
- #. Validate the Cluster Mesh is enabled correctly and operational:
+ #. Validate that Cluster Mesh is enabled and operational:
 
     .. code-block:: shell-session
 
@@ -271,10 +312,3 @@ Use the following list of steps to troubleshoot issues with ClusterMesh:
 
 If you cannot resolve the issue with the above commands, see the
 :ref:`troubleshooting_clustermesh` for a more detailed troubleshooting guide.
-
-Limitations
-###########
-
- * The number of clusters that can be connected together is currently limited
-   to 255. This limitation will be lifted in the future when running in direct
-   routing mode or when running in encapsulation mode with encryption enabled.

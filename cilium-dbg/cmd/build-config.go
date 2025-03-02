@@ -8,14 +8,15 @@ import (
 	"os"
 	"strings"
 
+	"github.com/cilium/hive/cell"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
 	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
 	k8sConsts "github.com/cilium/cilium/pkg/k8s/constants"
+	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/option/resolver"
 )
 
@@ -36,9 +37,11 @@ var buildConfigHive = hive.New(
 var buildConfigCmd = &cobra.Command{
 	Use:   "build-config --node-name $K8S_NODE_NAME",
 	Short: "Resolve all of the configuration sources that apply to this node",
-	RunE: func(cmd *cobra.Command, args []string) error {
-		fmt.Println("Running")
-		return buildConfigHive.Run()
+	Run: func(cmd *cobra.Command, args []string) {
+		log.Info("Running")
+		if err := buildConfigHive.Run(logging.DefaultSlogLogger); err != nil {
+			Fatalf("Build config failed: %v\n", err)
+		}
 	},
 }
 
@@ -76,6 +79,8 @@ var defaultBuildConfigCfg = buildConfigCfg{
 		resolver.KindConfigMap + ":cilium-config",
 		resolver.KindNodeConfig + ":" + os.Getenv("CILIUM_K8S_NAMESPACE"),
 	},
+	AllowConfigKeys: []string{},
+	DenyConfigKeys:  []string{},
 }
 
 type buildConfig struct {
@@ -85,7 +90,7 @@ type buildConfig struct {
 	shutdowner hive.Shutdowner
 }
 
-func newBuildConfig(lc hive.Lifecycle, cfg buildConfigCfg, log logrus.FieldLogger, client k8sClient.Clientset, shutdowner hive.Shutdowner) (*buildConfig, error) {
+func newBuildConfig(lc cell.Lifecycle, cfg buildConfigCfg, log logrus.FieldLogger, client k8sClient.Clientset, shutdowner hive.Shutdowner) (*buildConfig, error) {
 	if cfg.Dest == "" {
 		return nil, fmt.Errorf("--dest is required")
 	}
@@ -97,12 +102,12 @@ func newBuildConfig(lc hive.Lifecycle, cfg buildConfigCfg, log logrus.FieldLogge
 		shutdowner: shutdowner,
 	}
 
-	lc.Append(hive.Hook{OnStart: obj.onStart})
+	lc.Append(cell.Hook{OnStart: obj.onStart})
 
 	return obj, nil
 }
 
-func (bc *buildConfig) onStart(ctx hive.HookContext) error {
+func (bc *buildConfig) onStart(ctx cell.HookContext) error {
 	sources := []resolver.ConfigSource{}
 	for _, sourceSpec := range bc.cfg.Source {
 		if sourceSpec == "" {

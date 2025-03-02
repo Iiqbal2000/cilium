@@ -6,10 +6,12 @@ package tables
 import (
 	"net/netip"
 	"slices"
+	"strings"
+
+	"github.com/cilium/statedb"
+	"github.com/cilium/statedb/index"
 
 	"github.com/cilium/cilium/pkg/k8s/resource"
-	"github.com/cilium/cilium/pkg/statedb"
-	"github.com/cilium/cilium/pkg/statedb/index"
 )
 
 type L2AnnounceKey struct {
@@ -18,7 +20,7 @@ type L2AnnounceKey struct {
 	NetworkInterface string
 }
 
-func (k L2AnnounceKey) Key() []byte {
+func (k L2AnnounceKey) Key() index.Key {
 	key := append(index.NetIPAddr(k.IP), '+')
 	key = append(key, index.String(k.NetworkInterface)...)
 	return key
@@ -45,8 +47,14 @@ var (
 		FromObject: func(b *L2AnnounceEntry) index.KeySet {
 			return index.NewKeySet(b.Key())
 		},
-		FromKey: func(id L2AnnounceKey) []byte {
-			return id.Key()
+		FromKey: L2AnnounceKey.Key,
+		FromString: func(key string) (index.Key, error) {
+			addrS, iface, _ := strings.Cut(key, "+")
+			addr, err := netip.ParseAddr(addrS)
+			if err != nil {
+				return index.Key{}, err
+			}
+			return L2AnnounceKey{IP: addr, NetworkInterface: iface}.Key(), nil
 		},
 		Unique: true,
 	}
@@ -56,14 +64,13 @@ var (
 		FromObject: func(b *L2AnnounceEntry) index.KeySet {
 			return index.StringerSlice(b.Origins)
 		},
-		FromKey: func(id resource.Key) []byte {
-			return index.Stringer(id)
-		},
+		FromKey:    index.Stringer[resource.Key],
+		FromString: index.FromString,
 	}
 )
 
 func NewL2AnnounceTable() (statedb.RWTable[*L2AnnounceEntry], error) {
-	return statedb.NewTable[*L2AnnounceEntry](
+	return statedb.NewTable(
 		"l2-announce",
 		L2AnnounceIDIndex,
 		L2AnnounceOriginIndex,

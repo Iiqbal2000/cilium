@@ -4,7 +4,10 @@
 package k8s
 
 import (
-	"github.com/cilium/cilium/pkg/hive/cell"
+	"github.com/cilium/hive/cell"
+	mcsapiv1alpha1 "sigs.k8s.io/mcs-api/pkg/apis/v1alpha1"
+
+	"github.com/cilium/cilium/pkg/clustermesh/mcsapi"
 	"github.com/cilium/cilium/pkg/k8s"
 	cilium_api_v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/k8s/resource"
@@ -25,15 +28,15 @@ var (
 		cell.Config(k8s.DefaultConfig),
 		cell.Provide(
 			k8s.ServiceResource,
+			mcsapi.ServiceExportResource,
 			k8s.EndpointsResource,
-			k8s.CiliumNodeResource,
+			CiliumNodeResource,
 			k8s.CiliumIdentityResource,
 			// The CiliumSlimEndpoint resource constructor in the agent depends on the
 			// LocalNodeStore to index its cache. In the clustermesh-apiserver, there is no
 			// cell providing LocalNodeStore, so we provide the resource with a separate
 			// constructor.
 			CiliumSlimEndpointResource,
-			k8s.CiliumExternalWorkloads,
 		),
 	)
 )
@@ -43,6 +46,7 @@ type Resources struct {
 	cell.In
 
 	Services            resource.Resource[*slim_corev1.Service]
+	ServiceExports      resource.Resource[*mcsapiv1alpha1.ServiceExport]
 	Endpoints           resource.Resource[*k8s.Endpoints]
 	CiliumNodes         resource.Resource[*cilium_api_v2.CiliumNode]
 	CiliumIdentities    resource.Resource[*cilium_api_v2.CiliumIdentity]

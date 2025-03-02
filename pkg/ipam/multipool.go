@@ -6,21 +6,21 @@ package ipam
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"slices"
 	"sort"
 	"strconv"
 
-	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	agentK8s "github.com/cilium/cilium/daemon/k8s"
 	"github.com/cilium/cilium/pkg/controller"
-	"github.com/cilium/cilium/pkg/inctimer"
 	"github.com/cilium/cilium/pkg/ipam/types"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	"github.com/cilium/cilium/pkg/lock"
+	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/time"
@@ -69,15 +69,17 @@ func parseMultiPoolPreAllocMap(conf map[string]string) (preAllocatePerPool, erro
 // or if pending allocation expires (i.e. the owner has not performed any retry
 // attempt within pendingAllocationTTL)
 type pendingAllocationsPerPool struct {
-	pools map[Pool]pendingAllocationsPerOwner
-	clock func() time.Time // support custom clock for testing
+	logger *slog.Logger
+	pools  map[Pool]pendingAllocationsPerOwner
+	clock  func() time.Time // support custom clock for testing
 }
 
 // newPendingAllocationsPerPool returns a new pendingAllocationsPerPool with the
 // default monotonic expiration clock
-func newPendingAllocationsPerPool() *pendingAllocationsPerPool {
+func newPendingAllocationsPerPool(logger *slog.Logger) *pendingAllocationsPerPool {
 	return &pendingAllocationsPerPool{
-		pools: map[Pool]pendingAllocationsPerOwner{},
+		logger: logger,
+		pools:  map[Pool]pendingAllocationsPerOwner{},
 		clock: func() time.Time {
 			return time.Now()
 		},
@@ -92,11 +94,12 @@ func (p pendingAllocationsPerPool) upsertPendingAllocation(poolName Pool, owner 
 		pool = pendingAllocationsPerOwner{}
 	}
 
-	log.WithFields(logrus.Fields{
-		"owner":  owner,
-		"family": family,
-		"pool":   poolName,
-	}).Debug("IP allocation failed, upserting pending allocation")
+	p.logger.Debug(
+		"IP allocation failed, upserting pending allocation",
+		logfields.Owner, owner,
+		logfields.Family, family,
+		logfields.PoolName, poolName,
+	)
 
 	now := p.clock()
 	pool.startExpirationAt(now, owner, family)
@@ -126,7 +129,7 @@ func (p pendingAllocationsPerPool) markAsAllocated(poolName Pool, owner string, 
 func (p pendingAllocationsPerPool) removeExpiredEntries() {
 	now := p.clock()
 	for poolName, pool := range p.pools {
-		pool.removeExpiredEntries(now, poolName)
+		pool.removeExpiredEntries(p.logger, now, poolName)
 		if len(pool) == 0 {
 			delete(p.pools, poolName)
 		}
@@ -166,16 +169,17 @@ func (p pendingAllocationsPerOwner) removeExpiration(owner string, family Family
 }
 
 // removeExpiredEntries removes all pending allocation requests which have expired
-func (p pendingAllocationsPerOwner) removeExpiredEntries(now time.Time, pool Pool) {
+func (p pendingAllocationsPerOwner) removeExpiredEntries(logger *slog.Logger, now time.Time, pool Pool) {
 	for family, owners := range p {
 		for owner, expires := range owners {
 			if now.After(expires) {
 				p.removeExpiration(owner, family)
-				log.WithFields(logrus.Fields{
-					"owner":  owner,
-					"family": family,
-					"pool":   pool,
-				}).Debug("Pending IP allocation has expired without being fulfilled")
+				logger.Debug(
+					"Pending IP allocation has expired without being fulfilled",
+					logfields.Owner, owner,
+					logfields.Family, family,
+					logfields.PoolName, pool,
+				)
 			}
 		}
 	}
@@ -193,7 +197,7 @@ type nodeUpdater interface {
 
 type multiPoolManager struct {
 	mutex *lock.Mutex
-	conf  Configuration
+	conf  *option.DaemonConfig
 	owner Owner
 
 	preallocatedIPsPerPool preAllocatePerPool
@@ -209,14 +213,15 @@ type multiPoolManager struct {
 	nodeUpdater nodeUpdater
 
 	finishedRestore map[Family]bool
+	logger          *slog.Logger
 }
 
 var _ Allocator = (*multiPoolAllocator)(nil)
 
-func newMultiPoolManager(conf Configuration, node agentK8s.LocalCiliumNodeResource, owner Owner, clientset nodeUpdater) *multiPoolManager {
-	preallocMap, err := parseMultiPoolPreAllocMap(option.Config.IPAMMultiPoolPreAllocation)
+func newMultiPoolManager(logger *slog.Logger, conf *option.DaemonConfig, node agentK8s.LocalCiliumNodeResource, owner Owner, clientset nodeUpdater) *multiPoolManager {
+	preallocMap, err := parseMultiPoolPreAllocMap(conf.IPAMMultiPoolPreAllocation)
 	if err != nil {
-		log.WithError(err).Fatalf("Invalid %s flag value", option.IPAMMultiPoolPreAllocation)
+		logging.Fatal(logger, fmt.Sprintf("Invalid %s flag value", option.IPAMMultiPoolPreAllocation), logfields.Error, err)
 	}
 
 	k8sController := controller.NewManager()
@@ -228,15 +233,16 @@ func newMultiPoolManager(conf Configuration, node agentK8s.LocalCiliumNodeResour
 		Name: multiPoolTriggerName,
 	})
 	if err != nil {
-		log.WithError(err).Fatal("Unable to initialize CiliumNode synchronization trigger")
+		logging.Fatal(logger, "Unable to initialize CiliumNode synchronization trigger", logfields.Error, err)
 	}
 
 	c := &multiPoolManager{
+		logger:                 logger,
 		mutex:                  &lock.Mutex{},
 		owner:                  owner,
 		conf:                   conf,
 		preallocatedIPsPerPool: preallocMap,
-		pendingIPsPerPool:      newPendingAllocationsPerPool(),
+		pendingIPsPerPool:      newPendingAllocationsPerPool(logger),
 		pools:                  map[Pool]*poolPair{},
 		poolsUpdated:           make(chan struct{}, 1),
 		node:                   nil,
@@ -268,7 +274,10 @@ func (m *multiPoolManager) ciliumNodeEventLoop(evs <-chan resource.Event[*cilium
 		case resource.Upsert:
 			m.ciliumNodeUpdated(ev.Object)
 		case resource.Delete:
-			log.WithField(logfields.Node, ev.Object).Warning("Local CiliumNode deleted. IPAM will continue on last seen version")
+			m.logger.Debug(
+				"Local CiliumNode deleted. IPAM will continue on last seen version",
+				logfields.Node, ev.Object,
+			)
 		}
 		ev.Done(nil)
 	}
@@ -300,8 +309,6 @@ func (m *multiPoolManager) waitForAllPools() {
 // before any IPs are handed out, so hasAvailableIPs returns true so as long as
 // the local node has IPs assigned to it in the given pool.
 func (m *multiPoolManager) waitForPool(ctx context.Context, family Family, poolName Pool) (ready bool) {
-	timer, stop := inctimer.New()
-	defer stop()
 	for {
 		m.mutex.Lock()
 		switch family {
@@ -323,11 +330,13 @@ func (m *multiPoolManager) waitForPool(ctx context.Context, family Family, poolN
 			return false
 		case <-m.poolsUpdated:
 			continue
-		case <-timer.After(5 * time.Second):
-			log.WithFields(logrus.Fields{
-				logfields.HelpMessage: "Check if cilium-operator pod is running and does not have any warnings or error messages.",
-				logfields.Family:      family,
-			}).Infof("Waiting for %s pod CIDR pool %q to become available", family, poolName)
+		case <-time.After(5 * time.Second):
+			m.logger.Info(
+				"Waiting for podCIDR pool to become available",
+				logfields.PoolName, poolName,
+				logfields.Family, family,
+				logfields.HelpMessage, "Check if cilium-operator pod is running and does not have any warnings or error messages.",
+			)
 		}
 	}
 }
@@ -530,10 +539,10 @@ func (m *multiPoolManager) upsertPoolLocked(poolName Pool, podCIDRs []types.IPAM
 	if !ok {
 		pool = &poolPair{}
 		if m.conf.IPv4Enabled() {
-			pool.v4 = newPodCIDRPool()
+			pool.v4 = newPodCIDRPool(m.logger)
 		}
 		if m.conf.IPv6Enabled() {
-			pool.v6 = newPodCIDRPool()
+			pool.v6 = newPodCIDRPool(m.logger)
 		}
 	}
 

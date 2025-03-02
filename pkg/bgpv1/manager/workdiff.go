@@ -6,6 +6,7 @@ package manager
 import (
 	"fmt"
 
+	"github.com/cilium/cilium/pkg/bgpv1/manager/instance"
 	v2api "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	v2alpha1api "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 )
@@ -50,11 +51,9 @@ func newReconcileDiff(ciliumNode *v2api.CiliumNode) *reconcileDiff {
 // withdraw, or reconcile in the reconcileDiff's respective fields.
 func (wd *reconcileDiff) diff(m LocalASNMap, policy *v2alpha1api.CiliumBGPPeeringPolicy) error {
 	if err := wd.registerOrReconcileDiff(m, policy); err != nil {
-		return fmt.Errorf("encountered error creating register or reconcile diff: %v", err)
+		return fmt.Errorf("encountered error creating register or reconcile diff: %w", err)
 	}
-	if err := wd.withdrawDiff(m); err != nil {
-		return fmt.Errorf("encountered error creating withdraw diff: %v", err)
-	}
+	wd.withdrawDiff(m)
 	return nil
 }
 
@@ -104,11 +103,125 @@ func (wd *reconcileDiff) registerOrReconcileDiff(m LocalASNMap, policy *v2alpha1
 
 // withdrawDiff will populate the `withdraw` field of a reconcileDiff, indicating which
 // existing BgpServers must disconnected and removed from the Manager.
-func (wd *reconcileDiff) withdrawDiff(m LocalASNMap) error {
+func (wd *reconcileDiff) withdrawDiff(m LocalASNMap) {
 	for k := range m {
 		if _, ok := wd.seen[k]; !ok {
 			wd.withdraw = append(wd.withdraw, k)
 		}
 	}
+}
+
+type reconcileDiffV2 struct {
+	seen map[string]*v2alpha1api.CiliumBGPNodeInstance
+
+	ciliumNode *v2api.CiliumNode
+
+	register  []string
+	withdraw  []string
+	reconcile []string
+}
+
+// newReconcileDiffV2 constructs a new *reconcileDiffV2 with all internal structures
+// initialized.
+func newReconcileDiffV2(ciliumNode *v2api.CiliumNode) *reconcileDiffV2 {
+	return &reconcileDiffV2{
+		seen:       make(map[string]*v2alpha1api.CiliumBGPNodeInstance),
+		ciliumNode: ciliumNode,
+		register:   []string{},
+		withdraw:   []string{},
+		reconcile:  []string{},
+	}
+}
+
+func (wd *reconcileDiffV2) diff(existingInstances map[string]*instance.BGPInstance, desiredConfig *v2alpha1api.CiliumBGPNodeConfig) error {
+	if err := wd.registerOrReconcileDiff(existingInstances, desiredConfig); err != nil {
+		return fmt.Errorf("encountered error creating register or reconcile diff: %w", err)
+	}
+	wd.withdrawDiff(existingInstances)
 	return nil
+}
+
+// String provides a string representation of the reconcileDiff.
+func (wd *reconcileDiffV2) String() string {
+	return fmt.Sprintf("Registering: %v Withdrawing: %v Reconciling: %v",
+		wd.register,
+		wd.withdraw,
+		wd.reconcile,
+	)
+}
+
+// empty informs the caller whether the reconcileDiff contains any work to undertake.
+func (wd *reconcileDiffV2) empty() bool {
+	switch {
+	case len(wd.register) > 0:
+		fallthrough
+	case len(wd.withdraw) > 0:
+		fallthrough
+	case len(wd.reconcile) > 0:
+		return false
+	}
+	return true
+}
+
+// registerOrReconcileDiff will populate the `seen` field of the reconcileDiff with `policy`,
+// compute BgpServers which must be registered and mark existing BgpServers for
+// reconciliation of their configuration.
+//
+// since registerOrReconcileDiff populates the `seen` field of a diff, this method should always
+// be called first when computing a reconcileDiff.
+func (wd *reconcileDiffV2) registerOrReconcileDiff(existingInstances map[string]*instance.BGPInstance, desiredConfig *v2alpha1api.CiliumBGPNodeConfig) error {
+	for i, config := range desiredConfig.Spec.BGPInstances {
+		if _, ok := wd.seen[config.Name]; !ok {
+			wd.seen[config.Name] = &desiredConfig.Spec.BGPInstances[i]
+		} else {
+			return fmt.Errorf("encountered duplicate BGP instance with name %s", config.Name)
+		}
+		if existing, ok := existingInstances[config.Name]; !ok {
+			// new instance
+			wd.register = append(wd.register, config.Name)
+		} else {
+			// existing instance
+			recreate, err := wd.requiresRecreate(existing, &desiredConfig.Spec.BGPInstances[i])
+			if err != nil {
+				return err
+			}
+			if recreate {
+				wd.withdraw = append(wd.withdraw, config.Name)
+				wd.register = append(wd.register, config.Name) // register does an initial reconciliation as well
+			} else {
+				wd.reconcile = append(wd.reconcile, config.Name)
+			}
+		}
+	}
+	return nil
+}
+
+// requiresRecreate returns true if the desired config change requires full recreate of the BGP instance.
+func (wd *reconcileDiffV2) requiresRecreate(existing *instance.BGPInstance, desiredConfig *v2alpha1api.CiliumBGPNodeInstance) (bool, error) {
+	localASN, err := getLocalASN(desiredConfig)
+	if err != nil {
+		return false, fmt.Errorf("failed to get local ASN for instance %v: %w", desiredConfig.Name, err)
+	}
+
+	localPort, err := getLocalPort(desiredConfig, wd.ciliumNode, localASN)
+	if err != nil {
+		return false, fmt.Errorf("failed to get local port for instance %v: %w", desiredConfig.Name, err)
+	}
+
+	routerID, err := getRouterID(desiredConfig, wd.ciliumNode, localASN)
+	if err != nil {
+		return false, fmt.Errorf("failed to get router ID for instance %v: %w", desiredConfig.Name, err)
+	}
+
+	return localASN != int64(existing.Global.ASN) || localPort != existing.Global.ListenPort || routerID != existing.Global.RouterID, nil
+}
+
+// withdrawDiff will populate the `withdraw` field of a reconcileDiff, indicating which
+// existing BgpInstances must be disconnected and removed from the Manager.
+func (wd *reconcileDiffV2) withdrawDiff(existingInstances map[string]*instance.BGPInstance) {
+	for k := range existingInstances {
+		if _, ok := wd.seen[k]; !ok {
+			wd.withdraw = append(wd.withdraw, k)
+		}
+	}
 }

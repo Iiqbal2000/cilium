@@ -25,6 +25,8 @@ import (
 	"github.com/cilium/cilium/pkg/option"
 )
 
+const pseudoHeaderLength = 40
+
 // This is the required size of the OOB buffer to pass to ReadMsgUDP.
 var udpOOBSize = func() int {
 	var hdr unix.Cmsghdr
@@ -71,7 +73,7 @@ type sessionUDP struct {
 	oob   []byte
 }
 
-// Set the socket options needed for tranparent proxying for the listening socket
+// Set the socket options needed for transparent proxying for the listening socket
 // IP(V6)_TRANSPARENT allows socket to receive packets with any destination address/port
 // IP(V6)_RECVORIGDSTADDR tells the kernel to pass the original destination address/port on recvmsg
 // By design, a socket of a DNS Server can only receive IPv4 or IPv6 traffic.
@@ -88,7 +90,7 @@ func transparentSetsockopt(fd int, ipFamily ipfamily.IPFamily) error {
 
 // listenConfig sets the socket options for the fqdn proxy transparent socket.
 // Note that it is also used for TCP sockets.
-func listenConfig(mark int, ipFamily ipfamily.IPFamily) *net.ListenConfig {
+func listenConfig(mark uint32, ipFamily ipfamily.IPFamily) *net.ListenConfig {
 	return &net.ListenConfig{
 		Control: func(_, _ string, c syscall.RawConn) error {
 			var opErr error
@@ -98,7 +100,7 @@ func listenConfig(mark int, ipFamily ipfamily.IPFamily) *net.ListenConfig {
 					return
 				}
 				if mark != 0 {
-					if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_MARK, mark); err != nil {
+					if err := unix.SetsockoptUint64(int(fd), unix.SOL_SOCKET, unix.SO_MARK, uint64(mark)); err != nil {
 						opErr = fmt.Errorf("setsockopt(SO_MARK) failed: %w", err)
 						return
 					}
@@ -191,7 +193,7 @@ func (s *sessionUDP) RemoteAddr() net.Addr { return s.raddr }
 // LocalAddr returns the local network address for the current request.
 func (s *sessionUDP) LocalAddr() net.Addr { return s.laddr }
 
-// WriteResponse writes a response to a request received earlier
+// WriteResponse writes a response to a request received earlier.
 // It uses the raw udp connections (IPv4 or IPv6) from its sessionUDPFactory.
 func (s *sessionUDP) WriteResponse(b []byte) (int, error) {
 	// Must give the UDP header to get the source port right.
@@ -205,6 +207,12 @@ func (s *sessionUDP) WriteResponse(b []byte) (int, error) {
 	binary.Write(bb, binary.BigEndian, uint16(0)) // checksum
 	bb.Write(b)
 	buf := bb.Bytes()
+
+	// A UDP checksum is required for IPv6
+	if s.raddr.IP.To4() == nil {
+		// Compute the UDP the checksum
+		binary.BigEndian.PutUint16(buf[6:8], computeIPv6Checksum(s.laddr.IP, s.raddr.IP, buf))
+	}
 
 	var n int
 	var err error
@@ -225,52 +233,36 @@ func (s *sessionUDP) WriteResponse(b []byte) (int, error) {
 func parseDstFromOOB(oob []byte) (*net.UDPAddr, error) {
 	msgs, err := unix.ParseSocketControlMessage(oob)
 	if err != nil {
-		return nil, fmt.Errorf("parsing socket control message: %s", err)
+		return nil, fmt.Errorf("parsing socket control message: %w", err)
 	}
 
 	for _, msg := range msgs {
-		if msg.Header.Level == unix.SOL_IP && msg.Header.Type == unix.IP_ORIGDSTADDR {
-			pp := &unix.RawSockaddrInet4{}
-			// Address family is in native byte order
-			family := *(*uint16)(unsafe.Pointer(&msg.Data[unsafe.Offsetof(pp.Family)]))
-			if family != unix.AF_INET {
-				return nil, fmt.Errorf("original destination is not IPv4")
-			}
-			// Port is in big-endian byte order
-			if err = binary.Read(bytes.NewReader(msg.Data), binary.BigEndian, pp); err != nil {
-				return nil, fmt.Errorf("reading original destination address: %s", err)
-			}
-			laddr := &net.UDPAddr{
-				IP:   net.IPv4(pp.Addr[0], pp.Addr[1], pp.Addr[2], pp.Addr[3]),
-				Port: int(pp.Port),
-			}
-			return laddr, nil
+		sockaddr, err := unix.ParseOrigDstAddr(&msg)
+		if err != nil {
+			// The above will _only_ fail if the message was not a OrigDstAddr,
+			// hence we just skip here and error later if we don't find any.
+			continue
 		}
-		if msg.Header.Level == unix.SOL_IPV6 && msg.Header.Type == unix.IPV6_ORIGDSTADDR {
-			pp := &unix.RawSockaddrInet6{}
-			// Address family is in native byte order
-			family := *(*uint16)(unsafe.Pointer(&msg.Data[unsafe.Offsetof(pp.Family)]))
-			if family != unix.AF_INET6 {
-				return nil, fmt.Errorf("original destination is not IPv6")
-			}
-			// Scope ID is in native byte order
-			scopeId := *(*uint32)(unsafe.Pointer(&msg.Data[unsafe.Offsetof(pp.Scope_id)]))
-			// Rest of the data is big-endian (port)
-			if err = binary.Read(bytes.NewReader(msg.Data), binary.BigEndian, pp); err != nil {
-				return nil, fmt.Errorf("reading original destination address: %s", err)
-			}
-			laddr := &net.UDPAddr{
-				IP:   net.IP(pp.Addr[:]),
-				Port: int(pp.Port),
-				Zone: strconv.Itoa(int(scopeId)),
-			}
-			return laddr, nil
+		switch sa := sockaddr.(type) {
+		case *unix.SockaddrInet4:
+			return &net.UDPAddr{
+				IP:   net.IP(sa.Addr[:]),
+				Port: sa.Port,
+			}, nil
+		case *unix.SockaddrInet6:
+			return &net.UDPAddr{
+				IP:   net.IP(sa.Addr[:]),
+				Port: sa.Port,
+				Zone: strconv.Itoa(int(sa.ZoneId)),
+			}, nil
+		default:
+			return nil, fmt.Errorf("original destination is neither IPv4 nor IPv6")
 		}
 	}
 	return nil, fmt.Errorf("no original destination found")
 }
 
-// correctSource returns the oob data with the given source address
+// controlMessage returns the oob data with the given source address
 func (s *sessionUDP) controlMessage(src *net.UDPAddr) []byte {
 	// If the src is definitely an IPv6, then use ipv6's ControlMessage to
 	// respond otherwise use ipv4's because ipv6's marshal ignores ipv4
@@ -283,4 +275,58 @@ func (s *sessionUDP) controlMessage(src *net.UDPAddr) []byte {
 	cm := new(ipv4.ControlMessage)
 	cm.Src = src.IP
 	return cm.Marshal()
+}
+
+// computeIPv6Checksum computes and returns a checksum from the given src/dest IPs
+// and UDP header with a payload.
+func computeIPv6Checksum(srcIP, dstIP net.IP, udpHeaderWithPayload []byte) uint16 {
+	pseudoHeader := genIPv6PseudoHeader(srcIP, dstIP, len(udpHeaderWithPayload))
+	packet := append(pseudoHeader, udpHeaderWithPayload...)
+	checksum := computeChecksum(packet)
+	return checksum
+}
+
+// genIPv6PseudoHeader generates and returns an IPv6 pseudo-header used for calculating
+// the checksum of a UDP packet.
+func genIPv6PseudoHeader(srcIP, dstIP net.IP, headerAndPayloadSize int) []byte {
+	header := make([]byte, pseudoHeaderLength)
+	// Source address
+	copy(header[0:], srcIP)
+	// Destination address
+	copy(header[16:], dstIP)
+	// Payload length (16-bit field)
+	binary.BigEndian.PutUint16(header[32:34], uint16(headerAndPayloadSize))
+	if headerAndPayloadSize != 0 {
+		// Next header (UDP)
+		header[39] = 0x11
+	}
+	return header
+}
+
+// computeChecksum computes and returns a checksum for the given packet represented as
+// a byte slice.
+func computeChecksum(packet []byte) uint16 {
+	sum := uint32(0)
+
+	for ; len(packet) >= 2; packet = packet[2:] {
+		sum += uint32(packet[0])<<8 | uint32(packet[1])
+	}
+	if len(packet) > 0 {
+		sum += uint32(packet[0]) << 8
+	}
+	for sum > 0xffff {
+		sum = (sum >> 16) + (sum & 0xffff)
+	}
+	csum := ^uint16(sum)
+	/*
+	 * From RFC 768:
+	 * If the computed checksum is zero, it is transmitted as all ones (the
+	 * equivalent in one's complement arithmetic). An all zero transmitted
+	 * checksum value means that the transmitter generated no checksum (for
+	 * debugging or for higher level protocols that don't care).
+	 */
+	if csum == 0 {
+		csum = 0xffff
+	}
+	return csum
 }

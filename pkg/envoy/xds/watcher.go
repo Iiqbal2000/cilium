@@ -5,7 +5,7 @@ package xds
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"sync"
 
 	"github.com/sirupsen/logrus"
@@ -63,8 +63,8 @@ func (w *ResourceWatcher) HandleNewResourceVersion(typeURL string, version uint6
 		log.WithFields(logrus.Fields{
 			logfields.XDSCachedVersion: version,
 			logfields.XDSTypeURL:       typeURL,
-		}).Panicf(fmt.Sprintf("decreasing version number found for resources of type %s: %d < %d",
-			typeURL, version, w.version))
+		}).Panicf("decreasing version number found for resources of type %s: %d < %d",
+			typeURL, version, w.version)
 	}
 	w.version = version
 
@@ -156,10 +156,9 @@ func (w *ResourceWatcher) WatchResources(ctx context.Context, typeURL string, la
 
 	err := ctx.Err()
 	if err != nil {
-		switch err {
-		case context.Canceled:
+		if errors.Is(err, context.Canceled) {
 			watchLog.Debug("context canceled, terminating resource watch")
-		default:
+		} else {
 			watchLog.WithError(err).Error("context error, terminating resource watch")
 		}
 	}

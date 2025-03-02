@@ -31,7 +31,6 @@ const (
 	keyPprofPort               = "pprof-port"
 	keyGops                    = "gops"
 	keyGopsPort                = "gops-port"
-	keyDialTimeout             = "dial-timeout"
 	keyRetryTimeout            = "retry-timeout"
 	keyListenAddress           = "listen-address"
 	keyHealthListenAddress     = "health-listen-address"
@@ -84,10 +83,6 @@ func New(vp *viper.Viper) *cobra.Command {
 		keyGopsPort,
 		defaults.GopsPort,
 		"Port for gops server to listen on")
-	flags.Duration(
-		keyDialTimeout,
-		defaults.DialTimeout,
-		"Dial timeout when connecting to hubble peers")
 	flags.Duration(
 		keyRetryTimeout,
 		defaults.RetryTimeout,
@@ -193,7 +188,6 @@ func runServe(vp *viper.Viper) error {
 
 	opts := []server.Option{
 		server.WithLocalClusterName(vp.GetString(keyClusterName)),
-		server.WithDialTimeout(vp.GetDuration(keyDialTimeout)),
 		server.WithPeerTarget(vp.GetString(keyPeerService)),
 		server.WithListenAddress(vp.GetString(keyListenAddress)),
 		server.WithHealthListenAddress(vp.GetString(keyHealthListenAddress)),
@@ -259,12 +253,12 @@ func runServe(vp *viper.Viper) error {
 			Addr:                   addr,
 			ReuseSocketAddrAndPort: true,
 		}); err != nil {
-			return fmt.Errorf("failed to start gops agent: %v", err)
+			return fmt.Errorf("failed to start gops agent: %w", err)
 		}
 	}
 	srv, err := server.New(opts...)
 	if err != nil {
-		return fmt.Errorf("cannot create hubble-relay server: %v", err)
+		return fmt.Errorf("cannot create hubble-relay server: %w", err)
 	}
 	go func() {
 		sigs := make(chan os.Signal, 1)

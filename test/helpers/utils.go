@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -20,31 +21,31 @@ import (
 	. "github.com/onsi/gomega"
 	"golang.org/x/sys/unix"
 
-	"github.com/cilium/cilium/pkg/rand"
 	"github.com/cilium/cilium/pkg/versioncheck"
 	"github.com/cilium/cilium/test/config"
 	ginkgoext "github.com/cilium/cilium/test/ginkgo-ext"
 )
 
-// ensure that our random numbers are seeded differently on each run
-var randGen = rand.NewSafeRand(time.Now().UnixNano())
+var runningCiliumVersion string
 
-// IsRunningOnJenkins detects if the currently running Ginkgo application is
-// most likely running in a Jenkins environment. Returns true if certain
-// environment variables that are present in Jenkins jobs are set, false
-// otherwise.
-func IsRunningOnJenkins() bool {
-	result := true
+// GetRunningCiliumVersion gets the currently running cilium version.
+func GetRunningCiliumVersion() string {
+	return runningCiliumVersion
+}
 
-	env := []string{"JENKINS_HOME", "NODE_NAME"}
-
-	for _, varName := range env {
-		if val := os.Getenv(varName); val == "" {
-			result = false
-			log.Infof("build is not running on Jenkins; environment variable '%v' is not set", varName)
-		}
+// HasNewServiceOutput checks to see if the current running cilium
+// version uses the old style service output (e.g. "0.0.0.0:53") vs
+// the new style (e.g. "0.0.0.0:53/TCP").
+func HasNewServiceOutput(ver string) bool {
+	cst, err := versioncheck.Version(ver)
+	// If the version is not parseable it is probably
+	// someone's custom build  or not set.
+	// Either way, it is probably using the new output
+	// format.
+	if err != nil {
+		return true
 	}
-	return result
+	return versioncheck.MustCompile(">=1.17.0")(cst)
 }
 
 // Sleep sleeps for the specified duration in seconds
@@ -67,7 +68,7 @@ func CountValues(key string, data []string) (int, int) {
 
 // MakeUID returns a randomly generated string.
 func MakeUID() string {
-	return fmt.Sprintf("%08x", randGen.Uint32())
+	return fmt.Sprintf("%08x", rand.Uint32())
 }
 
 // RenderTemplate renders a text/template string into a buffer.
@@ -111,7 +112,7 @@ func (c *TimeoutConfig) Validate() error {
 func WithTimeout(body func() bool, msg string, config *TimeoutConfig) error {
 	err := RepeatUntilTrue(body, config)
 	if err != nil {
-		return fmt.Errorf("%s: %s", msg, err)
+		return fmt.Errorf("%s: %w", msg, err)
 	}
 
 	return nil
@@ -203,6 +204,7 @@ func GetAppPods(apps []string, namespace string, kubectl *Kubectl, appFmt string
 		res, err := kubectl.GetPodNames(namespace, fmt.Sprintf("%s=%s", appFmt, v))
 		Expect(err).Should(BeNil())
 		Expect(res).Should(Not(BeNil()))
+		Expect(len(res)).To(BeNumerically(">", 0))
 		appPods[v] = res[0]
 		log.Infof("GetAppPods: pod=%q assigned to %q", res[0], v)
 	}
@@ -414,8 +416,12 @@ func getK8sSupportedConstraints(ciliumVersion string) (semver.Range, error) {
 		return nil, err
 	}
 	switch {
+	case IsCiliumV1_17(cst):
+		return versioncheck.MustCompile(">=1.16.0 <1.33.0"), nil
+	case IsCiliumV1_16(cst):
+		return versioncheck.MustCompile(">=1.16.0 <1.31.0"), nil
 	case IsCiliumV1_15(cst):
-		return versioncheck.MustCompile(">=1.16.0 <1.29.0"), nil
+		return versioncheck.MustCompile(">=1.16.0 <1.30.0"), nil
 	case IsCiliumV1_14(cst):
 		return versioncheck.MustCompile(">=1.16.0 <1.28.0"), nil
 	case IsCiliumV1_13(cst):
@@ -509,29 +515,8 @@ func DoesNotRunOn54Kernel() bool {
 	return !RunsOn54Kernel()
 }
 
-// RunsOn419Kernel checks whether a test case is running on the 4.19 kernel.
-func RunsOn419Kernel() bool {
-	return os.Getenv("KERNEL") == "419"
-}
-
 func NativeRoutingCIDR() string {
 	return os.Getenv("NATIVE_CIDR")
-}
-
-// DoesNotRunOn419Kernel is the complement function of RunsOn419Kernel.
-func DoesNotRunOn419Kernel() bool {
-	return !RunsOn419Kernel()
-}
-
-// RunsOn419OrLaterKernel checks whether a test case is running on 4.19.x (x > 57) or later kernel
-func RunsOn419OrLaterKernel() bool {
-	return RunsOnNetNextKernel() || RunsOn419Kernel() || RunsOn54Kernel()
-}
-
-// DoesNotRunOn419OrLaterKernel is the complement function of
-// RunsOn419OrLaterKernel.
-func DoesNotRunOn419OrLaterKernel() bool {
-	return !RunsOn419OrLaterKernel()
 }
 
 // RunsOn54OrLaterKernel checks whether a test case is running on 5.4 or later kernel
@@ -623,10 +608,6 @@ func ExistNodeWithoutCilium() bool {
 // DoesNotExistNodeWithoutCilium is the complement function of ExistNodeWithoutCilium.
 func DoesNotExistNodeWithoutCilium() bool {
 	return !ExistNodeWithoutCilium()
-}
-
-func RunsOnJenkins() bool {
-	return os.Getenv("JENKINS_HOME") != ""
 }
 
 // HasSocketLB returns true if the given Cilium pod has TCP and/or

@@ -43,7 +43,7 @@ func ciliumAddService(kubectl *helpers.Kubectl, id int64, frontend string, backe
 	ciliumPods, err := kubectl.GetCiliumPods()
 	ExpectWithOffset(1, err).To(BeNil(), "Cannot get cilium pods")
 	for _, pod := range ciliumPods {
-		err := kubectl.CiliumServiceAdd(pod, id, frontend, backends, svcType, trafficPolicy)
+		err := kubectl.CiliumServiceAdd(pod, id, "", frontend, backends, svcType, trafficPolicy)
 		ExpectWithOffset(1, err).To(BeNil(), "Failed to add cilium service")
 	}
 }
@@ -225,14 +225,13 @@ func testCurlFromOutsideWithLocalPort(kubectl *helpers.Kubectl, ni *helpers.Node
 			ipStr := strings.TrimSpace(strings.Split(res.Stdout(), "=")[1])
 			sourceIP, err := netip.ParseAddr(ipStr)
 			ExpectWithOffset(1, err).Should(BeNil(), "Cannot parse IP %q", ipStr)
+			sourceIP = sourceIP.Unmap()
 			var outIP netip.Addr
 			switch {
 			case sourceIP.Is4():
 				outIP, err = netip.ParseAddr(ni.OutsideIP)
+				outIP = outIP.Unmap()
 				ExpectWithOffset(1, err).Should(BeNil(), "Cannot parse IPv4 address %q", ni.OutsideIP)
-			case sourceIP.Is4In6():
-				outIP, err = netip.ParseAddr(ni.OutsideIP)
-				ExpectWithOffset(1, err).Should(BeNil(), "Cannot parse IPv4-mapped IPv6 address %q", ni.OutsideIP)
 			default:
 				outIP, err = netip.ParseAddr(ni.OutsideIPv6)
 				ExpectWithOffset(1, err).Should(BeNil(), "Cannot parse IPv6 address %q", ni.OutsideIP)
@@ -272,6 +271,12 @@ func doFragmentedRequest(kubectl *helpers.Kubectl, srcPod string, srcPort, dstPo
 	ciliumPodK8s2, err := kubectl.GetCiliumPodOnNode(helpers.K8s2)
 	ExpectWithOffset(2, err).Should(BeNil(), "Cannot get cilium pod on k8s2")
 
+	res := kubectl.CiliumExecMustSucceed(context.TODO(), ciliumPodK8s1, "cilium config  get ConntrackAccounting")
+	res.ExpectContains("Enabled")
+
+	res = kubectl.CiliumExecMustSucceed(context.TODO(), ciliumPodK8s2, "cilium config  get ConntrackAccounting")
+	res.ExpectContains("Enabled")
+
 	_, dstPodIPK8s1 := kubectl.GetPodOnNodeLabeledWithOffset(helpers.K8s1, testDS, 1)
 	_, dstPodIPK8s2 := kubectl.GetPodOnNodeLabeledWithOffset(helpers.K8s2, testDS, 1)
 
@@ -281,13 +286,13 @@ func doFragmentedRequest(kubectl *helpers.Kubectl, srcPod string, srcPort, dstPo
 	// Atoi() throws an error and simply consider we have 0
 	// packets.
 
-	// Field #7 is "RxPackets=<n>"
+	// Field #7 is "Packets=<n>"
 	cmdIn := "cilium-dbg bpf ct list global | awk '/%s/ { sub(\".*=\",\"\", $7); print $7 }'"
 
 	endpointK8s1 := net.JoinHostPort(dstPodIPK8s1, fmt.Sprintf("%d", dstPodPort))
 	patternInK8s1 := fmt.Sprintf("UDP IN [^:]+:%d -> %s", srcPort, endpointK8s1)
 	cmdInK8s1 := fmt.Sprintf(cmdIn, patternInK8s1)
-	res := kubectl.CiliumExecMustSucceed(context.TODO(), ciliumPodK8s1, cmdInK8s1)
+	res = kubectl.CiliumExecMustSucceed(context.TODO(), ciliumPodK8s1, cmdInK8s1)
 	countInK8s1, _ := strconv.Atoi(strings.TrimSpace(res.Stdout()))
 
 	endpointK8s2 := net.JoinHostPort(dstPodIPK8s2, fmt.Sprintf("%d", dstPodPort))
@@ -296,8 +301,8 @@ func doFragmentedRequest(kubectl *helpers.Kubectl, srcPod string, srcPort, dstPo
 	res = kubectl.CiliumExecMustSucceed(context.TODO(), ciliumPodK8s2, cmdInK8s2)
 	countInK8s2, _ := strconv.Atoi(strings.TrimSpace(res.Stdout()))
 
-	// Field #11 is "TxPackets=<n>"
-	cmdOut := "cilium-dbg bpf ct list global | awk '/%s/ { sub(\".*=\",\"\", $11); print $11 }'"
+	// Field #7 is "Packets=<n>"
+	cmdOut := "cilium-dbg bpf ct list global | awk '/%s/ { sub(\".*=\",\"\", $7); print $7 }'"
 
 	if !hasDNAT {
 		// If kube-proxy is enabled, we see packets in ctmap with the

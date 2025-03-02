@@ -8,15 +8,19 @@ import (
 	"net/netip"
 	"sync"
 
+	"github.com/cilium/hive/cell"
+
+	"github.com/cilium/cilium/pkg/container/set"
 	"github.com/cilium/cilium/pkg/endpoint"
 	"github.com/cilium/cilium/pkg/endpoint/regeneration"
-	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
+	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/identity/cache"
 	"github.com/cilium/cilium/pkg/ipcache"
 	"github.com/cilium/cilium/pkg/k8s/client"
-	"github.com/cilium/cilium/pkg/k8s/watchers/subscriber"
+	"github.com/cilium/cilium/pkg/maps/ctmap"
+	"github.com/cilium/cilium/pkg/maps/policymap"
 	"github.com/cilium/cilium/pkg/metrics"
+	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy"
 	"github.com/cilium/cilium/pkg/time"
@@ -80,11 +84,14 @@ type EndpointsLookup interface {
 
 	// IngressEndpointExists returns true if the ingress endpoint exists.
 	IngressEndpointExists() bool
+
+	// GetEndpointNetnsCookieByIP returns the netns cookie for the passed endpoint with ip address if found.
+	GetEndpointNetnsCookieByIP(ip netip.Addr) (uint64, error)
 }
 
 type EndpointsModify interface {
 	// AddEndpoint takes the prepared endpoint object and starts managing it.
-	AddEndpoint(owner regeneration.Owner, ep *endpoint.Endpoint, reason string) (err error)
+	AddEndpoint(owner regeneration.Owner, ep *endpoint.Endpoint) (err error)
 
 	// AddIngressEndpoint creates an Endpoint representing Cilium Ingress on this node without a
 	// corresponding container necessarily existing. This is needed to be able to ingest and
@@ -92,21 +99,23 @@ type EndpointsModify interface {
 	AddIngressEndpoint(
 		ctx context.Context,
 		owner regeneration.Owner,
+		policyMapFactory policymap.Factory,
 		policyGetter policyRepoGetter,
 		ipcache *ipcache.IPCache,
 		proxy endpoint.EndpointProxy,
 		allocator cache.IdentityAllocator,
-		reason string,
+		ctMapGC ctmap.GCRunner,
 	) error
 
 	AddHostEndpoint(
 		ctx context.Context,
 		owner regeneration.Owner,
+		policyMapFactory policymap.Factory,
 		policyGetter policyRepoGetter,
 		ipcache *ipcache.IPCache,
 		proxy endpoint.EndpointProxy,
 		allocator cache.IdentityAllocator,
-		reason, nodeName string,
+		ctMapGC ctmap.GCRunner,
 	) error
 
 	// RestoreEndpoint exposes the specified endpoint to other subsystems via the
@@ -119,15 +128,11 @@ type EndpointsModify interface {
 	// RemoveEndpoint stops the active handling of events by the specified endpoint,
 	// and prevents the endpoint from being globally acccessible via other packages.
 	RemoveEndpoint(ep *endpoint.Endpoint, conf endpoint.DeleteConfig) []error
-
-	// RemoveAll removes all endpoints from the global maps.
-	RemoveAll()
 }
 
 type EndpointManager interface {
 	EndpointsLookup
 	EndpointsModify
-	subscriber.Node
 	EndpointResourceSynchronizer
 
 	// Subscribe to endpoint events.
@@ -148,6 +153,10 @@ type EndpointManager interface {
 	// Returns a waiting group that can be used to know when all the endpoints are
 	// regenerated.
 	RegenerateAllEndpoints(regenMetadata *regeneration.ExternalRegenerationMetadata) *sync.WaitGroup
+
+	// TriggerRegenerateAlEndpoints triggers a batched regeneration of all endpoints.
+	// Returns immediately.
+	TriggerRegenerateAllEndpoints()
 
 	// WaitForEndpointsAtPolicyRev waits for all endpoints which existed at the time
 	// this function is called to be at a given policy revision.
@@ -173,12 +182,20 @@ type EndpointManager interface {
 	// each endpoint that reaches the desired revision calls 'done' independently.
 	// The provided callback should not block and generally be lightweight.
 	CallbackForEndpointsAtPolicyRev(ctx context.Context, rev uint64, done func(time.Time)) error
+
+	// GetEndpointNetnsCookieByIP returns the netns cookie for the passed endpoint with ip address if found.
+	GetEndpointNetnsCookieByIP(ip netip.Addr) (uint64, error)
+
+	// UpdatePolicy triggers policy updates for all live endpoints.
+	// Endpoints with security IDs in provided set will be regenerated. Otherwise, the endpoint's
+	// policy revision will be bumped to toRev.
+	UpdatePolicy(idsToRegen *set.Set[identity.NumericIdentity], fromRev, toRev uint64)
 }
 
 // EndpointResourceSynchronizer is an interface which synchronizes CiliumEndpoint
 // resources with Kubernetes.
 type EndpointResourceSynchronizer interface {
-	RunK8sCiliumEndpointSync(ep *endpoint.Endpoint, conf endpoint.EndpointStatusConfiguration, hr cell.HealthReporter)
+	RunK8sCiliumEndpointSync(ep *endpoint.Endpoint, hr cell.Health)
 	DeleteK8sCiliumEndpointSync(e *endpoint.Endpoint)
 }
 
@@ -191,12 +208,13 @@ var (
 type endpointManagerParams struct {
 	cell.In
 
-	Lifecycle       hive.Lifecycle
+	Lifecycle       cell.Lifecycle
 	Config          EndpointManagerConfig
 	Clientset       client.Clientset
 	MetricsRegistry *metrics.Registry
-	Scope           cell.Scope
+	Health          cell.Health
 	EPSynchronizer  EndpointResourceSynchronizer
+	LocalNodeStore  *node.LocalNodeStore
 }
 
 type endpointManagerOut struct {
@@ -210,15 +228,16 @@ type endpointManagerOut struct {
 func newDefaultEndpointManager(p endpointManagerParams) endpointManagerOut {
 	checker := endpoint.CheckHealth
 
-	mgr := New(p.EPSynchronizer, p.Scope)
+	mgr := New(p.EPSynchronizer, p.LocalNodeStore, p.Health)
 	if p.Config.EndpointGCInterval > 0 {
 		ctx, cancel := context.WithCancel(context.Background())
-		p.Lifecycle.Append(hive.Hook{
-			OnStart: func(hive.HookContext) error {
+		p.Lifecycle.Append(cell.Hook{
+			OnStart: func(cell.HookContext) error {
 				mgr.WithPeriodicEndpointGC(ctx, checker, p.Config.EndpointGCInterval)
+				mgr.WithPeriodicEndpointRegeneration(ctx, p.Config.EndpointRegenInterval)
 				return nil
 			},
-			OnStop: func(hive.HookContext) error {
+			OnStop: func(cell.HookContext) error {
 				cancel()
 				mgr.controllers.RemoveAllAndWait()
 				return nil

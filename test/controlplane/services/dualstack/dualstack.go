@@ -41,6 +41,7 @@ func testDualStack(t *testing.T) {
 				UpdateObjectsFromFile(abs("init.yaml")).
 				SetupEnvironment().
 				StartAgent(modConfig).
+				EnsureWatchers("endpointslices", "services").
 				UpdateObjectsFromFile(abs("state1.yaml")).
 				Eventually(func() error { return validate(abs("lbmap1.golden"), test) }).
 				StopAgent().
@@ -50,11 +51,11 @@ func testDualStack(t *testing.T) {
 }
 
 func validate(file string, test *suite.ControlPlaneTest) error {
-	if err := helpers.ValidateLBMapGoldenFile(file, test.Datapath); err != nil {
+	if err := helpers.ValidateLBMapGoldenFile(file, test.FakeLbMap); err != nil {
 		return err
 	}
 
-	assert := helpers.NewLBMapAssert(test.Datapath.LBMockMap())
+	assert := helpers.NewLBMapAssert(test.FakeLbMap)
 
 	// Verify that default/echo-dualstack service exists
 	// for both NodePort and ClusterIP, and that it has backends
@@ -80,5 +81,4 @@ func validate(file string, test *suite.ControlPlaneTest) error {
 	}
 
 	return nil
-
 }

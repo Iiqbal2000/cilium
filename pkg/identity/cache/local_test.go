@@ -4,36 +4,43 @@
 package cache
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/netip"
 	"testing"
+	"time"
 
-	. "github.com/cilium/checkmate"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
-	"github.com/cilium/cilium/pkg/checker"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/labels"
+	"github.com/cilium/cilium/pkg/testutils"
 )
 
-func (s *IdentityCacheTestSuite) TestBumpNextNumericIdentity(c *C) {
+func TestBumpNextNumericIdentity(t *testing.T) {
+	testutils.IntegrationTest(t)
+
 	minID, maxID := identity.NumericIdentity(1), identity.NumericIdentity(5)
 	scope := identity.NumericIdentity(0x42_00_00_00)
-	cache := newLocalIdentityCache(scope, minID, maxID, nil)
+	cache := newLocalIdentityCache(scope, minID, maxID)
 
 	for i := minID; i <= maxID; i++ {
-		c.Assert(cache.nextNumericIdentity, Equals, i)
+		require.Equal(t, i, cache.nextNumericIdentity)
 		cache.bumpNextNumericIdentity()
 	}
 
 	// ID must have overflowed and must be back to minID
-	c.Assert(cache.nextNumericIdentity, Equals, minID)
+	require.Equal(t, minID, cache.nextNumericIdentity)
 }
 
-func (s *IdentityCacheTestSuite) TestLocalIdentityCache(c *C) {
+func TestLocalIdentityCache(t *testing.T) {
+	testutils.IntegrationTest(t)
+
 	minID, maxID := identity.NumericIdentity(1), identity.NumericIdentity(5)
 	scope := identity.NumericIdentity(0x42_00_00_00)
-	cache := newLocalIdentityCache(scope, minID, maxID, nil)
+	cache := newLocalIdentityCache(scope, minID, maxID)
 
 	identities := map[identity.NumericIdentity]*identity.Identity{}
 
@@ -41,9 +48,9 @@ func (s *IdentityCacheTestSuite) TestLocalIdentityCache(c *C) {
 	// unique label
 	for i := minID; i <= maxID; i++ {
 		id, isNew, err := cache.lookupOrCreate(labels.NewLabelsFromModel([]string{fmt.Sprintf("%d", i)}), identity.InvalidIdentity)
-		c.Assert(err, IsNil)
-		c.Assert(isNew, Equals, true)
-		c.Assert(id.ID, Equals, scope+i)
+		require.NoError(t, err)
+		require.True(t, isNew)
+		require.Equal(t, scope+i, id.ID)
 		identities[id.ID] = id
 	}
 
@@ -51,57 +58,57 @@ func (s *IdentityCacheTestSuite) TestLocalIdentityCache(c *C) {
 	// identities must be returned.
 	for i := minID; i <= maxID; i++ {
 		id, isNew, err := cache.lookupOrCreate(labels.NewLabelsFromModel([]string{fmt.Sprintf("%d", i)}), identity.InvalidIdentity)
-		c.Assert(isNew, Equals, false)
-		c.Assert(err, IsNil)
+		require.False(t, isNew)
+		require.NoError(t, err)
 
 		// The returned identity must be identical
-		c.Assert(id, checker.DeepEquals, identities[id.ID])
+		require.EqualValues(t, identities[id.ID], id)
 	}
 
 	// Allocation must fail as we are out of IDs
 	_, _, err := cache.lookupOrCreate(labels.NewLabelsFromModel([]string{"foo"}), identity.InvalidIdentity)
-	c.Assert(err, Not(IsNil))
+	require.Error(t, err)
 
 	// release all identities, this must decrement the reference count but not release the identities yet
 	for _, id := range identities {
-		c.Assert(cache.release(id), Equals, false)
+		require.False(t, cache.release(id))
 	}
 
 	// lookup must still be successful
 	for i := minID; i <= maxID; i++ {
-		c.Assert(cache.lookup(labels.NewLabelsFromModel([]string{fmt.Sprintf("%d", i)})), Not(IsNil))
-		c.Assert(cache.lookupByID(i|scope), Not(IsNil))
+		require.NotNil(t, cache.lookup(labels.NewLabelsFromModel([]string{fmt.Sprintf("%d", i)})))
+		require.NotNil(t, cache.lookupByID(i|scope))
 	}
 
 	// release the identities a second time, this must cause the identity
 	// to be forgotten
 	for _, id := range identities {
-		c.Assert(cache.release(id), Equals, true)
+		require.True(t, cache.release(id))
 	}
 
 	// allocate all identities again
 	for i := minID; i <= maxID; i++ {
 		id, isNew, err := cache.lookupOrCreate(labels.NewLabelsFromModel([]string{fmt.Sprintf("%d", i)}), identity.InvalidIdentity)
-		c.Assert(err, IsNil)
-		c.Assert(isNew, Equals, true)
+		require.NoError(t, err)
+		require.True(t, isNew)
 		identities[id.ID] = id
 	}
 
 	// release a random identity in the middle
 	randomID := identity.NumericIdentity(3) | scope
-	c.Assert(cache.release(identities[randomID]), Equals, true)
+	require.True(t, cache.release(identities[randomID]))
 
 	id, isNew, err := cache.lookupOrCreate(labels.NewLabelsFromModel([]string{"foo"}), identity.InvalidIdentity)
-	c.Assert(err, IsNil)
-	c.Assert(isNew, Equals, true)
+	require.NoError(t, err)
+	require.True(t, isNew)
 	// the selected numeric identity must be the one released before
-	c.Assert(id.ID, Equals, randomID)
+	require.Equal(t, randomID, id.ID)
 }
 
 func TestOldNID(t *testing.T) {
 	minID, maxID := identity.NumericIdentity(1), identity.NumericIdentity(10)
 	scope := identity.NumericIdentity(0x42_00_00_00)
-	c := newLocalIdentityCache(scope, minID, maxID, nil)
+	c := newLocalIdentityCache(scope, minID, maxID)
 
 	// Request identity, it should work
 	l := labels.GetCIDRLabels(netip.MustParsePrefix("1.1.1.1/32"))
@@ -157,4 +164,87 @@ func TestOldNID(t *testing.T) {
 	assert.NotNil(t, id)
 	// actual value is random, just need it to succeed
 	assert.True(t, id.ID >= scope+6 && id.ID <= scope+10, "%d <= %d <= %d", scope+6, id.ID, scope+10)
+}
+
+func TestObserve(t *testing.T) {
+	minID, maxID := identity.NumericIdentity(1), identity.NumericIdentity(10)
+	scope := identity.NumericIdentity(0x42_00_00_00)
+	c := newLocalIdentityCache(scope, minID, maxID)
+
+	tctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+	t.Cleanup(cancel)
+
+	// Notification channels for two observers.
+	ev := make(chan IdentityChange, 1)
+	synced := make(chan struct{})
+	ev2 := make(chan IdentityChange, 1)
+	synced2 := make(chan struct{})
+
+	c.Observe(tctx, func(ic IdentityChange) {
+		switch ic.Kind {
+		case IdentityChangeUpsert, IdentityChangeDelete:
+			ev <- ic
+		case IdentityChangeSync:
+			close(synced)
+		}
+	}, func(err error) {
+		// We don't actually expect this to complete, but let's be "future-proof"
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("completed with error: %v", err)
+		}
+	})
+	<-synced
+
+	// Allocate a CIDR identity.
+	l := labels.GetCIDRLabels(netip.MustParsePrefix("1.1.1.1/32"))
+	id, _, _ := c.lookupOrCreate(l, scope)
+	assert.NotNil(t, id)
+	assert.EqualValues(t, scope, id.ID)
+
+	e := <-ev
+	assert.Empty(t, ev)
+	assert.Equal(t, IdentityChangeUpsert, e.Kind)
+
+	// No event when just increasing the refcount.
+	_, created, _ := c.lookupOrCreate(l, scope)
+	assert.False(t, created)
+	assert.Empty(t, ev)
+	// Decrease reference count again.
+	assert.False(t, c.release(id))
+
+	// Second observer.
+	c.Observe(tctx, func(ic IdentityChange) {
+		switch ic.Kind {
+		case IdentityChangeUpsert, IdentityChangeDelete:
+			ev2 <- ic
+		case IdentityChangeSync:
+			close(synced2)
+		}
+	}, func(err error) {
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("observer 2 completed with error: %v", err)
+		}
+		// We don't actually expect this to complete, but let's be "future-proof"
+	})
+
+	// Should replay state:
+	e = <-ev2
+	assert.Empty(t, ev2)
+	assert.Equal(t, IdentityChangeUpsert, e.Kind)
+	assert.Equal(t, id.ID, e.ID)
+	<-synced2
+
+	// Release allocated identity, should be observed by both.
+	assert.True(t, c.release(id))
+	e = <-ev
+	assert.Empty(t, ev)
+	assert.Equal(t, IdentityChangeDelete, e.Kind)
+	e = <-ev2
+	assert.Empty(t, ev2)
+	assert.Equal(t, IdentityChangeDelete, e.Kind)
+
+	// No event for releasing when there's nothing to release.
+	assert.False(t, c.release(id))
+	assert.Empty(t, ev)
+	assert.Empty(t, ev2)
 }

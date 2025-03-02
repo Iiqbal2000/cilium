@@ -12,15 +12,14 @@ const (
 	// RouteTableIPSec is the default table ID to use for IPSec routing rules
 	RouteTableIPSec = 200
 
-	// RouteTableWireguard is the default table ID to use for WireGuard routing
-	// rules
-	RouteTableWireguard = 201
-
 	// RouteTableVtep is the default table ID to use for VTEP routing rules
 	RouteTableVtep = 202
 
-	// RouteTableProxy is the default table ID to use for proxy routing rules.
-	RouteTableProxy = 2004
+	// RouteTableToProxy is the default table ID to use routing rules to the proxy.
+	RouteTableToProxy = 2004
+
+	// RouteTableFromProxy is the default table ID to use routing rules from the proxy.
+	RouteTableFromProxy = 2005
 
 	// RouteTableInterfacesOffset is the offset for the per-ENI routing tables.
 	// Each ENI interface will have its own table starting with this offset. It
@@ -28,13 +27,17 @@ const (
 	// table which is between 253-255. See ip-route(8).
 	RouteTableInterfacesOffset = 10
 
+	// MarkProxyToWorld is the default mark to use to indicate that a packet
+	// from proxy needs to be sent to the world.
+	MarkProxyToWorld = 0x800
+
 	// RouteMarkDecrypt is the default route mark to use to indicate datapath
 	// needs to decrypt a packet.
-	RouteMarkDecrypt = 0x0D00
+	RouteMarkDecrypt = MagicMarkDecrypt
 
 	// RouteMarkEncrypt is the default route mark to use to indicate datapath
 	// needs to encrypt a packet.
-	RouteMarkEncrypt = 0x0E00
+	RouteMarkEncrypt = MagicMarkEncrypt
 
 	// RouteMarkMask is the mask required for the route mark value
 	RouteMarkMask = 0xF00
@@ -67,14 +70,13 @@ const (
 	// to 'yes' by default).
 	RTProto = unix.RTPROT_KERNEL
 
-	// RulePriorityWireguard is the priority of the rule used for routing packets to WireGuard device for encryption
-	RulePriorityWireguard = 1
+	// RulePriorityToProxyIngress is the priority of the routing rule installed by
+	// the proxy package for redirecting inbound packets to the proxy.
+	RulePriorityToProxyIngress = 9
 
-	// RulePriorityProxyIngress is the priority of the routing rule installed by
-	// the proxy package for redirecting inbound packets to the proxy. Priority 10
-	// used to be for outgoing packets from the proxy (see PROXY_RT_TABLE in older
-	// versions), but is no longer used.
-	RulePriorityProxyIngress = 9
+	// RulePriorityFromProxy is the priority of the routing rule installed by
+	// the proxy package for redirecting packets from the proxy.
+	RulePriorityFromProxy = 10
 
 	// RulePriorityIngress is the priority of the rule used for ingress routing
 	// of endpoints. This priority is after encryption and proxy rules, and
@@ -113,15 +115,14 @@ const (
 	// IPsecMarkMaskNodeID is the mask used for the node ID.
 	IPsecMarkMaskNodeID = 0xFFFF0000
 
-	// IPsecOldMarkMaskOut is the mask that was previously used. It can be
-	// removed in Cilium v1.15.
-	IPsecOldMarkMaskOut = 0xFF00
+	// IPsecMarkBitMask is the mask used for the encrypt and decrypt bits.
+	IPsecMarkBitMask = 0x0F00
 
 	// IPsecMarkMask is the mask required for the IPsec SPI, node ID, and encrypt/decrypt bits
-	IPsecMarkMaskOut = IPsecOldMarkMaskOut | IPsecMarkMaskNodeID
+	IPsecMarkMaskOut = 0xFF00 | IPsecMarkMaskNodeID
 
-	// IPsecMarkMaskIn is the mask required for IPsec to lookup encrypt/decrypt bits
-	IPsecMarkMaskIn = 0x0F00
+	// IPsecMarkMaskIn is the mask required for the IPsec node ID and encrypt/decrypt bits
+	IPsecMarkMaskIn = IPsecMarkBitMask | IPsecMarkMaskNodeID
 
 	// IPsecFwdPriority is the priority of the fwd rules placed by IPsec
 	IPsecFwdPriority = 0x0B9F

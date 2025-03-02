@@ -34,6 +34,10 @@ type EndpointSelector struct {
 	// EndpointSelectors are created via `NewESFromMatchRequirements`. It is
 	// immutable after its creation.
 	cachedLabelSelectorString string `json:"-"`
+
+	// Generated indicates whether the rule was generated based on other rules
+	// or provided by user
+	Generated bool `json:"-"`
 }
 
 // LabelSelectorString returns a user-friendly string representation of
@@ -345,7 +349,7 @@ func (n *EndpointSelector) ConvertToLabelSelectorRequirementSlice() []slim_metav
 func (n *EndpointSelector) sanitize() error {
 	errList := validation.ValidateLabelSelector(n.LabelSelector, validation.LabelSelectorValidationOptions{AllowInvalidLabelValueInSelector: false}, nil)
 	if len(errList) > 0 {
-		return fmt.Errorf("invalid label selector: %s", errList.ToAggregate().Error())
+		return fmt.Errorf("invalid label selector: %w", errList.ToAggregate())
 	}
 	return nil
 }

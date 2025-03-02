@@ -10,7 +10,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 
 	"github.com/cilium/cilium/pkg/bgpv1/manager/instance"
 	"github.com/cilium/cilium/pkg/bgpv1/manager/store"
@@ -20,6 +20,7 @@ import (
 	v2alpha1api "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
 	slim_metav1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
+	"github.com/cilium/cilium/pkg/option"
 )
 
 // We use similar local listen ports as the tests in the pkg/bgpv1/test package.
@@ -139,9 +140,15 @@ func TestPreflightReconciler(t *testing.T) {
 				},
 			}
 
-			err = preflightReconciler.Reconcile(context.Background(), params)
-			if (tt.err == nil) != (err == nil) {
-				t.Fatalf("wanted error: %v", (tt.err == nil))
+			// Run the reconciler twice to ensure idempotency. This
+			// simulates the retrying behavior of the controller.
+			for i := 0; i < 2; i++ {
+				t.Run(tt.name, func(t *testing.T) {
+					err = preflightReconciler.Reconcile(context.Background(), params)
+					if (tt.err == nil) != (err == nil) {
+						t.Fatalf("wanted error: %v", (tt.err == nil))
+					}
+				})
 			}
 			if tt.shouldRecreate && testSC.Server == originalServer {
 				t.Fatalf("preflightReconciler did not recreate server")
@@ -216,12 +223,13 @@ func TestReconcileAfterServerReinit(t *testing.T) {
 	// Validate pod CIDR and service announcements work as expected
 	newc := &v2alpha1api.CiliumBGPVirtualRouter{
 		LocalASN:        localASN,
-		ExportPodCIDR:   pointer.Bool(true),
+		ExportPodCIDR:   ptr.To[bool](true),
 		Neighbors:       []v2alpha1api.CiliumBGPNeighbor{},
 		ServiceSelector: serviceSelector,
 	}
 
-	exportPodCIDRReconciler := NewExportPodCIDRReconciler().Reconciler
+	daemonConfig := &option.DaemonConfig{IPAM: "Kubernetes"}
+	exportPodCIDRReconciler := NewExportPodCIDRReconciler(daemonConfig).Reconciler
 	params := ReconcileParams{
 		CurrentServer: testSC,
 		DesiredConfig: newc,
@@ -239,7 +247,7 @@ func TestReconcileAfterServerReinit(t *testing.T) {
 	require.NoError(t, err)
 
 	diffstore.Upsert(obj)
-	reconciler := NewLBServiceReconciler(diffstore, epDiffStore)
+	reconciler := NewServiceReconciler(diffstore, epDiffStore)
 	err = reconciler.Reconciler.Reconcile(context.Background(), params)
 	require.NoError(t, err)
 
@@ -261,7 +269,7 @@ func TestReconcileAfterServerReinit(t *testing.T) {
 	require.NoError(t, err)
 
 	// Update LB service
-	reconciler = NewLBServiceReconciler(diffstore, epDiffStore)
+	reconciler = NewServiceReconciler(diffstore, epDiffStore)
 	err = reconciler.Reconciler.Reconcile(context.Background(), params)
 	require.NoError(t, err)
 }
