@@ -355,7 +355,6 @@ endef
 define K8S_PROTO_PACKAGES
 github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1
 github.com/cilium/cilium/pkg/k8s/slim/k8s/api/discovery/v1
-github.com/cilium/cilium/pkg/k8s/slim/k8s/api/discovery/v1beta1
 github.com/cilium/cilium/pkg/k8s/slim/k8s/api/networking/v1
 github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/apiextensions/v1
 github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1
@@ -470,6 +469,8 @@ endif
 	$(QUIET) contrib/scripts/check-datapathconfig.sh
 	@$(ECHO_CHECK) $(GO) run ./tools/slogloggercheck .
 	$(QUIET)$(GO) run ./tools/slogloggercheck .
+	@$(ECHO_CHECK) contrib/scripts/check-fipsonly.sh
+	$(QUIET) contrib/scripts/check-fipsonly.sh
 
 pprof-heap: ## Get Go pprof heap profile.
 	$(QUIET)$(GO) tool pprof http://localhost:6060/debug/pprof/heap

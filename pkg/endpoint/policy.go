@@ -15,7 +15,6 @@ import (
 	"strings"
 
 	"github.com/cilium/ebpf"
-	"go4.org/netipx"
 
 	"github.com/cilium/cilium/pkg/container/set"
 	"github.com/cilium/cilium/pkg/controller"
@@ -310,6 +309,7 @@ func (e *Endpoint) setDesiredPolicy(datapathRegenCtxt *datapathRegenerationConte
 		return fmt.Errorf("endpoint %d SecurityIdentity changed during policy regeneration", e.ID)
 	}
 
+	oldNextPolicyRevision := e.nextPolicyRevision
 	// Set the revision of this endpoint to the current revision of the policy
 	// repository.
 	e.setNextPolicyRevision(res.policyRevision)
@@ -333,6 +333,12 @@ func (e *Endpoint) setDesiredPolicy(datapathRegenCtxt *datapathRegenerationConte
 		datapathRegenCtxt.revertStack.Push(func() error {
 			// Do nothing if e.policyMap was not initialized already
 			if e.policyMap != nil && e.desiredPolicy != e.realizedPolicy {
+				// Revert nextPolicyRevision; otherwise,
+				// res.endpointPolicy will not be recalculated
+				// on the next regeneration attempt, and we
+				// won't advance to the true desired policy map
+				// state. See GH-38998.
+				e.setNextPolicyRevision(oldNextPolicyRevision)
 				e.desiredPolicy.Detach(e.getLogger())
 				e.desiredPolicy = e.realizedPolicy
 
@@ -1026,10 +1032,10 @@ func (e *Endpoint) runIPIdentitySync(endpointIP netip.Addr) {
 				logger := e.getLogger()
 
 				ID := e.SecurityIdentity.ID
-				hostIP, ok := netipx.FromStdIP(node.GetIPv4(logger))
-				if !ok {
+				hostIP, err := netip.ParseAddr(node.GetCiliumEndpointNodeIP(logger))
+				if err != nil {
 					e.runlock()
-					return controller.NewExitReason("Failed to convert node IPv4 address")
+					return controller.NewExitReason("Failed to get node IP")
 				}
 				key := node.GetEndpointEncryptKeyIndex(logger)
 				metadata := e.FormatGlobalEndpointID()
@@ -1086,8 +1092,12 @@ func (e *Endpoint) SetIdentity(identity *identityPkg.Identity, newEndpoint bool)
 
 	// Whenever the identity is updated, propagate change to key-value store
 	// of IP to identity mapping.
-	e.runIPIdentitySync(e.IPv4)
-	e.runIPIdentitySync(e.IPv6)
+	if option.Config.EnableIPv4 {
+		e.runIPIdentitySync(e.IPv4)
+	}
+	if option.Config.EnableIPv6 {
+		e.runIPIdentitySync(e.IPv6)
+	}
 
 	if oldIdentity != identity.StringID() {
 		e.getLogger().Info(

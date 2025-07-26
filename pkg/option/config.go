@@ -246,9 +246,6 @@ const (
 	// which is relevant in lb-only mode
 	LoadBalancerExternalControlPlane = "bpf-lb-external-control-plane"
 
-	// LoadBalancerProtocolDifferentiation enables support for service protocol differentiation (TCP, UDP, SCTP)
-	LoadBalancerProtocolDifferentiation = "bpf-lb-proto-diff"
-
 	// NodePortBindProtection rejects bind requests to NodePort service ports
 	NodePortBindProtection = "node-port-bind-protection"
 
@@ -1502,10 +1499,10 @@ type DaemonConfig struct {
 	EnableIPIPTermination         bool
 	EnableUnreachableRoutes       bool
 	FixedIdentityMapping          map[string]string
-	FixedIdentityMappingValidator func(val string) (string, error) `json:"-"`
+	FixedIdentityMappingValidator Validator `json:"-"`
 	FixedZoneMapping              map[string]uint8
 	ReverseFixedZoneMapping       map[uint8]string
-	FixedZoneMappingValidator     func(val string) (string, error) `json:"-"`
+	FixedZoneMappingValidator     Validator `json:"-"`
 	IPv4Range                     string
 	IPv6Range                     string
 	IPv4ServiceRange              string
@@ -1718,9 +1715,6 @@ type DaemonConfig struct {
 	// LoadBalancerExternalControlPlane tells whether to not use kube-apiserver as
 	// its control plane in lb-only mode.
 	LoadBalancerExternalControlPlane bool
-
-	// LoadBalancerProtocolDifferentiation enables support for service protocol differentiation (TCP, UDP, SCTP)
-	LoadBalancerProtocolDifferentiation bool
 
 	// EnablePMTUDiscovery indicates whether to send ICMP fragmentation-needed
 	// replies to the client (when needed).
@@ -1941,7 +1935,7 @@ type DaemonConfig struct {
 	// BPFMapEventBuffers has configuration on what BPF map event buffers to enabled
 	// and configuration options for those.
 	BPFMapEventBuffers          map[string]string
-	BPFMapEventBuffersValidator func(val string) (string, error) `json:"-"`
+	BPFMapEventBuffersValidator Validator `json:"-"`
 	bpfMapEventConfigs          BPFEventBufferConfigs
 
 	// BPFDistributedLRU enables per-CPU distributed backend memory
@@ -2240,11 +2234,6 @@ func (c *DaemonConfig) IPv4Enabled() bool {
 // IPv6Enabled returns true if IPv6 is enabled
 func (c *DaemonConfig) IPv6Enabled() bool {
 	return c.EnableIPv6
-}
-
-// LBProtoDiffEnabled returns true if LoadBalancerProtocolDifferentiation is enabled
-func (c *DaemonConfig) LBProtoDiffEnabled() bool {
-	return c.LoadBalancerProtocolDifferentiation
 }
 
 // IPv6NDPEnabled returns true if IPv6 NDP support is enabled
@@ -3060,7 +3049,6 @@ func (c *DaemonConfig) Populate(logger *slog.Logger, vp *viper.Viper) {
 		c.IdentityRestoreGracePeriod = defaults.IdentityRestoreGracePeriodKvstore
 	}
 
-	c.LoadBalancerProtocolDifferentiation = vp.GetBool(LoadBalancerProtocolDifferentiation)
 	c.EnableInternalTrafficPolicy = vp.GetBool(EnableInternalTrafficPolicy)
 	c.EnableSourceIPVerification = vp.GetBool(EnableSourceIPVerification)
 
